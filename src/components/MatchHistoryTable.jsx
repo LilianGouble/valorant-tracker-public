@@ -15,7 +15,7 @@ const formatRelativeDate = (dateString) => {
 };
 
 export const MatchHistoryTable = ({ matches, onSelectMatch, mode = 'full', playersConfig }) => {
-    // --- PAGINATION ---
+    // -- PAGINATION --
     const [visibleCount, setVisibleCount] = useState(20);
 
     if (!matches || matches.length === 0) {
