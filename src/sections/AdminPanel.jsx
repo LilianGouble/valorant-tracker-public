@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Shield, Key, Users, Settings, LogOut, Check, Trash2, Plus, Info } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion'; // <--- CORRECTION ICI
+import { motion, AnimatePresence } from 'framer-motion';
 import { LOCAL_SERVER_URL } from '../config/constants';
 
 export const AdminPanel = () => {
@@ -30,10 +30,10 @@ export const AdminPanel = () => {
         setTimeout(() => setMsg({ text: '', type: '' }), 3000);
     };
 
-    const authHeaders = {
+    const authHeaders = useMemo(() => ({
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`
-    };
+    }), [token]);
 
     // --- LOGIN & AUTH ---
     const handleLogin = async (e) => {
@@ -73,13 +73,13 @@ export const AdminPanel = () => {
         }
     };
 
-    const handleLogout = () => {
+    const handleLogout = useCallback(() => {
         localStorage.removeItem('adminToken');
         setToken(null);
-    };
+    }, []);
 
     // --- FETCH DATA ---
-    const fetchData = async () => {
+    const fetchData = useCallback(async () => {
         if (!token) return;
         try {
             const [pRes, kRes, cRes] = await Promise.all([
@@ -96,11 +96,11 @@ export const AdminPanel = () => {
         } catch (err) {
             console.error("Erreur Fetch Admin:", err);
         }
-    };
+    }, [token, authHeaders, handleLogout]);
 
     useEffect(() => {
         fetchData();
-    }, [token, activeTab]);
+    }, [fetchData, activeTab]);
 
     // --- ACTIONS JOUEURS ---
     const addPlayer = async (e) => {
@@ -116,13 +116,19 @@ export const AdminPanel = () => {
                 setNewPlayer({ name: '', tag: '', region: 'eu', color: '#ff4655' });
                 fetchData();
             }
-        } catch (err) { }
+        } catch (err) {
+            console.error("Erreur lors de l'ajout du joueur :", err);
+        }
     };
 
     const deletePlayer = async (id) => {
         if (!window.confirm("Supprimer ce joueur ?")) return;
-        await fetch(`${LOCAL_SERVER_URL}/api/admin/players/${id}`, { method: 'DELETE', headers: authHeaders });
-        fetchData();
+        try {
+            await fetch(`${LOCAL_SERVER_URL}/api/admin/players/${id}`, { method: 'DELETE', headers: authHeaders });
+            fetchData();
+        } catch (err) {
+            console.error("Erreur lors de la suppression du joueur :", err);
+        }
     };
 
     // --- ACTIONS CLÉS ---
@@ -142,12 +148,18 @@ export const AdminPanel = () => {
             } else {
                 showMsg(data.error, 'error');
             }
-        } catch (err) { }
+        } catch (err) {
+            console.error("Erreur lors de l'ajout de la clé :", err);
+        }
     };
 
     const deleteKey = async (id) => {
-        await fetch(`${LOCAL_SERVER_URL}/api/admin/keys/${id}`, { method: 'DELETE', headers: authHeaders });
-        fetchData();
+        try {
+            await fetch(`${LOCAL_SERVER_URL}/api/admin/keys/${id}`, { method: 'DELETE', headers: authHeaders });
+            fetchData();
+        } catch (err) {
+            console.error("Erreur lors de la suppression de la clé :", err);
+        }
     };
 
     // --- ACTIONS CONFIG ---
@@ -160,7 +172,9 @@ export const AdminPanel = () => {
                 body: JSON.stringify(config)
             });
             if (res.ok) showMsg("Configuration sauvegardée !");
-        } catch (err) { }
+        } catch (err) {
+            console.error("Erreur lors de la sauvegarde de la config :", err);
+        }
     };
 
     // ==========================================
@@ -405,10 +419,10 @@ export const AdminPanel = () => {
 
                                 <div className="mt-3 flex flex-wrap gap-2">
                                     <button type="button" onClick={async () => {
-                                        try { await fetch(`${LOCAL_SERVER_URL}/test-match`); showMsg("Faux match envoyé sur Discord !"); } catch (e) { }
+                                        try { await fetch(`${LOCAL_SERVER_URL}/test-match`); showMsg("Faux match envoyé sur Discord !"); } catch (e) { console.error("Erreur test match:", e); }
                                     }} className="px-4 py-2 bg-indigo-500/20 text-indigo-400 hover:bg-indigo-500/40 rounded text-xs font-bold transition-colors">Test Fin de Match</button>
                                     <button type="button" onClick={async () => {
-                                        try { await fetch(`${LOCAL_SERVER_URL}/test-report`); showMsg("Faux rapport envoyé sur Discord !"); } catch (e) { }
+                                        try { await fetch(`${LOCAL_SERVER_URL}/test-report`); showMsg("Faux rapport envoyé sur Discord !"); } catch (e) { console.error("Erreur test rapport:", e); }
                                     }} className="px-4 py-2 bg-purple-500/20 text-purple-400 hover:bg-purple-500/40 rounded text-xs font-bold transition-colors">Test Rapport Quotidien</button>
                                 </div>
                             </div>

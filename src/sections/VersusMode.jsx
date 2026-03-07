@@ -68,16 +68,17 @@ const calculateStats = (matches, playerId, challengeStartDate) => {
 };
 
 export const VersusMode = ({ matches, players, challengeStartDate }) => {
-    // Si aucun joueur n'est configuré, on ne peut pas afficher de VS
-    if (!players || players.length < 2) {
-        return <div className="text-center p-10 text-gray-500">Il faut au moins 2 joueurs configurés pour utiliser ce mode.</div>;
-    }
 
     const [p1Id, setP1Id] = useState(players[0].id);
     const [p2Id, setP2Id] = useState(players[1].id);
 
     const s1 = useMemo(() => calculateStats(matches, p1Id, challengeStartDate), [matches, p1Id, challengeStartDate]);
     const s2 = useMemo(() => calculateStats(matches, p2Id, challengeStartDate), [matches, p2Id, challengeStartDate]);
+
+    // Si aucun joueur n'est configuré, on ne peut pas afficher de VS
+    if (!players || players.length < 2) {
+        return <div className="text-center p-10 text-gray-500">Il faut au moins 2 joueurs configurés pour utiliser ce mode.</div>;
+    }
 
     const p1 = players.find(p => p.id === p1Id);
     const p2 = players.find(p => p.id === p2Id);
