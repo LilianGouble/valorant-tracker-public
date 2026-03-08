@@ -1,3 +1,10 @@
+// Détection intelligente de l'URL de l'API. 
+// 1. Cherche une variable d'environnement VITE_API_URL (Pour la prod personnalisée)
+// 2. Sinon, en mode DEV, tape sur localhost:3001
+// 3. Sinon, en PROD, suppose que le backend est sur le même domaine (ex: proxy Nginx)
+export const LOCAL_SERVER_URL = import.meta.env.VITE_API_URL || 
+  (import.meta.env.MODE === 'development' ? "http://localhost:3001" : window.location.origin);
+
 // UUID Actuel et stable pour les icônes de rang (Épisode 5+ avec le rang Ascendant)
 const TIER_UUID = "03621f52-342b-cf4e-4f86-9350a49c6d04";
 
@@ -15,6 +22,7 @@ export const RANK_TIERS = [
     { value: 1100, label: 'RADIANT', icon: `https://media.valorant-api.com/competitivetiers/${TIER_UUID}/27/largeicon.png` }
 ];
 
+// Mapping précis pour récupérer l'icône exacte (ex: Diamant 2, Plat 3, etc.)
 const EXACT_TIER_INDEX = {
     'UNRATED': 0,
     'IRON 1': 3, 'IRON 2': 4, 'IRON 3': 5,

@@ -28,6 +28,7 @@ import { EcoRating } from './sections/EcoRating.jsx';
 import { TDMChallenge } from './sections/TDMChallenge.jsx';
 import { Spellcaster } from './sections/Spellcaster.jsx';
 import { AdminPanel } from './sections/AdminPanel.jsx';
+import { SkirmishAnalysis } from './sections/SkirmishAnalysis.jsx'; // <-- NOUVEL IMPORT ICI
 
 const SidebarItem = ({ id, label, icon: Icon, activeTab, onNavigate, isMobile, setIsSidebarOpen }) => {
   const isActive = activeTab === id;
@@ -77,7 +78,6 @@ function MainApp() {
   const [selectedMatch, setSelectedMatch] = useState(null);
   const [matches, setMatches] = useState([]);
 
-  // NOUVEAU : On stocke les joueurs dynamiquement
   const [playersConfig, setPlayersConfig] = useState([]);
   const [appUrl, setAppUrl] = useState('');
   const [challengeStartDate, setChallengeStartDate] = useState(null);
@@ -107,10 +107,8 @@ function MainApp() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // --- RÉCUPÉRATION INITALE DE LA CONFIG ET DES MATCHS ---
   const loadData = useCallback(async () => {
     try {
-      // 1. Récupérer la liste des joueurs configurés par l'admin
       const configRes = await fetch(`${LOCAL_SERVER_URL}/api/public/config`);
       let validPlayerIds = new Set();
 
@@ -118,15 +116,13 @@ function MainApp() {
         const configData = await configRes.json();
         setPlayersConfig(configData.players || []);
         setAppUrl(configData.appUrl || '');
-        setChallengeStartDate(configData.challengeStartDate); // <-- Ajoute ça
+        setChallengeStartDate(configData.challengeStartDate);
         validPlayerIds = new Set((configData.players || []).map(p => p.id));
       }
 
-      // 2. Récupérer les matchs et les filtrer avec les joueurs valides
       const res = await fetch(`${LOCAL_SERVER_URL}/history`);
       if (res.ok) {
         const data = await res.json();
-        // N'afficher que les matchs des joueurs qui existent encore dans la DB Admin
         const cleanMatches = (data.matches || []).filter(m => validPlayerIds.has(m.playerId));
         setMatches(cleanMatches);
         setServerStatus('connected');
@@ -184,7 +180,6 @@ function MainApp() {
     if (selectedPlayerId !== 'all') {
       data = data.filter(m => m.playerId === selectedPlayerId);
     }
-    // Remplacer CHALLENGE_START_DATE par challengeStartDate
     if (challengeStartDate) {
       const startDate = new Date(challengeStartDate).getTime();
       data = data.filter(m => {
@@ -206,7 +201,6 @@ function MainApp() {
 
   const isInitialLoading = loading && matches.length === 0;
 
-  // S'il n'y a aucun joueur configuré, on affiche un message d'accueil pour le proprio
   if (!loading && playersConfig.length === 0) {
     return (
       <div className="min-h-screen bg-[#0f1923] flex items-center justify-center p-4">
@@ -262,6 +256,9 @@ function MainApp() {
 
         <div className="flex-grow py-6 px-3 space-y-1.5 overflow-y-auto custom-scrollbar">
           <SidebarItem id="rush" label="RUSH IMMORTAL" icon={Trophy} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
+          {/* NOUVEAU MENU SKIRMISH ICI */}
+          <SidebarItem id="skirmish" label="SKIRMISH 2V2" icon={Users} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
+
           <SidebarItem id="deathmatch" label="DEATHMATCH 100" icon={Swords} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
           <SidebarItem id="tdm" label="DÉFI 100 TDM" icon={Target} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
           <div className="my-4 border-t border-white/5 mx-2"></div>
@@ -351,6 +348,13 @@ function MainApp() {
                   <RushDashboard matches={matches} filteredData={filteredData} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={challengeStartDate} onSelectMatch={setSelectedMatch} />
                 </motion.div>
               )}
+              {/* NOUVELLE VUE SKIRMISH ICI */}
+              {activeTab === 'skirmish' && (
+                <motion.div key="skirmish" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
+                  <SkirmishAnalysis matches={matches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={challengeStartDate} />
+                </motion.div>
+              )}
+
               {activeTab === 'deathmatch' && (
                 <motion.div key="dm" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
                   <DeathmatchAnalysis matches={matches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />

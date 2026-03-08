@@ -319,6 +319,37 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
 
     await delay(500);
 
+    // SKIRMISH (Nouveau)
+    try {
+      const url = `${API_BASE}/v3/matches/${player.region}/${encodedName}/${encodedTag}?filter=skirmish${commonParams}${cacheBuster}`;
+      const skirmishResponse = await fetchWithRetry(url, apiKeys, { headers });
+      const skirmishData = skirmishResponse.ok ? await skirmishResponse.json().catch(() => ({ data: [] })) : { data: [] };
+      const cleanSkirmishMatches = (skirmishData.data || []).map(m => {
+        const playerStats = m.players?.all_players?.find(p => p.name.toLowerCase() === player.name.toLowerCase() && p.tag.toLowerCase() === player.tag.toLowerCase());
+        if (!playerStats) return null;
+        const b = m.teams?.blue?.rounds_won || 0; const r = m.teams?.red?.rounds_won || 0;
+        const isWin = playerStats.team === 'Blue' ? (b > r) : (r > b);
+        let matchScore = '0 - 0';
+        if (m.teams && playerStats.team) {
+            const myT = playerStats.team.toLowerCase(); const oppT = myT === 'blue' ? 'red' : 'blue';
+            matchScore = `${m.teams[myT]?.rounds_won || 0} - ${m.teams[oppT]?.rounds_won || 0}`;
+        }
+        return {
+          id: m.metadata.matchid, type: 'skirmish', playerId: player.id, agent: playerStats.character, agentImg: playerStats.assets?.agent?.small || null,
+          kills: playerStats.stats?.kills || 0, deaths: playerStats.stats?.deaths || 0, assists: playerStats.stats?.assists || 0, score: playerStats.stats?.score || 0,
+          kd: (playerStats.stats?.deaths || 0) > 0 ? (playerStats.stats?.kills || 0) / playerStats.stats?.deaths : playerStats.stats?.kills || 0,
+          adr: Math.round((playerStats.damage_made || 0) / (m.metadata?.rounds_played || 1)), acs: Math.round((playerStats.stats?.score || 0) / (m.metadata?.rounds_played || 1)),
+          rounds: m.metadata?.rounds_played || 1, roundsPlayed: m.metadata?.rounds_played || 1, result: isWin ? 'WIN' : 'LOSS', scoreTeam: matchScore,
+          map: m.metadata.map, date: m.metadata.game_start_patched, timestamp: m.metadata.game_start, allPlayers: m.players.all_players, myTeam: playerStats.team
+        };
+      }).filter(Boolean);
+      newMatches = [...newMatches, ...cleanSkirmishMatches];
+    } catch (e) {
+      console.error(`❌ Erreur Fetch Skirmish pour ${player.name}:`, e.message);
+    }
+
+    await delay(500);
+
     // RANKED
     try {
       const url = `${API_BASE}/v3/matches/${player.region}/${encodedName}/${encodedTag}?filter=competitive${commonParams}${cacheBuster}`;
