@@ -326,12 +326,20 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
 
     // SKIRMISH (CORRECTION DU FILTRE)
     try {
-      const url = `${API_BASE}/v3/matches/${player.region}/${encodedName}/${encodedTag}?filter=skirmish${commonParams}${cacheBuster}`;
+      // 1. On retire le "?filter=skirmish" qui faisait bugger l'API
+      const url = `${API_BASE}/v3/matches/${player.region}/${encodedName}/${encodedTag}?size=20${cacheBuster}`;
       const skirmishResponse = await fetchWithRetry(url, apiKeys, { headers });
       const skirmishData = skirmishResponse.ok ? await skirmishResponse.json().catch(() => ({ data: [] })) : { data: [] };
+      
+      // 2. On affiche dans la console le nom interne des modes que ce joueur a joué
+      if (skirmishData.data && skirmishData.data.length > 0) {
+          const modesJoues = [...new Set(skirmishData.data.map(m => m.metadata?.mode))];
+          console.log(`🕵️ Noms internes des modes récents de ${player.name} :`, modesJoues);
+      }
+
+      // 3. On filtre provisoirement sur "Custom Game" (Partie personnalisée)
       const cleanSkirmishMatches = (skirmishData.data || [])
-        // ON AJOUTE UN FILTRE STRICT POUR EMPÊCHER LES DM DE PASSER
-        .filter(m => m.metadata && m.metadata.mode && m.metadata.mode.toLowerCase() === 'skirmish')
+        .filter(m => m.metadata && m.metadata.mode && m.metadata.mode === 'Custom Game') 
         .map(m => {
           const playerStats = m.players?.all_players?.find(p => p.name.toLowerCase() === player.name.toLowerCase() && p.tag.toLowerCase() === player.tag.toLowerCase());
           if (!playerStats) return null;
