@@ -29,6 +29,7 @@ import { TDMChallenge } from './sections/TDMChallenge.jsx';
 import { Spellcaster } from './sections/Spellcaster.jsx';
 import { AdminPanel } from './sections/AdminPanel.jsx';
 import { SkirmishAnalysis } from './sections/SkirmishAnalysis.jsx'; // <-- NOUVEL IMPORT ICI
+import { Tournaments } from './sections/Tournaments.jsx'; // <--- AJOUTEZ CETTE LIGNE
 
 const SidebarItem = ({ id, label, icon: Icon, activeTab, onNavigate, isMobile, setIsSidebarOpen }) => {
   const isActive = activeTab === id;
@@ -262,6 +263,7 @@ function MainApp() {
           <SidebarItem id="deathmatch" label="DEATHMATCH 100" icon={Swords} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
           <SidebarItem id="tdm" label="DÉFI 100 TDM" icon={Target} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
           <div className="my-4 border-t border-white/5 mx-2"></div>
+          <SidebarItem id="tournaments" label="TOURNOIS KSL" icon={Trophy} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
           <SidebarItem id="leaderboard" label="CLASSEMENTS" icon={BarChart2} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
           <SidebarItem id="agents" label="AGENTS" icon={User} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
           <SidebarItem id="arsenal" label="ARSENAL" icon={Target} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
@@ -363,6 +365,11 @@ function MainApp() {
               {activeTab === 'tdm' && (
                 <motion.div key="tdm" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
                   <TDMChallenge matches={matches} playersConfig={playersConfig} />
+                </motion.div>
+              )}
+              {activeTab === 'tournaments' && (
+                <motion.div key="tournaments" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
+                  <Tournaments />
                 </motion.div>
               )}
               {activeTab === 'leaderboard' && (

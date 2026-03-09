@@ -62,6 +62,14 @@ let db;
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             key TEXT UNIQUE
         );
+
+        CREATE TABLE IF NOT EXISTS tournaments (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            date TEXT,
+            players TEXT,
+            bracket TEXT
+        );
     `);
 
     // 1. Initialiser le secret JWT s'il n'existe pas
@@ -85,8 +93,6 @@ let db;
     await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('challenge_start_date', '2024-01-01T00:00')");
 
     // 4. NETTOYAGE DES FAUX MATCHS SKIRMISH (Dû au bug de l'API)
-    // Comme le Skirmish est récent, on peut effacer l'historique "Skirmish" sans risque, 
-    // le prochain scan retéléchargera les vraies parties proprement.
     await db.run("DELETE FROM matches WHERE data LIKE '%\"type\":\"skirmish\"%'");
     console.log("🧹 Base de données nettoyée des matchs Skirmish corrompus.");
 
@@ -219,6 +225,115 @@ app.delete('/api/admin/keys/:id', authenticateToken, async (req, res) => {
     res.json({ message: "Clé supprimée" });
 });
 
+// ==========================================
+// ROUTES : TOURNOIS
+// ==========================================
+
+app.get('/api/public/tournaments', async (req, res) => {
+    try {
+        const rows = await db.all("SELECT * FROM tournaments ORDER BY date DESC");
+        res.json(rows.map(r => ({ ...r, players: JSON.parse(r.players), bracket: JSON.parse(r.bracket) })));
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/admin/tournaments', authenticateToken, async (req, res) => {
+    const rows = await db.all("SELECT * FROM tournaments ORDER BY date DESC");
+    res.json(rows.map(r => ({ ...r, players: JSON.parse(r.players), bracket: JSON.parse(r.bracket) })));
+});
+
+app.post('/api/admin/tournaments', authenticateToken, async (req, res) => {
+    const { name, date, players } = req.body;
+    const id = `tourney_${Date.now()}`;
+    
+    // NOUVEL ALGO : Distribution parfaite des "BYE" pour éviter les "BYE vs BYE"
+    const shuffled = [...players].sort(() => 0.5 - Math.random());
+    const nextPowerOf2 = Math.pow(2, Math.ceil(Math.log2(shuffled.length)));
+    const numByes = nextPowerOf2 - shuffled.length;
+    
+    const rounds = [];
+    const round1 = [];
+    let playerIdx = 0;
+    
+    // 1. On crée les matchs contre les "BYE"
+    for(let i=0; i<numByes; i++) {
+        round1.push({ player1: shuffled[playerIdx], player2: 'BYE', winner: shuffled[playerIdx], score: '' });
+        playerIdx++;
+    }
+    // 2. On crée les matchs normaux entre joueurs restants
+    while(playerIdx < shuffled.length) {
+        round1.push({ player1: shuffled[playerIdx], player2: shuffled[playerIdx+1], winner: null, score: '' });
+        playerIdx += 2;
+    }
+    
+    // 3. On mélange le Round 1 pour que les BYEs ne soient pas tous en haut de l'arbre
+    round1.sort(() => 0.5 - Math.random());
+    rounds.push(round1);
+
+    // 4. Génération de l'arbre vide
+    let currentMatches = round1.length;
+    while (currentMatches > 1) {
+        currentMatches /= 2;
+        const nextRound = [];
+        for (let i = 0; i < currentMatches; i++) {
+            nextRound.push({ player1: null, player2: null, winner: null, score: '' });
+        }
+        rounds.push(nextRound);
+    }
+
+    // 5. Avancement automatique des gagnants par BYE au Round 2
+    if (rounds.length > 1) {
+        for (let i = 0; i < rounds[0].length; i++) {
+            if (rounds[0][i].winner) {
+                const nextMatchIndex = Math.floor(i / 2);
+                const isPlayer1 = i % 2 === 0;
+                if (isPlayer1) rounds[1][nextMatchIndex].player1 = rounds[0][i].winner;
+                else rounds[1][nextMatchIndex].player2 = rounds[0][i].winner;
+            }
+        }
+    }
+
+    await db.run("INSERT INTO tournaments (id, name, date, players, bracket) VALUES (?, ?, ?, ?, ?)",
+        [id, name, date, JSON.stringify(players), JSON.stringify(rounds)]);
+    res.json({ message: "Tournoi créé avec succès", id });
+});
+
+// NOUVELLE ROUTE : MISE À JOUR D'UN MATCH DE TOURNOI
+app.put('/api/admin/tournaments/:id/match', authenticateToken, async (req, res) => {
+    const { id } = req.params;
+    const { roundIndex, matchIndex, winner, score } = req.body;
+
+    const row = await db.get("SELECT * FROM tournaments WHERE id = ?", [id]);
+    if (!row) return res.status(404).json({ error: "Tournoi non trouvé" });
+
+    const bracket = JSON.parse(row.bracket);
+    const match = bracket[roundIndex][matchIndex];
+
+    // Mise à jour
+    match.winner = winner || null;
+    match.score = score || '';
+
+    // Si on a un gagnant et qu'on n'est pas en finale, on l'envoie au round suivant
+    if (winner && roundIndex + 1 < bracket.length) {
+        const nextMatchIndex = Math.floor(matchIndex / 2);
+        const isPlayer1 = matchIndex % 2 === 0;
+        
+        if (isPlayer1) {
+            bracket[roundIndex + 1][nextMatchIndex].player1 = winner;
+        } else {
+            bracket[roundIndex + 1][nextMatchIndex].player2 = winner;
+        }
+    }
+
+    await db.run("UPDATE tournaments SET bracket = ? WHERE id = ?", [JSON.stringify(bracket), id]);
+    res.json({ message: "Match mis à jour", bracket });
+});
+
+app.delete('/api/admin/tournaments/:id', authenticateToken, async (req, res) => {
+    await db.run("DELETE FROM tournaments WHERE id = ?", [req.params.id]);
+    res.json({ message: "Tournoi supprimé" });
+});
 
 // ==========================================
 // LOGIQUE DE SCAN ET DE RECUPERATION
@@ -324,20 +439,17 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
 
     await delay(500);
 
-    // SKIRMISH (CORRECTION DU FILTRE)
+    // SKIRMISH (Filtre strict "Custom Game")
     try {
-      // 1. On retire le "?filter=skirmish" qui faisait bugger l'API
       const url = `${API_BASE}/v3/matches/${player.region}/${encodedName}/${encodedTag}?size=20${cacheBuster}`;
       const skirmishResponse = await fetchWithRetry(url, apiKeys, { headers });
       const skirmishData = skirmishResponse.ok ? await skirmishResponse.json().catch(() => ({ data: [] })) : { data: [] };
       
-      // 2. On affiche dans la console le nom interne des modes que ce joueur a joué
       if (skirmishData.data && skirmishData.data.length > 0) {
           const modesJoues = [...new Set(skirmishData.data.map(m => m.metadata?.mode))];
           console.log(`🕵️ Noms internes des modes récents de ${player.name} :`, modesJoues);
       }
 
-      // 3. On filtre provisoirement sur "Custom Game" (Partie personnalisée)
       const cleanSkirmishMatches = (skirmishData.data || [])
         .filter(m => m.metadata && m.metadata.mode && m.metadata.mode === 'Custom Game') 
         .map(m => {
@@ -615,7 +727,6 @@ const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appU
 
     const matchesById = {};
     newlyDiscoveredMatches.forEach(m => {
-        // On s'assure une dernière fois que c'est bien de la Ranked
         if (m.type !== 'ranked') {
             console.log(`🚫 [Discord] Match ${m.id} ignoré car ce n'est pas une Ranked.`);
             return;
@@ -624,7 +735,6 @@ const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appU
         const matchTime = m.timestamp ? m.timestamp * 1000 : new Date(m.date).getTime();
         const hoursOld = (Date.now() - matchTime) / (1000 * 60 * 60);
         
-        // On passe la limite à 24h pour éviter les bugs d'horloge Windows
         if (ignoreTimeLimit || hoursOld < 24) {
             if (!matchesById[m.id]) matchesById[m.id] = [];
             matchesById[m.id].push(m);
