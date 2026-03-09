@@ -84,6 +84,12 @@ let db;
     await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('app_url', 'http://localhost:5173')");
     await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('challenge_start_date', '2024-01-01T00:00')");
 
+    // 4. NETTOYAGE DES FAUX MATCHS SKIRMISH (Dû au bug de l'API)
+    // Comme le Skirmish est récent, on peut effacer l'historique "Skirmish" sans risque, 
+    // le prochain scan retéléchargera les vraies parties proprement.
+    await db.run("DELETE FROM matches WHERE data LIKE '%\"type\":\"skirmish\"%'");
+    console.log("🧹 Base de données nettoyée des matchs Skirmish corrompus.");
+
     console.log("✅ Connecté à la base SQLite & Initialisation terminée.");
     
     setTimeout(() => {
@@ -145,7 +151,7 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
     res.json({ message: "Mot de passe mis à jour avec succès" });
 });
 
-// Récupération de la config publique pour le Frontend (sans clés API ni webhooks)
+// Récupération de la config publique pour le Frontend
 app.get('/api/public/config', async (req, res) => {
     try {
         const players = await getPlayers();
@@ -181,7 +187,6 @@ app.get('/api/admin/players', authenticateToken, async (req, res) => {
 
 app.post('/api/admin/players', authenticateToken, async (req, res) => {
     const { name, tag, region, color } = req.body;
-    // Génère un ID unique p1, p2...
     const countRow = await db.get("SELECT COUNT(*) as count FROM players");
     const id = `p${countRow.count + 1}_${Date.now()}`;
     await db.run("INSERT INTO players (id, name, tag, region, color) VALUES (?, ?, ?, ?, ?)", [id, name, tag, region, color || '#ffffff']);
@@ -319,29 +324,32 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
 
     await delay(500);
 
-    // SKIRMISH (Nouveau)
+    // SKIRMISH (CORRECTION DU FILTRE)
     try {
       const url = `${API_BASE}/v3/matches/${player.region}/${encodedName}/${encodedTag}?filter=skirmish${commonParams}${cacheBuster}`;
       const skirmishResponse = await fetchWithRetry(url, apiKeys, { headers });
       const skirmishData = skirmishResponse.ok ? await skirmishResponse.json().catch(() => ({ data: [] })) : { data: [] };
-      const cleanSkirmishMatches = (skirmishData.data || []).map(m => {
-        const playerStats = m.players?.all_players?.find(p => p.name.toLowerCase() === player.name.toLowerCase() && p.tag.toLowerCase() === player.tag.toLowerCase());
-        if (!playerStats) return null;
-        const b = m.teams?.blue?.rounds_won || 0; const r = m.teams?.red?.rounds_won || 0;
-        const isWin = playerStats.team === 'Blue' ? (b > r) : (r > b);
-        let matchScore = '0 - 0';
-        if (m.teams && playerStats.team) {
-            const myT = playerStats.team.toLowerCase(); const oppT = myT === 'blue' ? 'red' : 'blue';
-            matchScore = `${m.teams[myT]?.rounds_won || 0} - ${m.teams[oppT]?.rounds_won || 0}`;
-        }
-        return {
-          id: m.metadata.matchid, type: 'skirmish', playerId: player.id, agent: playerStats.character, agentImg: playerStats.assets?.agent?.small || null,
-          kills: playerStats.stats?.kills || 0, deaths: playerStats.stats?.deaths || 0, assists: playerStats.stats?.assists || 0, score: playerStats.stats?.score || 0,
-          kd: (playerStats.stats?.deaths || 0) > 0 ? (playerStats.stats?.kills || 0) / playerStats.stats?.deaths : playerStats.stats?.kills || 0,
-          adr: Math.round((playerStats.damage_made || 0) / (m.metadata?.rounds_played || 1)), acs: Math.round((playerStats.stats?.score || 0) / (m.metadata?.rounds_played || 1)),
-          rounds: m.metadata?.rounds_played || 1, roundsPlayed: m.metadata?.rounds_played || 1, result: isWin ? 'WIN' : 'LOSS', scoreTeam: matchScore,
-          map: m.metadata.map, date: m.metadata.game_start_patched, timestamp: m.metadata.game_start, allPlayers: m.players.all_players, myTeam: playerStats.team
-        };
+      const cleanSkirmishMatches = (skirmishData.data || [])
+        // ON AJOUTE UN FILTRE STRICT POUR EMPÊCHER LES DM DE PASSER
+        .filter(m => m.metadata && m.metadata.mode && m.metadata.mode.toLowerCase() === 'skirmish')
+        .map(m => {
+          const playerStats = m.players?.all_players?.find(p => p.name.toLowerCase() === player.name.toLowerCase() && p.tag.toLowerCase() === player.tag.toLowerCase());
+          if (!playerStats) return null;
+          const b = m.teams?.blue?.rounds_won || 0; const r = m.teams?.red?.rounds_won || 0;
+          const isWin = playerStats.team === 'Blue' ? (b > r) : (r > b);
+          let matchScore = '0 - 0';
+          if (m.teams && playerStats.team) {
+              const myT = playerStats.team.toLowerCase(); const oppT = myT === 'blue' ? 'red' : 'blue';
+              matchScore = `${m.teams[myT]?.rounds_won || 0} - ${m.teams[oppT]?.rounds_won || 0}`;
+          }
+          return {
+            id: m.metadata.matchid, type: 'skirmish', playerId: player.id, agent: playerStats.character, agentImg: playerStats.assets?.agent?.small || null,
+            kills: playerStats.stats?.kills || 0, deaths: playerStats.stats?.deaths || 0, assists: playerStats.stats?.assists || 0, score: playerStats.stats?.score || 0,
+            kd: (playerStats.stats?.deaths || 0) > 0 ? (playerStats.stats?.kills || 0) / playerStats.stats?.deaths : playerStats.stats?.kills || 0,
+            adr: Math.round((playerStats.damage_made || 0) / (m.metadata?.rounds_played || 1)), acs: Math.round((playerStats.stats?.score || 0) / (m.metadata?.rounds_played || 1)),
+            rounds: m.metadata?.rounds_played || 1, roundsPlayed: m.metadata?.rounds_played || 1, result: isWin ? 'WIN' : 'LOSS', scoreTeam: matchScore,
+            map: m.metadata.map, date: m.metadata.game_start_patched, timestamp: m.metadata.game_start, allPlayers: m.players.all_players, myTeam: playerStats.team
+          };
       }).filter(Boolean);
       newMatches = [...newMatches, ...cleanSkirmishMatches];
     } catch (e) {
@@ -585,19 +593,36 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
     return newMatches;
 };
 
-// --- ALERTE FIN DE MATCH IMMÉDIATE ---
-const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appUrl) => {
+// --- ALERTE FIN DE MATCH IMMÉDIATE (CORRECTION DISCORD & ANTI-SPAM 24H) ---
+const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appUrl, ignoreTimeLimit = false) => {
     if (newlyDiscoveredMatches.length === 0) return;
 
     const webhookUrl = await getConfig('webhook_url');
-    if (!webhookUrl) return;
+    if (!webhookUrl) {
+        console.log("⚠️ [Discord] Webhook non configuré, impossible d'envoyer l'alerte.");
+        return;
+    }
+
+    console.log(`🔔 [Discord] Analyse de ${newlyDiscoveredMatches.length} nouveau(x) match(s) pour envoi...`);
 
     const matchesById = {};
     newlyDiscoveredMatches.forEach(m => {
+        // On s'assure une dernière fois que c'est bien de la Ranked
+        if (m.type !== 'ranked') {
+            console.log(`🚫 [Discord] Match ${m.id} ignoré car ce n'est pas une Ranked.`);
+            return;
+        }
+
         const matchTime = m.timestamp ? m.timestamp * 1000 : new Date(m.date).getTime();
-        if (Date.now() - matchTime < 4 * 60 * 60 * 1000) {
+        const hoursOld = (Date.now() - matchTime) / (1000 * 60 * 60);
+        
+        // On passe la limite à 24h pour éviter les bugs d'horloge Windows
+        if (ignoreTimeLimit || hoursOld < 24) {
             if (!matchesById[m.id]) matchesById[m.id] = [];
             matchesById[m.id].push(m);
+            console.log(`✅ [Discord] Match validé pour l'envoi (Vieux de ${hoursOld.toFixed(1)}h).`);
+        } else {
+            console.log(`🚫 [Anti-Spam] Match ignoré car il date de plus de ${hoursOld.toFixed(1)}h. Vérifiez l'heure de votre PC !`);
         }
     });
 
@@ -632,7 +657,7 @@ const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appU
             if (isGroupMember) {
                 const trackedData = playersInMatch.find(tm => tm.playerId === isGroupMember.id);
                 let rrText = "";
-                if (trackedData && trackedData.rrChange !== undefined) {
+                if (trackedData && trackedData.rrChange !== undefined && baseMatch.type === 'ranked') {
                     const rrSign = trackedData.rrChange > 0 ? '+' : '';
                     rrText = `[ ${rrSign}${trackedData.rrChange} RR ]`;
                 }
@@ -658,13 +683,14 @@ const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appU
         }
 
         const embed = {
-            title: `🚨 FIN DE MATCH : ${baseMatch.map.toUpperCase()}`,
+            title: `🚨 FIN DE MATCH (RANKED) : ${baseMatch.map.toUpperCase()}`,
             color: color,
             description: desc,
             url: appUrl,
             footer: { text: "Tracker Custom • Alerte Rapide" }
         };
 
+        console.log(`📤 [Discord] Envoi de l'alerte pour la map ${baseMatch.map}...`);
         await sendDiscordWebhook(webhookUrl, { embeds: [embed] });
         await delay(1500); 
     }
@@ -985,7 +1011,8 @@ app.get('/test-match', async (req, res) => {
         const rows = await db.all("SELECT data FROM matches WHERE id LIKE ?", [`${latestMatchId}_%`]);
         const playersInLastMatch = rows.map(r => JSON.parse(r.data));
 
-        await announceNewMatches(playersInLastMatch, allConfigPlayers, appUrl);
+        // Le "true" permet de forcer le test en ignorant la limite d'âge de la game
+        await announceNewMatches(playersInLastMatch, allConfigPlayers, appUrl, true);
         
         res.status(200).send("Faux match envoyé sur Discord avec succès ! Va vérifier ton channel !");
     } catch (e) {
@@ -1015,8 +1042,8 @@ app.get('/trigger-report', async (req, res) => {
     }
 });
 
-// Tâches CRON (Toutes les 15 minutes, et tous les jours à 01h00 Paris)
-cron.schedule('*/15 * * * *', () => { syncAllPlayers('all'); });
+// Tâches CRON (Toutes les 5 minutes pour être plus rapide, et tous les jours à 01h00 Paris)
+cron.schedule('*/5 * * * *', () => { syncAllPlayers('all'); });
 cron.schedule('0 1 * * *', () => { generateDailyReport(false); }, { timezone: "Europe/Paris" });
 
 app.listen(PORT, '0.0.0.0', () => {
