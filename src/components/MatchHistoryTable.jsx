@@ -80,7 +80,7 @@ export const MatchHistoryTable = ({ matches, onSelectMatch, mode = 'full', playe
                         resultText = 'ÉGALITÉ';
                     }
 
-                    if (mode === 'dm') {
+                    if (match.type === 'dm') {
                         resultText = `${match.placement || '?'}${match.placement === 1 ? 'er' : 'ème'}`;
                         if (match.placement === 1) {
                             rowStyle = 'border-l-yellow-500 bg-gradient-to-r from-yellow-500/20 to-transparent hover:from-yellow-500/30 shadow-[inset_4px_0_20px_rgba(234,179,8,0.2)] border-yellow-500/20';
@@ -94,17 +94,22 @@ export const MatchHistoryTable = ({ matches, onSelectMatch, mode = 'full', playe
                         }
                     }
 
-                    // Calcul de la taille du groupe pour cet historique
+                    // Calcul de la taille du groupe
                     let partySize = 1;
                     if (match.partyId && match.allPlayers) {
                         partySize = match.allPlayers.filter(p => p.party_id === match.partyId).length;
                     }
 
+                    // FIX FUSEAU HORAIRE ICI POUR L'AFFICHAGE DU HOVER
+                    const matchTimeMs = match.timestamp ? match.timestamp * 1000 : new Date(match.date).getTime();
+                    const exactTimeStr = new Date(matchTimeMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
                     return (
                         <div
                             key={match.id + match.playerId}
-                            onClick={() => onSelectMatch(match)}
+                            onClick={() => onSelectMatch && onSelectMatch(match)}
                             className={`flex flex-col md:grid md:grid-cols-12 gap-3 md:gap-2 p-3 md:p-2.5 items-start md:items-center transition-all cursor-pointer border border-l-[4px] rounded-xl md:rounded-r-xl md:rounded-l-none ${rowStyle} group relative`}
+                            title={`Joué à ${exactTimeStr} (Heure locale)`}
                         >
                             {/* Petit indicateur de groupe en haut à gauche */}
                             {partySize > 1 && (
@@ -140,7 +145,7 @@ export const MatchHistoryTable = ({ matches, onSelectMatch, mode = 'full', playe
                                 {/* Résultat visible uniquement sur mobile ici */}
                                 <div className="md:hidden flex flex-col items-end pl-2 shrink-0">
                                     <span className={`text-xs font-black uppercase tracking-wider ${textColor}`}>{resultText}</span>
-                                    <span className="text-[9px] font-medium text-gray-500 mt-0.5">{formatRelativeDate(match.date)}</span>
+                                    <span className="text-[9px] font-medium text-gray-500 mt-0.5">{formatRelativeDate(matchTimeMs)}</span>
                                 </div>
                             </div>
 
@@ -167,7 +172,7 @@ export const MatchHistoryTable = ({ matches, onSelectMatch, mode = 'full', playe
                                     <span className={`text-sm font-black ${Number(kd) >= 1 ? 'text-white' : 'text-gray-500'}`}>
                                         {Number(kd).toFixed(2)}
                                     </span>
-                                    {mode === 'ranked' && match.rrChange !== undefined && match.rrChange !== 0 && (
+                                    {match.type === 'ranked' && match.rrChange !== undefined && match.rrChange !== 0 && (
                                         <span className={`text-[10px] font-black ${match.rrChange > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                                             {match.rrChange > 0 ? '+' : ''}{match.rrChange}
                                         </span>
@@ -179,7 +184,7 @@ export const MatchHistoryTable = ({ matches, onSelectMatch, mode = 'full', playe
                             <div className="hidden md:flex col-span-2 flex-col items-end justify-center pl-1">
                                 <span className={`text-[10px] font-black uppercase tracking-wider ${textColor}`}>{resultText}</span>
                                 <span className="text-[9px] text-gray-600 flex items-center gap-1 whitespace-nowrap mt-0.5">
-                                    {formatRelativeDate(match.date)}
+                                    {formatRelativeDate(matchTimeMs)}
                                 </span>
                             </div>
                         </div>

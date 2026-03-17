@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { X, Clock, Calendar, Map as MapIcon, Crosshair, Users, Coins, Activity, Layers, Target } from 'lucide-react';
+import { X, Clock, Calendar, Map as MapIcon, Crosshair, Users, Coins, Activity, Layers, Target, Trophy, Skull, Star, Flame, Link2, Shield } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { calculateKD } from '../utils/calculations';
 import { getRankIcon } from '../config/constants';
+import { User } from 'lucide-react';
 
 const getPlayerColor = (puuid, playersConfig) => {
     if (!puuid) return '#ff0000';
@@ -221,6 +222,11 @@ export const MatchDetailModal = ({ match, onClose, playersConfig }) => {
     const playersInLegend = playersConfig.filter(cfg => deadPlayerIds.has(cfg.id));
     const isTDM = match.type === 'tdm';
 
+    // FIX FUSEAU HORAIRE ICI ! (Le navigateur s'occupe de l'offset)
+    const matchTimeMs = match.timestamp ? match.timestamp * 1000 : new Date(match.date).getTime();
+    const timeStr = new Date(matchTimeMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const dateStr = new Date(matchTimeMs).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+
     return (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-2 sm:p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200" onClick={onClose}>
             <div className="bg-[#1c252e] w-full max-w-5xl max-h-[95dvh] rounded-2xl border border-white/10 shadow-2xl flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
@@ -233,7 +239,7 @@ export const MatchDetailModal = ({ match, onClose, playersConfig }) => {
                                 {match.result === 'WIN' ? 'VICTOIRE' : 'DÉFAITE'}
                             </Badge>
                             <span className="text-gray-400 text-[10px] sm:text-xs font-mono flex items-center gap-1">
-                                <Calendar size={12} /> {new Date(match.date).toLocaleString()}
+                                <Calendar size={12} /> {dateStr}
                             </span>
                         </div>
                         <h2 className="text-xl sm:text-3xl font-black text-white italic tracking-tighter uppercase flex items-center gap-2">
