@@ -1079,7 +1079,37 @@ const generateDailyReport = async (isManual = false, forceDate = null) => {
 
 app.get('/history', async (req, res) => {
     try {
-        const rows = await db.all('SELECT data FROM matches ORDER BY date DESC');
+        // On récupère les filtres temporels demandés par le site
+        const { start, end } = req.query;
+        let query = 'SELECT data FROM matches';
+        let params = [];
+        let conditions = [];
+
+        // Si le site demande une date de début
+        if (start && start !== 'null') {
+            conditions.push('date >= ?');
+            params.push(parseInt(start));
+        }
+        // Si le site demande une date de fin (pour les saisons)
+        if (end && end !== 'null') {
+            conditions.push('date <= ?');
+            params.push(parseInt(end));
+        }
+
+        // On assemble la requête SQL
+        if (conditions.length > 0) {
+            query += ' WHERE ' + conditions.join(' AND ');
+        }
+        
+        query += ' ORDER BY date DESC';
+
+        // SÉCURITÉ VITALE : Si le mode "Global" est sélectionné (sans dates), 
+        // on bloque à 500 matchs max pour ne pas faire exploser les navigateurs mobiles.
+        if (!start && !end) {
+            query += ' LIMIT 500'; 
+        }
+
+        const rows = await db.all(query, params);
         const matches = rows.map(row => JSON.parse(row.data));
         res.json({ matches });
     } catch (e) {

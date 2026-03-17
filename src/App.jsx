@@ -73,6 +73,7 @@ function MainApp() {
   const [challengeStartDate, setChallengeStartDate] = useState(null);
 
   const [loading, setLoading] = useState(true);
+  const [isConfigLoaded, setIsConfigLoaded] = useState(false); // FLAG POUR OPTIMISATION
   const [refreshStatus, setRefreshStatus] = useState('');
   const [serverStatus, setServerStatus] = useState('unknown');
 
@@ -91,34 +92,22 @@ function MainApp() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  const loadData = useCallback(async () => {
+  // 1. CHARGEMENT DE LA CONFIGURATION (Exécuté une seule fois au lancement)
+  const loadConfig = useCallback(async () => {
     try {
       const configRes = await fetch(`${LOCAL_SERVER_URL}/api/public/config`);
-      let validPlayerIds = new Set();
       if (configRes.ok) {
         const configData = await configRes.json();
         setPlayersConfig(configData.players || []);
         setAppUrl(configData.appUrl || '');
         setChallengeStartDate(configData.challengeStartDate);
-        validPlayerIds = new Set((configData.players || []).map(p => p.id));
       }
 
-      const res = await fetch(`${LOCAL_SERVER_URL}/history`);
-      if (res.ok) {
-        const data = await res.json();
-        const cleanMatches = (data.matches || []).filter(m => validPlayerIds.has(m.playerId));
-        setMatches(cleanMatches);
-        setServerStatus('connected');
-      } else {
-        setServerStatus('disconnected');
-      }
-
-      // CORRECTION : Fetch Saisons Valorant (API Officielle Publique)
+      // Fetch Saisons Valorant (API Officielle Publique)
       try {
         const seasonRes = await fetch('https://valorant-api.com/v1/seasons');
         const seasonData = await seasonRes.json();
         if (seasonData.status === 200) {
-          // Dans l'API, les Épisodes n'ont pas de parentUuid. Les Actes ont un parentUuid.
           const episodes = seasonData.data.filter(s => !s.parentUuid);
           const acts = seasonData.data.filter(s => s.parentUuid);
 
@@ -139,14 +128,58 @@ function MainApp() {
         }
       } catch (e) { console.error("Erreur Saisons Valorant API:", e); }
 
+      setIsConfigLoaded(true); // Autorise le chargement de l'historique
     } catch {
       setServerStatus('disconnected');
-    } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => { loadConfig(); }, [loadConfig]);
+
+  // 2. CHARGEMENT DE L'HISTORIQUE CIBLÉ (S'exécute à chaque changement de période)
+  const fetchHistory = useCallback(async () => {
+    if (!isConfigLoaded) return;
+    setLoading(true);
+
+    try {
+      let url = `${LOCAL_SERVER_URL}/history`;
+      let params = new URLSearchParams();
+
+      // On demande au backend uniquement les dates nécessaires
+      if (selectedPeriod === 'challenge' && challengeStartDate) {
+        params.append('start', new Date(challengeStartDate).getTime());
+      } else if (selectedPeriod !== 'global' && selectedPeriod !== 'challenge') {
+        const act = valorantSeasons.find(s => s.uuid === selectedPeriod);
+        if (act) {
+          params.append('start', act.startTime);
+          params.append('end', act.endTime);
+        }
+      }
+
+      const queryString = params.toString();
+      if (queryString) url += `?${queryString}`;
+
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        const validPlayerIds = new Set(playersConfig.map(p => p.id));
+        const cleanMatches = (data.matches || []).filter(m => validPlayerIds.has(m.playerId));
+        setMatches(cleanMatches);
+        setServerStatus('connected');
+      } else {
+        setServerStatus('disconnected');
+      }
+    } catch (e) {
+      setServerStatus('disconnected');
+    } finally {
+      setLoading(false);
+    }
+  }, [isConfigLoaded, selectedPeriod, challengeStartDate, valorantSeasons, playersConfig]);
+
+  useEffect(() => {
+    fetchHistory();
+  }, [fetchHistory]);
 
   const forceRefreshFromRiot = useCallback(async () => {
     if (isFetchingRef.current) return;
@@ -158,43 +191,20 @@ function MainApp() {
       const response = await fetch(`${LOCAL_SERVER_URL}/sync`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ playerId: selectedPlayerId }) });
       if (response.status === 429) { setRefreshStatus('Scan en cours...'); await new Promise(r => setTimeout(r, 3000)); }
       else if (response.ok) { setRefreshStatus('Rechargement...'); }
-      await loadData();
+      await fetchHistory(); // On recharge les données ciblées après le scan
       setRefreshStatus('À jour !');
     } catch (err) { setRefreshStatus('Erreur serveur !'); }
     finally { setTimeout(() => { setLoading(false); setRefreshStatus(''); isFetchingRef.current = false; }, 2000); }
-  }, [selectedPlayerId, loadData]);
+  }, [selectedPlayerId, fetchHistory]);
 
-  // FILTRE GLOBAL : Appliqué sur TOUTES les sections du site
+  // 3. OPTIMISATION DU FILTRE (Le filtrage temporel est déjà fait par le backend)
   const globalFilteredMatches = useMemo(() => {
     let data = matches;
-
-    // Filtre par joueur
     if (selectedPlayerId !== 'all') {
       data = data.filter(m => m.playerId === selectedPlayerId);
     }
-
-    // Filtre Temporel (Saisons / Dates)
-    if (selectedPeriod === 'global') {
-      // Ne rien faire, on garde tout
-    } else if (selectedPeriod === 'challenge' && challengeStartDate) {
-      const startDate = new Date(challengeStartDate).getTime();
-      data = data.filter(m => {
-        const matchTime = m.timestamp ? m.timestamp * 1000 : new Date(m.date).getTime();
-        return matchTime >= startDate;
-      });
-    } else {
-      // Acte spécifique sélectionné
-      const act = valorantSeasons.find(s => s.uuid === selectedPeriod);
-      if (act) {
-        data = data.filter(m => {
-          const matchTime = m.timestamp ? m.timestamp * 1000 : new Date(m.date).getTime();
-          return matchTime >= act.startTime && matchTime <= act.endTime;
-        });
-      }
-    }
-
     return data.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-  }, [selectedPlayerId, matches, selectedPeriod, challengeStartDate, valorantSeasons]);
+  }, [selectedPlayerId, matches]);
 
   const handlePlayerChange = (e) => { navigate(`/${e.target.value === 'all' ? 'global' : e.target.value}/${activeTab}`); };
   const handleTabChange = (newTab) => { navigate(`/${scope}/${newTab}`); };
