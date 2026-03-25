@@ -10,6 +10,9 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 
+// --- IMPORT DU BOT DISCORD ---
+import { Client, GatewayIntentBits } from 'discord.js';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -22,6 +25,15 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 
 let db;
+
+// --- INITIALISATION DU CLIENT DISCORD ---
+const discordClient = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent // Requis pour lire les commandes comme "!stats"
+    ]
+});
 
 // --- INITIALISATION DE LA BASE DE DONNÉES ---
 (async () => {
@@ -87,17 +99,31 @@ let db;
         console.log("🔒 Compte administrateur par défaut créé (admin / admin).");
     }
 
-    // 3. Configurations par défaut manquantes
-    await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('webhook_url', '')");
+    // 3. Configurations par défaut manquantes (Intégration Discord Bot)
+    // SÉCURITÉ : Le token a été retiré. Il doit être entré via le panel d'administration pour éviter d'être envoyé sur GitHub.
+    await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('discord_bot_token', '')");
+    await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('discord_channel_id', '')");
     await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('app_url', 'http://localhost:5173')");
     await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('challenge_start_date', '2024-01-01T00:00')");
 
-    // 4. NETTOYAGE DES FAUX MATCHS SKIRMISH (Dû au bug de l'API)
+    // 4. NETTOYAGE DES FAUX MATCHS SKIRMISH
     await db.run("DELETE FROM matches WHERE data LIKE '%\"type\":\"skirmish\"%'");
     console.log("🧹 Base de données nettoyée des matchs Skirmish corrompus.");
 
     console.log("✅ Connecté à la base SQLite & Initialisation terminée.");
     
+    // DÉMARRAGE DU BOT DISCORD
+    const botToken = await getConfig('discord_bot_token');
+    if (botToken && botToken.trim() !== '') {
+        discordClient.login(botToken).then(() => {
+            console.log(`🤖 Bot Discord connecté avec succès en tant que ${discordClient.user.tag} !`);
+        }).catch(err => {
+            console.error(`❌ Erreur de connexion du Bot Discord: Vérifiez votre Token dans le panel Admin.`);
+        });
+    } else {
+        console.log("⚠️ Aucun Token de Bot Discord trouvé. Allez dans le panel d'administration pour le configurer.");
+    }
+
     setTimeout(() => {
         syncAllPlayers();
     }, 5000);
@@ -111,7 +137,6 @@ const getConfig = async (key, defaultVal = '') => {
 const getPlayers = async () => await db.all("SELECT * FROM players");
 const getApiKeys = async () => (await db.all("SELECT key FROM api_keys")).map(r => r.key);
 
-// --- AUTHENTIFICATION MIDDLEWARE ---
 const authenticateToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -123,6 +148,77 @@ const authenticateToken = async (req, res, next) => {
         req.user = user;
         next();
     });
+};
+
+// ==========================================
+// BOT DISCORD : COMMANDES INTERACTIVES
+// ==========================================
+discordClient.on('messageCreate', async (message) => {
+    // On ignore les messages des autres bots
+    if (message.author.bot) return;
+
+    const prefix = '!';
+    if (!message.content.startsWith(prefix)) return;
+
+    const args = message.content.slice(prefix.length).trim().split(/ +/);
+    const command = args.shift().toLowerCase();
+
+    // Commande 1: Test de vie
+    if (command === 'ping') {
+        message.reply('🏓 **Pong !** Le KSL Tracker est en ligne et opérationnel.');
+    }
+
+    // Commande 2: Avoir les stats rapides d'un joueur
+    if (command === 'stats') {
+        const playerName = args.join(' ');
+        if (!playerName) return message.reply("❌ Précise un joueur ! Exemple : `!stats Tenz`");
+
+        const players = await getPlayers();
+        const target = players.find(p => p.name.toLowerCase() === playerName.toLowerCase());
+        if (!target) return message.reply(`❌ Joueur **${playerName}** introuvable dans la liste du tracker.`);
+
+        // On récupère ses 20 dernières ranked en base de données
+        const rows = await db.all("SELECT data FROM matches WHERE player_id = ? AND data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC LIMIT 20", [target.id]);
+        if (rows.length === 0) return message.reply(`⚠️ Aucun match classé trouvé pour **${target.name}**.`);
+
+        let wins = 0, kills = 0, deaths = 0, rr = 0;
+        rows.forEach(r => {
+            const m = JSON.parse(r.data);
+            if (m.result === 'WIN') wins++;
+            kills += (m.kills || 0);
+            deaths += (m.deaths || 0);
+            rr += (m.rrChange || 0);
+        });
+
+        const kd = deaths > 0 ? (kills / deaths).toFixed(2) : kills;
+        const winrate = Math.round((wins / rows.length) * 100);
+
+        const embed = {
+            title: `📊 Stats récentes (Ranked) : ${target.name}`,
+            color: parseInt(target.color.replace('#', ''), 16) || 0xff4655,
+            description: `Basé sur les **${rows.length} derniers matchs** classés.`,
+            fields: [
+                { name: 'Victoires', value: `${wins}W - ${rows.length - wins}L (${winrate}%)`, inline: true },
+                { name: 'K/D Global', value: `${kd}`, inline: true },
+                { name: 'RR Généré', value: `${rr > 0 ? '+' : ''}${rr} RR`, inline: true }
+            ]
+        };
+
+        message.reply({ embeds: [embed] });
+    }
+});
+
+// NOUVELLE FONCTION D'ENVOI DISCORD VIA LE BOT (Remplace le Webhook)
+const sendDiscordMessage = async (channelId, payload) => {
+    try {
+        if (!channelId) return;
+        const channel = await discordClient.channels.fetch(channelId);
+        if (channel) {
+            await channel.send(payload);
+        }
+    } catch (e) {
+        console.error("❌ Erreur envoi message Discord:", e.message);
+    }
 };
 
 // ==========================================
@@ -169,20 +265,22 @@ app.get('/api/public/config', async (req, res) => {
     }
 });
 
-// Admin : Config Webhook & App URL
+// Admin : Config Bot Discord & App URL
 app.get('/api/admin/config', authenticateToken, async (req, res) => {
-    const webhook_url = await getConfig('webhook_url');
+    const discord_bot_token = await getConfig('discord_bot_token');
+    const discord_channel_id = await getConfig('discord_channel_id');
     const app_url = await getConfig('app_url');
     const challenge_start_date = await getConfig('challenge_start_date');
-    res.json({ webhook_url, app_url, challenge_start_date });
+    res.json({ discord_bot_token, discord_channel_id, app_url, challenge_start_date });
 });
 
 app.post('/api/admin/config', authenticateToken, async (req, res) => {
-    const { webhook_url, app_url, challenge_start_date } = req.body;
-    if (webhook_url !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'webhook_url'", [webhook_url]);
+    const { discord_bot_token, discord_channel_id, app_url, challenge_start_date } = req.body;
+    if (discord_bot_token !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'discord_bot_token'", [discord_bot_token]);
+    if (discord_channel_id !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'discord_channel_id'", [discord_channel_id]);
     if (app_url !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'app_url'", [app_url]);
     if (challenge_start_date !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'challenge_start_date'", [challenge_start_date]);
-    res.json({ message: "Configuration sauvegardée" });
+    res.json({ message: "Configuration sauvegardée (Redémarrez le serveur si vous avez changé le Token du Bot)" });
 });
 
 // Admin : Gestion des Joueurs
@@ -247,7 +345,6 @@ app.post('/api/admin/tournaments', authenticateToken, async (req, res) => {
     const { name, date, players } = req.body;
     const id = `tourney_${Date.now()}`;
     
-    // NOUVEL ALGO : Distribution parfaite des "BYE" pour éviter les "BYE vs BYE"
     const shuffled = [...players].sort(() => 0.5 - Math.random());
     const nextPowerOf2 = Math.pow(2, Math.ceil(Math.log2(shuffled.length)));
     const numByes = nextPowerOf2 - shuffled.length;
@@ -256,22 +353,18 @@ app.post('/api/admin/tournaments', authenticateToken, async (req, res) => {
     const round1 = [];
     let playerIdx = 0;
     
-    // 1. On crée les matchs contre les "BYE"
     for(let i=0; i<numByes; i++) {
         round1.push({ player1: shuffled[playerIdx], player2: 'BYE', winner: shuffled[playerIdx], score: '' });
         playerIdx++;
     }
-    // 2. On crée les matchs normaux entre joueurs restants
     while(playerIdx < shuffled.length) {
         round1.push({ player1: shuffled[playerIdx], player2: shuffled[playerIdx+1], winner: null, score: '' });
         playerIdx += 2;
     }
     
-    // 3. On mélange le Round 1 pour que les BYEs ne soient pas tous en haut de l'arbre
     round1.sort(() => 0.5 - Math.random());
     rounds.push(round1);
 
-    // 4. Génération de l'arbre vide
     let currentMatches = round1.length;
     while (currentMatches > 1) {
         currentMatches /= 2;
@@ -282,7 +375,6 @@ app.post('/api/admin/tournaments', authenticateToken, async (req, res) => {
         rounds.push(nextRound);
     }
 
-    // 5. Avancement automatique des gagnants par BYE au Round 2
     if (rounds.length > 1) {
         for (let i = 0; i < rounds[0].length; i++) {
             if (rounds[0][i].winner) {
@@ -299,7 +391,6 @@ app.post('/api/admin/tournaments', authenticateToken, async (req, res) => {
     res.json({ message: "Tournoi créé avec succès", id });
 });
 
-// NOUVELLE ROUTE : MISE À JOUR D'UN MATCH DE TOURNOI
 app.put('/api/admin/tournaments/:id/match', authenticateToken, async (req, res) => {
     const { id } = req.params;
     const { roundIndex, matchIndex, winner, score } = req.body;
@@ -310,11 +401,9 @@ app.put('/api/admin/tournaments/:id/match', authenticateToken, async (req, res) 
     const bracket = JSON.parse(row.bracket);
     const match = bracket[roundIndex][matchIndex];
 
-    // Mise à jour
     match.winner = winner || null;
     match.score = score || '';
 
-    // Si on a un gagnant et qu'on n'est pas en finale, on l'envoie au round suivant
     if (winner && roundIndex + 1 < bracket.length) {
         const nextMatchIndex = Math.floor(matchIndex / 2);
         const isPlayer1 = matchIndex % 2 === 0;
@@ -439,7 +528,7 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
 
     await delay(500);
 
-    // SKIRMISH (Filtre strict "Custom Game")
+    // SKIRMISH
     try {
       const url = `${API_BASE}/v3/matches/${player.region}/${encodedName}/${encodedTag}?size=20${cacheBuster}`;
       const skirmishResponse = await fetchWithRetry(url, apiKeys, { headers });
@@ -494,7 +583,13 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
         const playerStats = m.players?.all_players?.find(p => p.name.toLowerCase() === player.name.toLowerCase() && p.tag.toLowerCase() === player.tag.toLowerCase());
         if (!playerStats) return null;
 
-        const relatedMmr = (mmrData.data || []).find(mmr => mmr.match_id === m.metadata.matchid) || {};
+        const relatedMmr = (mmrData.data || []).find(mmr => mmr.match_id === m.metadata.matchid);
+        
+        // SECURITE : Si le match n'est pas encore dans l'historique MMR (RR pas prêts), on l'ignore pour ce scan
+        if (!relatedMmr) {
+            console.log(`⏳ Match ${m.metadata.matchid} ignoré (RR pas encore disponibles).`);
+            return null;
+        }
         
         const b = m.teams?.blue?.rounds_won || 0;
         const r = m.teams?.red?.rounds_won || 0;
@@ -657,7 +752,7 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
               if (!weaponStats[k.damage_weapon_name]) weaponStats[k.damage_weapon_name] = { kills: 0 };
               weaponStats[k.damage_weapon_name].kills++;
             }
-            const victimInGroup = allConfigPlayers.find(p => p.id === k.victim_puuid || p.name.toLowerCase() === (k.victim_display_name || '').toLowerCase().split('#')[0]);
+            const victimInGroup = allConfigPlayers.find(p => p.id === k.victim_puuid || (p.name && p.name.toLowerCase() === (k.victim_display_name || '').toLowerCase().split('#')[0] && p.tag && p.tag.toLowerCase() === (k.victim_display_name || '').toLowerCase().split('#')[1]));
             if (victimInGroup) {
               let victimAgentImg = null;
               const vInfo = (m.players?.all_players || []).find(vp => vp.puuid === k.victim_puuid);
@@ -713,13 +808,13 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
     return newMatches;
 };
 
-// --- ALERTE FIN DE MATCH IMMÉDIATE (CORRECTION DISCORD & ANTI-SPAM 24H) ---
+// --- ALERTE FIN DE MATCH IMMÉDIATE ---
 const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appUrl, ignoreTimeLimit = false) => {
     if (newlyDiscoveredMatches.length === 0) return;
 
-    const webhookUrl = await getConfig('webhook_url');
-    if (!webhookUrl) {
-        console.log("⚠️ [Discord] Webhook non configuré, impossible d'envoyer l'alerte.");
+    const channelId = await getConfig('discord_channel_id');
+    if (!channelId) {
+        console.log("⚠️ [Discord] Channel ID non configuré, impossible d'envoyer l'alerte.");
         return;
     }
 
@@ -759,7 +854,12 @@ const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appU
         const redTeam = allPlayers.filter(p => p.team === 'Red').sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
 
         const formatPlayerRow = (p) => {
-            const isGroupMember = allConfigPlayers.find(c => c.id === p.puuid || (p.name && c.name.toLowerCase() === p.name.toLowerCase()));
+            // CORRECTION DU BUG DES HOMONYMES : On vérifie maintenant le nom ET LE TAG exact !
+            const isGroupMember = allConfigPlayers.find(c => 
+                c.id === p.puuid || 
+                (p.name && c.name.toLowerCase() === p.name.toLowerCase() && p.tag && c.tag.toLowerCase() === p.tag.toLowerCase())
+            );
+            
             const isMvp = p.puuid === matchMvpId;
             const rounds = baseMatch.roundsPlayed || 1;
             const acs = Math.round((p.stats?.score || 0) / rounds);
@@ -809,7 +909,7 @@ const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appU
         };
 
         console.log(`📤 [Discord] Envoi de l'alerte pour la map ${baseMatch.map}...`);
-        await sendDiscordWebhook(webhookUrl, { embeds: [embed] });
+        await sendDiscordMessage(channelId, { embeds: [embed] });
         await delay(1500); 
     }
 };
@@ -892,19 +992,6 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
     }
 };
 
-const sendDiscordWebhook = async (webhookUrl, payload) => {
-    try {
-        const res = await fetch(webhookUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-        if (!res.ok) console.error("Erreur Webhook Discord:", await res.text());
-    } catch (e) {
-        console.error("Erreur requête Webhook:", e.message);
-    }
-};
-
 const getParisDateString = (dateObj) => {
     return new Intl.DateTimeFormat('fr-FR', {
         timeZone: 'Europe/Paris',
@@ -918,9 +1005,9 @@ const getParisDateString = (dateObj) => {
 const generateDailyReport = async (isManual = false, forceDate = null) => {
     console.log(`📊 [RAPPORT] Génération (Manuel: ${isManual})...`);
     
-    const webhookUrl = await getConfig('webhook_url');
-    if (!webhookUrl) {
-        console.log("⚠️ [RAPPORT] Aucun webhook configuré, annulation.");
+    const channelId = await getConfig('discord_channel_id');
+    if (!channelId) {
+        console.log("⚠️ [RAPPORT] Aucun Channel ID Discord configuré, annulation.");
         return;
     }
 
@@ -949,7 +1036,7 @@ const generateDailyReport = async (isManual = false, forceDate = null) => {
 
     if (dailyRawMatches.length === 0) {
         console.log("⚠️ [RAPPORT] Vide.");
-        if (isManual) await sendDiscordWebhook(webhookUrl, { content: `🚫 **Rapport du ${dateStr}** : Le calme plat. Aucune game classée enregistrée.` });
+        if (isManual) await sendDiscordMessage(channelId, { content: `🚫 **Rapport du ${dateStr}** : Le calme plat. Aucune game classée enregistrée.` });
         return;
     }
 
@@ -1070,7 +1157,7 @@ const generateDailyReport = async (isManual = false, forceDate = null) => {
         timestamp: new Date().toISOString()
     };
 
-    await sendDiscordWebhook(webhookUrl, { embeds: [embed] });
+    await sendDiscordMessage(channelId, { embeds: [embed] });
 };
 
 // ==========================================
@@ -1085,26 +1172,21 @@ app.get('/history', async (req, res) => {
         let params = [];
         let conditions = [];
 
-        // Si le site demande une date de début
         if (start && start !== 'null') {
             conditions.push('date >= ?');
             params.push(parseInt(start));
         }
-        // Si le site demande une date de fin (pour les saisons)
         if (end && end !== 'null') {
             conditions.push('date <= ?');
             params.push(parseInt(end));
         }
 
-        // On assemble la requête SQL
         if (conditions.length > 0) {
             query += ' WHERE ' + conditions.join(' AND ');
         }
         
         query += ' ORDER BY date DESC';
 
-        // SÉCURITÉ VITALE : Si le mode "Global" est sélectionné (sans dates), 
-        // on bloque à 500 matchs max pour ne pas faire exploser les navigateurs mobiles.
         if (!start && !end) {
             query += ' LIMIT 500'; 
         }
@@ -1126,17 +1208,17 @@ app.post('/sync', async (req, res) => {
 
 app.get('/test-send', async (req, res) => {
     try {
-        const webhookUrl = await getConfig('webhook_url');
-        if (!webhookUrl) return res.status(400).send("Aucun Webhook Discord configuré dans le panel d'administration.");
+        const channelId = await getConfig('discord_channel_id');
+        if (!channelId) return res.status(400).send("Aucun ID de Salon Discord configuré dans le panel d'administration.");
 
         const embed = {
-            title: "🔌 TEST DE CONNEXION TRACKER",
+            title: "🔌 TEST DE CONNEXION BOT",
             color: 0x10b981,
-            description: "La liaison entre le serveur et Discord fonctionne parfaitement ! ✅",
+            description: "La liaison entre le serveur KSL et moi fonctionne parfaitement ! ✅",
             footer: { text: "Test manuel via /test-send" },
             timestamp: new Date().toISOString()
         };
-        await sendDiscordWebhook(webhookUrl, { embeds: [embed] });
+        await sendDiscordMessage(channelId, { embeds: [embed] });
         res.status(200).send("Message de test envoyé !");
     } catch (e) {
         res.status(500).send(e.message);
@@ -1147,8 +1229,8 @@ app.get('/test-match', async (req, res) => {
     try {
         const allConfigPlayers = await getPlayers();
         const appUrl = await getConfig('app_url', 'http://localhost:5173');
-        const webhookUrl = await getConfig('webhook_url');
-        if (!webhookUrl) return res.status(400).send("Aucun Webhook Discord configuré.");
+        const channelId = await getConfig('discord_channel_id');
+        if (!channelId) return res.status(400).send("Aucun ID de Salon Discord configuré.");
 
         const row = await db.get("SELECT data FROM matches WHERE data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC LIMIT 1");
         if (!row) return res.status(404).send("Aucun match classé en base de données pour simuler l'envoi.");
@@ -1159,7 +1241,6 @@ app.get('/test-match', async (req, res) => {
         const rows = await db.all("SELECT data FROM matches WHERE id LIKE ?", [`${latestMatchId}_%`]);
         const playersInLastMatch = rows.map(r => JSON.parse(r.data));
 
-        // Le "true" permet de forcer le test en ignorant la limite d'âge de la game
         await announceNewMatches(playersInLastMatch, allConfigPlayers, appUrl, true);
         
         res.status(200).send("Faux match envoyé sur Discord avec succès ! Va vérifier ton channel !");

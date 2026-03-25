@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Shield, Key, Users, Settings, LogOut, Check, Trash2, Plus, Info, Trophy, X, ChevronLeft, Edit3 } from 'lucide-react';
+import { Shield, Key, Users, Settings, LogOut, Check, Trash2, Plus, Info, Trophy, X, ChevronLeft, Edit3, MessageSquare } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { LOCAL_SERVER_URL } from '../config/constants';
 
@@ -15,7 +15,9 @@ export const AdminPanel = () => {
     const [players, setPlayers] = useState([]);
     const [keys, setKeys] = useState([]);
     const [tournaments, setTournaments] = useState([]);
-    const [config, setConfig] = useState({ webhook_url: '', app_url: '', challenge_start_date: '' });
+
+    // NOUVELLE CONFIGURATION AVEC LE BOT DISCORD
+    const [config, setConfig] = useState({ discord_bot_token: '', discord_channel_id: '', app_url: '', challenge_start_date: '' });
 
     const [newPlayer, setNewPlayer] = useState({ name: '', tag: '', region: 'eu', color: '#ff4655' });
     const [newKey, setNewKey] = useState('');
@@ -592,7 +594,7 @@ export const AdminPanel = () => {
                     </div>
                 )}
 
-                {/* ONGLET CONFIGURATION */}
+                {/* ONGLET CONFIGURATION (BOT DISCORD INCLUS) */}
                 {activeTab === 'settings' && (
                     <div className="space-y-6">
                         <div>
@@ -611,18 +613,38 @@ export const AdminPanel = () => {
                                 <input type="datetime-local" value={config.challenge_start_date || ''} onChange={e => setConfig({ ...config, challenge_start_date: e.target.value })} className="w-full bg-[#0f1923] text-white p-3 rounded border border-white/10 outline-none focus:border-[#ff4655] font-mono text-sm" required />
                             </div>
                             <hr className="border-white/5" />
-                            <div>
-                                <label className="text-xs text-gray-400 font-bold uppercase block mb-2">Webhook Discord</label>
-                                <input type="url" placeholder="https://discord.com/api/webhooks/..." value={config.webhook_url || ''} onChange={e => setConfig({ ...config, webhook_url: e.target.value })} className="w-full bg-[#0f1923] text-white p-3 rounded border border-white/10 outline-none focus:border-indigo-500 font-mono text-sm" />
-                                <div className="mt-3 flex flex-wrap gap-2">
+
+                            <div className="bg-[#0f1923] p-4 rounded-xl border border-[#5865F2]/30">
+                                <h3 className="font-black text-[#5865F2] uppercase mb-4 flex items-center gap-2">
+                                    <MessageSquare size={18} /> Configuration du Bot Discord
+                                </h3>
+
+                                <div className="space-y-4">
+                                    <div>
+                                        <label className="text-xs text-gray-400 font-bold uppercase block mb-1">Token du Bot (Optionnel car déjà inclus par défaut)</label>
+                                        <input type="password" value={config.discord_bot_token || ''} onChange={e => setConfig({ ...config, discord_bot_token: e.target.value })} className="w-full bg-[#1c252e] text-white p-3 rounded border border-white/10 outline-none focus:border-[#5865F2]" />
+                                    </div>
+
+                                    <div>
+                                        <label className="text-xs text-gray-400 font-bold uppercase block mb-1">ID du Salon Discord (Pour les alertes auto)</label>
+                                        <p className="text-[10px] text-gray-500 mb-2">Faites Clic-Droit sur un salon textuel sur Discord {'>'} "Copier l'identifiant du salon". (Nécessite le Mode Développeur Discord activé).</p>
+                                        <input type="text" placeholder="Ex: 1070058980836540467" value={config.discord_channel_id || ''} onChange={e => setConfig({ ...config, discord_channel_id: e.target.value })} className="w-full bg-[#1c252e] text-white p-3 rounded border border-white/10 outline-none focus:border-[#5865F2] font-mono" />
+                                    </div>
+                                </div>
+
+                                <div className="mt-4 flex flex-wrap gap-2">
                                     <button type="button" onClick={async () => {
-                                        try { await fetch(`${LOCAL_SERVER_URL}/test-match`); showMsg("Faux match envoyé sur Discord !"); } catch (e) { console.error("Erreur test match:", e); }
-                                    }} className="px-4 py-2 bg-indigo-500/20 text-indigo-400 hover:bg-indigo-500/40 rounded text-xs font-bold transition-colors">Test Fin de Match</button>
+                                        try { await fetch(`${LOCAL_SERVER_URL}/test-send`); showMsg("Ping envoyé au bot ! Vérifiez Discord."); } catch (e) { showMsg("Erreur ping", "error"); }
+                                    }} className="flex-1 bg-[#5865F2]/20 hover:bg-[#5865F2]/40 text-[#5865F2] font-bold py-2 rounded text-xs transition-colors text-center">Test Connexion Bot</button>
                                     <button type="button" onClick={async () => {
-                                        try { await fetch(`${LOCAL_SERVER_URL}/test-report`); showMsg("Faux rapport envoyé sur Discord !"); } catch (e) { console.error("Erreur test rapport:", e); }
-                                    }} className="px-4 py-2 bg-purple-500/20 text-purple-400 hover:bg-purple-500/40 rounded text-xs font-bold transition-colors">Test Rapport Quotidien</button>
+                                        try { await fetch(`${LOCAL_SERVER_URL}/test-match`); showMsg("Faux match envoyé !"); } catch (e) { showMsg("Erreur", "error"); }
+                                    }} className="flex-1 bg-emerald-500/20 hover:bg-emerald-500/40 text-emerald-400 font-bold py-2 rounded text-xs transition-colors text-center">Test Faux Match</button>
+                                    <button type="button" onClick={async () => {
+                                        try { await fetch(`${LOCAL_SERVER_URL}/test-report`); showMsg("Faux rapport envoyé !"); } catch (e) { showMsg("Erreur", "error"); }
+                                    }} className="flex-1 bg-purple-500/20 hover:bg-purple-500/40 text-purple-400 font-bold py-2 rounded text-xs transition-colors text-center">Test Rapport Quotidien</button>
                                 </div>
                             </div>
+
                             <button type="submit" className="w-full bg-emerald-500 hover:bg-emerald-600 text-white font-black py-3 rounded uppercase tracking-wider transition-colors mt-4">
                                 Sauvegarder la configuration
                             </button>
