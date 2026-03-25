@@ -10,8 +10,8 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 
-// --- IMPORT DU BOT DISCORD ---
-import { Client, GatewayIntentBits } from 'discord.js';
+// --- IMPORT DU BOT DISCORD (AVEC COMPOSANTS INTERACTIFS) ---
+import { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -31,7 +31,7 @@ const discordClient = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent // Requis pour lire les commandes comme "!stats"
+        GatewayIntentBits.MessageContent 
     ]
 });
 
@@ -39,7 +39,6 @@ const discordClient = new Client({
 (async () => {
     db = await open({ filename: DB_FILE, driver: sqlite3.Database });
     
-    // Création de toutes les tables nécessaires
     await db.exec(`
         CREATE TABLE IF NOT EXISTS matches (
             id TEXT PRIMARY KEY,
@@ -84,14 +83,12 @@ const discordClient = new Client({
         );
     `);
 
-    // 1. Initialiser le secret JWT s'il n'existe pas
     let jwtSecretRow = await db.get("SELECT value FROM config WHERE key = 'jwt_secret'");
     if (!jwtSecretRow) {
         const secret = crypto.randomBytes(64).toString('hex');
         await db.run("INSERT INTO config (key, value) VALUES ('jwt_secret', ?)", [secret]);
     }
 
-    // 2. Initialiser le compte Admin par défaut (admin / admin) s'il n'y a aucun utilisateur
     const adminUser = await db.get("SELECT * FROM users WHERE username = 'admin'");
     if (!adminUser) {
         const hash = await bcrypt.hash('admin', 10);
@@ -99,16 +96,11 @@ const discordClient = new Client({
         console.log("🔒 Compte administrateur par défaut créé (admin / admin).");
     }
 
-    // 3. Configurations par défaut manquantes (Intégration Discord Bot)
-    // SÉCURITÉ : Le token a été retiré. Il doit être entré via le panel d'administration pour éviter d'être envoyé sur GitHub.
+    // Configurations par défaut
     await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('discord_bot_token', '')");
     await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('discord_channel_id', '')");
     await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('app_url', 'http://localhost:5173')");
     await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('challenge_start_date', '2024-01-01T00:00')");
-
-    // 4. NETTOYAGE DES FAUX MATCHS SKIRMISH
-    await db.run("DELETE FROM matches WHERE data LIKE '%\"type\":\"skirmish\"%'");
-    console.log("🧹 Base de données nettoyée des matchs Skirmish corrompus.");
 
     console.log("✅ Connecté à la base SQLite & Initialisation terminée.");
     
@@ -129,7 +121,6 @@ const discordClient = new Client({
     }, 5000);
 })();
 
-// --- HELPERS BASE DE DONNÉES ---
 const getConfig = async (key, defaultVal = '') => {
     const row = await db.get("SELECT value FROM config WHERE key = ?", [key]);
     return row ? row.value : defaultVal;
@@ -151,10 +142,111 @@ const authenticateToken = async (req, res, next) => {
 };
 
 // ==========================================
-// BOT DISCORD : COMMANDES INTERACTIVES
+// BOT DISCORD : CRÉATION DU MESSAGE INTERACTIF
+// ==========================================
+
+const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
+    const rows = await db.all("SELECT data FROM matches WHERE id LIKE ?", [`${matchId}_%`]);
+    if (!rows || rows.length === 0) return null;
+
+    const playersInMatch = rows.map(r => JSON.parse(r.data));
+    const baseMatch = playersInMatch[0]; 
+    
+    const isWin = baseMatch.result === 'WIN';
+    const color = isWin ? 0x10b981 : (baseMatch.result === 'LOSS' ? 0xef4444 : 0x9ca3af);
+
+    const allPlayers = baseMatch.allPlayers || [];
+    const globalSorted = [...allPlayers].sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
+    const matchMvpId = globalSorted.length > 0 ? globalSorted[0].puuid : null;
+
+    const blueTeam = allPlayers.filter(p => p.team === 'Blue').sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
+    const redTeam = allPlayers.filter(p => p.team === 'Red').sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
+
+    // Construction de l'Embed principal
+    const embed = new EmbedBuilder()
+        .setTitle(`🚨 FIN DE MATCH (RANKED) : ${baseMatch.map.toUpperCase()}`)
+        .setURL(appUrl)
+        .setColor(view === 'blue' ? 0x3b82f6 : (view === 'red' ? 0xef4444 : color))
+        .setFooter({ text: "KSL Tracker • Interactif" })
+        .setTimestamp(baseMatch.timestamp ? baseMatch.timestamp * 1000 : new Date(baseMatch.date).getTime());
+
+    // Image de l'agent du meilleur joueur de l'escouade
+    const topTracked = [...playersInMatch].sort((a, b) => b.score - a.score)[0];
+    if (topTracked && topTracked.agentImg) {
+        embed.setThumbnail(topTracked.agentImg);
+    }
+
+    const formatPlayerRow = (p) => {
+        const isGroupMember = allConfigPlayers.find(c => 
+            c.id === p.puuid || 
+            (p.name && c.name.toLowerCase() === p.name.toLowerCase() && p.tag && c.tag.toLowerCase() === p.tag.toLowerCase())
+        );
+        
+        const isMvp = p.puuid === matchMvpId;
+        const rounds = baseMatch.roundsPlayed || 1;
+        const acs = Math.round((p.stats?.score || 0) / rounds);
+        
+        const agentName = (p.character || '?').padEnd(9);
+        const kills = String(p.stats?.kills || 0).padStart(2, '0');
+        const deaths = String(p.stats?.deaths || 0).padStart(2, '0');
+        const assists = String(p.stats?.assists || 0).padStart(2, '0');
+
+        let title = `**${p.name}**`;
+        if (isMvp) title += ` 👑`;
+        if (isGroupMember) {
+            const trackedData = playersInMatch.find(tm => tm.playerId === isGroupMember.id);
+            if (trackedData && trackedData.rrChange !== undefined && baseMatch.type === 'ranked') {
+                const rrSign = trackedData.rrChange > 0 ? '+' : '';
+                title += `  *( ${rrSign}${trackedData.rrChange} RR )*`;
+            }
+        }
+
+        return `${title}\n> \`${agentName}\` | 🎯 **${kills}/${deaths}/${assists}** | 💥 **${acs}** ACS\n`;
+    };
+
+    if (view === 'global') {
+        let desc = `**Score final :** ${baseMatch.matchScore} (${isWin ? 'Victoire' : 'Défaite'})\n\n**Vos Joueurs :**\n`;
+        const trackedAllPlayersInfo = allPlayers.filter(p => allConfigPlayers.find(c => 
+            c.id === p.puuid || 
+            (p.name && c.name.toLowerCase() === p.name.toLowerCase() && p.tag && c.tag.toLowerCase() === p.tag.toLowerCase())
+        ));
+        trackedAllPlayersInfo.forEach(p => {
+            desc += formatPlayerRow(p) + '\n';
+        });
+        embed.setDescription(desc);
+    } else if (view === 'blue') {
+        let desc = `🔵 **ÉQUIPE BLEUE** - *Score : ${baseMatch.teamInfo?.blue?.rounds_won || 0}*\n\n`;
+        blueTeam.forEach(p => desc += formatPlayerRow(p) + '\n');
+        embed.setDescription(desc);
+    } else if (view === 'red') {
+        let desc = `🔴 **ÉQUIPE ROUGE** - *Score : ${baseMatch.teamInfo?.red?.rounds_won || 0}*\n\n`;
+        redTeam.forEach(p => desc += formatPlayerRow(p) + '\n');
+        embed.setDescription(desc);
+    }
+
+    // Création des Boutons
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`match_global_${matchId}`)
+            .setLabel('Bilan Global')
+            .setStyle(view === 'global' ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder()
+            .setCustomId(`match_blue_${matchId}`)
+            .setLabel('Équipe Bleue')
+            .setStyle(view === 'blue' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+        new ButtonBuilder()
+            .setCustomId(`match_red_${matchId}`)
+            .setLabel('Équipe Rouge')
+            .setStyle(view === 'red' ? ButtonStyle.Danger : ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [row] };
+};
+
+// ==========================================
+// BOT DISCORD : ÉCOUTEURS D'ÉVÉNEMENTS
 // ==========================================
 discordClient.on('messageCreate', async (message) => {
-    // On ignore les messages des autres bots
     if (message.author.bot) return;
 
     const prefix = '!';
@@ -163,12 +255,10 @@ discordClient.on('messageCreate', async (message) => {
     const args = message.content.slice(prefix.length).trim().split(/ +/);
     const command = args.shift().toLowerCase();
 
-    // Commande 1: Test de vie
     if (command === 'ping') {
         message.reply('🏓 **Pong !** Le KSL Tracker est en ligne et opérationnel.');
     }
 
-    // Commande 2: Avoir les stats rapides d'un joueur
     if (command === 'stats') {
         const playerName = args.join(' ');
         if (!playerName) return message.reply("❌ Précise un joueur ! Exemple : `!stats Tenz`");
@@ -177,7 +267,6 @@ discordClient.on('messageCreate', async (message) => {
         const target = players.find(p => p.name.toLowerCase() === playerName.toLowerCase());
         if (!target) return message.reply(`❌ Joueur **${playerName}** introuvable dans la liste du tracker.`);
 
-        // On récupère ses 20 dernières ranked en base de données
         const rows = await db.all("SELECT data FROM matches WHERE player_id = ? AND data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC LIMIT 20", [target.id]);
         if (rows.length === 0) return message.reply(`⚠️ Aucun match classé trouvé pour **${target.name}**.`);
 
@@ -193,22 +282,42 @@ discordClient.on('messageCreate', async (message) => {
         const kd = deaths > 0 ? (kills / deaths).toFixed(2) : kills;
         const winrate = Math.round((wins / rows.length) * 100);
 
-        const embed = {
-            title: `📊 Stats récentes (Ranked) : ${target.name}`,
-            color: parseInt(target.color.replace('#', ''), 16) || 0xff4655,
-            description: `Basé sur les **${rows.length} derniers matchs** classés.`,
-            fields: [
+        const embed = new EmbedBuilder()
+            .setTitle(`📊 Stats récentes (Ranked) : ${target.name}`)
+            .setColor(parseInt(target.color.replace('#', ''), 16) || 0xff4655)
+            .setDescription(`Basé sur les **${rows.length} derniers matchs** classés.`)
+            .addFields(
                 { name: 'Victoires', value: `${wins}W - ${rows.length - wins}L (${winrate}%)`, inline: true },
                 { name: 'K/D Global', value: `${kd}`, inline: true },
                 { name: 'RR Généré', value: `${rr > 0 ? '+' : ''}${rr} RR`, inline: true }
-            ]
-        };
+            );
 
         message.reply({ embeds: [embed] });
     }
 });
 
-// NOUVELLE FONCTION D'ENVOI DISCORD VIA LE BOT (Remplace le Webhook)
+// Écouteur pour les clics sur les boutons !
+discordClient.on('interactionCreate', async interaction => {
+    if (!interaction.isButton()) return;
+
+    const customId = interaction.customId;
+    if (customId.startsWith('match_')) {
+        const parts = customId.split('_');
+        const view = parts[1]; // 'global', 'blue', 'red'
+        const matchId = parts.slice(2).join('_');
+
+        const appUrl = await getConfig('app_url', 'http://localhost:5173');
+        const allConfigPlayers = await getPlayers();
+
+        const messagePayload = await buildMatchMessage(matchId, view, allConfigPlayers, appUrl);
+        if (messagePayload) {
+            await interaction.update(messagePayload);
+        } else {
+            await interaction.reply({ content: "Désolé, ce match n'est plus en base de données.", ephemeral: true });
+        }
+    }
+});
+
 const sendDiscordMessage = async (channelId, payload) => {
     try {
         if (!channelId) return;
@@ -534,11 +643,6 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
       const skirmishResponse = await fetchWithRetry(url, apiKeys, { headers });
       const skirmishData = skirmishResponse.ok ? await skirmishResponse.json().catch(() => ({ data: [] })) : { data: [] };
       
-      if (skirmishData.data && skirmishData.data.length > 0) {
-          const modesJoues = [...new Set(skirmishData.data.map(m => m.metadata?.mode))];
-          console.log(`🕵️ Noms internes des modes récents de ${player.name} :`, modesJoues);
-      }
-
       const cleanSkirmishMatches = (skirmishData.data || [])
         .filter(m => m.metadata && m.metadata.mode && m.metadata.mode === 'Custom Game') 
         .map(m => {
@@ -839,78 +943,13 @@ const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appU
         }
     });
 
-    for (const [matchId, playersInMatch] of Object.entries(matchesById)) {
-        const baseMatch = playersInMatch[0]; 
-        const isWin = baseMatch.result === 'WIN';
-        const color = isWin ? 0x10b981 : (baseMatch.result === 'LOSS' ? 0xef4444 : 0x9ca3af);
-        
-        let desc = `**Score final :** ${baseMatch.matchScore} (${isWin ? 'Victoire' : 'Défaite'})\n\n`;
-
-        const allPlayers = baseMatch.allPlayers || [];
-        const globalSorted = [...allPlayers].sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
-        const matchMvpId = globalSorted.length > 0 ? globalSorted[0].puuid : null;
-
-        const blueTeam = allPlayers.filter(p => p.team === 'Blue').sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
-        const redTeam = allPlayers.filter(p => p.team === 'Red').sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
-
-        const formatPlayerRow = (p) => {
-            // CORRECTION DU BUG DES HOMONYMES : On vérifie maintenant le nom ET LE TAG exact !
-            const isGroupMember = allConfigPlayers.find(c => 
-                c.id === p.puuid || 
-                (p.name && c.name.toLowerCase() === p.name.toLowerCase() && p.tag && c.tag.toLowerCase() === p.tag.toLowerCase())
-            );
-            
-            const isMvp = p.puuid === matchMvpId;
-            const rounds = baseMatch.roundsPlayed || 1;
-            const acs = Math.round((p.stats?.score || 0) / rounds);
-            
-            const agentName = (p.character || '?').substring(0, 9).padEnd(9);
-            const kills = String(p.stats?.kills || 0).padStart(2, ' ');
-            const deaths = String(p.stats?.deaths || 0).padStart(2, ' ');
-            const assists = String(p.stats?.assists || 0).padStart(2, ' ');
-            const acsStr = String(acs).padStart(3, ' ');
-
-            let row = `\`${agentName} | ${kills}/${deaths}/${assists} | ACS: ${acsStr}\` `;
-
-            if (isGroupMember) {
-                const trackedData = playersInMatch.find(tm => tm.playerId === isGroupMember.id);
-                let rrText = "";
-                if (trackedData && trackedData.rrChange !== undefined && baseMatch.type === 'ranked') {
-                    const rrSign = trackedData.rrChange > 0 ? '+' : '';
-                    rrText = `[ ${rrSign}${trackedData.rrChange} RR ]`;
-                }
-                row += `**${isGroupMember.name}** **${rrText}**`;
-            } else {
-                row += `${p.name}`;
-            }
-
-            if (isMvp) row += ` 👑`;
-
-            return row + `\n`;
-        };
-
-        if (blueTeam.length > 0) {
-            desc += `🔵 **ÉQUIPE BLEUE**\n`;
-            blueTeam.forEach(p => desc += formatPlayerRow(p));
-            desc += `\n`;
+    for (const matchId of Object.keys(matchesById)) {
+        const messagePayload = await buildMatchMessage(matchId, 'global', allConfigPlayers, appUrl);
+        if (messagePayload) {
+            console.log(`📤 [Discord] Envoi de l'alerte pour le match ${matchId}...`);
+            await sendDiscordMessage(channelId, messagePayload);
+            await delay(1500); 
         }
-
-        if (redTeam.length > 0) {
-            desc += `🔴 **ÉQUIPE ROUGE**\n`;
-            redTeam.forEach(p => desc += formatPlayerRow(p));
-        }
-
-        const embed = {
-            title: `🚨 FIN DE MATCH (RANKED) : ${baseMatch.map.toUpperCase()}`,
-            color: color,
-            description: desc,
-            url: appUrl,
-            footer: { text: "Tracker Custom • Alerte Rapide" }
-        };
-
-        console.log(`📤 [Discord] Envoi de l'alerte pour la map ${baseMatch.map}...`);
-        await sendDiscordMessage(channelId, { embeds: [embed] });
-        await delay(1500); 
     }
 };
 
@@ -1107,14 +1146,17 @@ const generateDailyReport = async (isManual = false, forceDate = null) => {
         return hsB - hsA;
     })[0];
 
-    const fields = [];
-    const totalRRDay = activePlayers.reduce((acc, p) => acc + p.rrChange, 0);
+    const embed = new EmbedBuilder()
+        .setTitle(`📊 RAPPORT QUOTIDIEN • ${dateTitle.toUpperCase()}`)
+        .setURL(appUrl)
+        .setColor(color)
+        .setThumbnail("https://media.discordapp.net/attachments/1070058980836540467/1164570087799562300/valorant-logo.png")
+        .setFooter({ text: "Tracker Custom • Auto-généré" })
+        .setTimestamp();
 
-    fields.push({
-        name: `${weatherEmoji} Bilan de l'Escouade`,
-        value: `**Météo :** ${weatherTitle}\n**Winrate :** ${globalWinrate}% (${totalWins}W - ${totalUniqueGames - totalWins}L)\n**Rentabilité :** ${totalRRDay > 0 ? '+' : ''}${totalRRDay} RR globaux`,
-        inline: false
-    });
+    embed.addFields(
+        { name: `${weatherEmoji} Bilan de l'Escouade`, value: `**Météo :** ${weatherTitle}\n**Winrate :** ${globalWinrate}% (${totalWins}W - ${totalUniqueGames - totalWins}L)\n**Rentabilité :** ${totalRRDay > 0 ? '+' : ''}${totalRRDay} RR globaux`, inline: false }
+    );
 
     let fameText = "";
     if (mvp && mvp.rrChange > 0) fameText += `👑 **MVP :** ${mvp.name} (*+${mvp.rrChange} RR*)\n`;
@@ -1122,40 +1164,25 @@ const generateDailyReport = async (isManual = false, forceDate = null) => {
     if (sniper && sniper.shots > 0) fameText += `🎯 **Sniper :** ${sniper.name} (*${Math.round((sniper.headshots/sniper.shots)*100)}% HS*)\n`;
     if (loser && loser.rrChange < 0) fameText += `🤡 **Poids Mort :** ${loser.name} (*${loser.rrChange} RR*)\n`;
 
-    fields.push({
-        name: "🏆 Tableau d'Honneur",
-        value: fameText || "Pas de trophées marquants aujourd'hui.",
-        inline: false
-    });
+    embed.addFields(
+        { name: "🏆 Tableau d'Honneur", value: fameText || "Pas de trophées marquants aujourd'hui.", inline: false }
+    );
 
     let gamesLog = "";
     uniqueGamesList.forEach(g => {
         const icon = g.result === 'WIN' ? "🟢" : (g.result === 'DRAW' ? "⚪" : "🔴");
         const scoreText = g.score ? `**${g.score}**` : "";
         gamesLog += `${icon} **${g.map.toUpperCase()}** - ${scoreText}\n`;
-        
         g.players.sort((a, b) => parseInt(b.rr) - parseInt(a.rr));
-        
         g.players.forEach(p => {
             gamesLog += `> \`${p.agent.padEnd(9)}\` **${p.name}** : **${p.rr} RR** | ${p.kd} K/D | ${p.acs} ACS | ${p.hs}% HS\n`;
         });
         gamesLog += "\n";
     });
 
-    if (gamesLog.length > 3900) {
-        gamesLog = gamesLog.substring(0, 3900) + "\n... *[Journal tronqué par limite Discord]*";
-    }
-
-    const embed = {
-        title: `📊 RAPPORT QUOTIDIEN • ${dateTitle.toUpperCase()}`,
-        url: appUrl,
-        color: color,
-        description: `**📝 Journal des Matchs**\n\n${gamesLog || "Aucun détail de match."}`,
-        fields: fields,
-        thumbnail: { url: "https://media.discordapp.net/attachments/1070058980836540467/1164570087799562300/valorant-logo.png" },
-        footer: { text: "Tracker Custom • Auto-généré" },
-        timestamp: new Date().toISOString()
-    };
+    if (gamesLog.length > 3900) gamesLog = gamesLog.substring(0, 3900) + "\n... *[Journal tronqué par limite Discord]*";
+    
+    embed.setDescription(`**📝 Journal des Matchs**\n\n${gamesLog || "Aucun détail de match."}`);
 
     await sendDiscordMessage(channelId, { embeds: [embed] });
 };
@@ -1166,7 +1193,6 @@ const generateDailyReport = async (isManual = false, forceDate = null) => {
 
 app.get('/history', async (req, res) => {
     try {
-        // On récupère les filtres temporels demandés par le site
         const { start, end } = req.query;
         let query = 'SELECT data FROM matches';
         let params = [];
@@ -1211,13 +1237,13 @@ app.get('/test-send', async (req, res) => {
         const channelId = await getConfig('discord_channel_id');
         if (!channelId) return res.status(400).send("Aucun ID de Salon Discord configuré dans le panel d'administration.");
 
-        const embed = {
-            title: "🔌 TEST DE CONNEXION BOT",
-            color: 0x10b981,
-            description: "La liaison entre le serveur KSL et moi fonctionne parfaitement ! ✅",
-            footer: { text: "Test manuel via /test-send" },
-            timestamp: new Date().toISOString()
-        };
+        const embed = new EmbedBuilder()
+            .setTitle("🔌 TEST DE CONNEXION BOT")
+            .setColor(0x10b981)
+            .setDescription("La liaison entre le serveur KSL et moi fonctionne parfaitement ! ✅")
+            .setFooter({ text: "Test manuel via /test-send" })
+            .setTimestamp();
+            
         await sendDiscordMessage(channelId, { embeds: [embed] });
         res.status(200).send("Message de test envoyé !");
     } catch (e) {
