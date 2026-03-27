@@ -16,6 +16,10 @@ export const AdminPanel = () => {
     const [keys, setKeys] = useState([]);
     const [tournaments, setTournaments] = useState([]);
 
+    // Etats Édition Joueur
+    const [editingPlayerId, setEditingPlayerId] = useState(null);
+    const [editPlayerForm, setEditPlayerForm] = useState({ name: '', tag: '', color: '' });
+
     // NOUVELLE CONFIGURATION AVEC LE BOT DISCORD
     const [config, setConfig] = useState({ discord_bot_token: '', discord_channel_id: '', app_url: '', challenge_start_date: '' });
 
@@ -133,6 +137,32 @@ export const AdminPanel = () => {
             fetchData();
         } catch (err) {
             console.error(err);
+        }
+    };
+
+    // --- FONCTIONS ÉDITION JOUEUR ---
+    const startEditPlayer = (p) => {
+        setEditingPlayerId(p.id);
+        setEditPlayerForm({ name: p.name, tag: p.tag, color: p.color });
+    };
+
+    const saveEditPlayer = async (id) => {
+        try {
+            const res = await fetch(`${LOCAL_SERVER_URL}/api/admin/players/${id}`, {
+                method: 'PUT',
+                headers: authHeaders,
+                body: JSON.stringify(editPlayerForm)
+            });
+            if (res.ok) {
+                showMsg("Joueur mis à jour !");
+                setEditingPlayerId(null);
+                fetchData();
+            } else {
+                showMsg("Erreur lors de la mise à jour", "error");
+            }
+        } catch (err) {
+            console.error(err);
+            showMsg("Erreur réseau", "error");
         }
     };
 
@@ -418,16 +448,46 @@ export const AdminPanel = () => {
                         <div className="bg-[#1c252e] rounded-xl border border-white/5 overflow-hidden">
                             {players.map(p => (
                                 <div key={p.id} className="flex items-center justify-between p-4 border-b border-white/5 hover:bg-white/5 transition-colors">
-                                    <div className="flex items-center gap-3">
-                                        <div className="w-4 h-4 rounded-full" style={{ backgroundColor: p.color }}></div>
-                                        <div>
-                                            <div className="font-bold text-white leading-none">{p.name} <span className="text-gray-500 text-xs">#{p.tag}</span></div>
-                                            <div className="text-[10px] text-gray-500 font-mono mt-1">ID: {p.id}</div>
+
+                                    {editingPlayerId === p.id ? (
+                                        <div className="flex-grow flex items-center gap-2 mr-4">
+                                            <input type="color" value={editPlayerForm.color} onChange={e => setEditPlayerForm({ ...editPlayerForm, color: e.target.value })} className="h-8 w-8 p-0 bg-transparent border border-white/10 rounded cursor-pointer shrink-0" />
+                                            <input type="text" value={editPlayerForm.name} onChange={e => setEditPlayerForm({ ...editPlayerForm, name: e.target.value })} className="bg-[#0f1923] text-white px-2 py-1.5 rounded border border-white/10 text-sm font-bold w-full outline-none focus:border-blue-500" />
+                                            <span className="text-gray-500 font-bold">#</span>
+                                            <input type="text" value={editPlayerForm.tag} onChange={e => setEditPlayerForm({ ...editPlayerForm, tag: e.target.value })} className="bg-[#0f1923] text-white px-2 py-1.5 rounded border border-white/10 text-sm font-bold w-24 outline-none focus:border-blue-500" />
                                         </div>
+                                    ) : (
+                                        <div className="flex items-center gap-3">
+                                            <div className="w-4 h-4 rounded-full" style={{ backgroundColor: p.color }}></div>
+                                            <div>
+                                                <div className="font-bold text-white leading-none">{p.name} <span className="text-gray-500 text-xs">#{p.tag}</span></div>
+                                                <div className="text-[10px] text-gray-500 font-mono mt-1">ID: {p.id}</div>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    <div className="flex items-center gap-2 shrink-0">
+                                        {editingPlayerId === p.id ? (
+                                            <>
+                                                <button onClick={() => saveEditPlayer(p.id)} className="p-2 text-emerald-400 hover:bg-emerald-400/10 rounded transition-colors" title="Sauvegarder">
+                                                    <Check size={18} />
+                                                </button>
+                                                <button onClick={() => setEditingPlayerId(null)} className="p-2 text-gray-500 hover:bg-white/10 rounded transition-colors" title="Annuler">
+                                                    <X size={18} />
+                                                </button>
+                                            </>
+                                        ) : (
+                                            <>
+                                                <button onClick={() => startEditPlayer(p)} className="p-2 text-blue-400 hover:bg-blue-400/10 rounded transition-colors" title="Modifier pseudo/couleur">
+                                                    <Edit3 size={18} />
+                                                </button>
+                                                <button onClick={() => deletePlayer(p.id)} className="p-2 text-gray-500 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors">
+                                                    <Trash2 size={18} />
+                                                </button>
+                                            </>
+                                        )}
                                     </div>
-                                    <button onClick={() => deletePlayer(p.id)} className="p-2 text-gray-500 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors">
-                                        <Trash2 size={18} />
-                                    </button>
+
                                 </div>
                             ))}
                             {players.length === 0 && <div className="p-6 text-center text-gray-500 text-sm">Aucun joueur enregistré.</div>}

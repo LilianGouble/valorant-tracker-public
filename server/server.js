@@ -406,6 +406,19 @@ app.post('/api/admin/players', authenticateToken, async (req, res) => {
     res.json({ message: "Joueur ajouté", id });
 });
 
+app.put('/api/admin/players/:id', authenticateToken, async (req, res) => {
+    const { name, tag, color } = req.body;
+    try {
+        await db.run(
+            "UPDATE players SET name = ?, tag = ?, color = ? WHERE id = ?",
+            [name, tag, color, req.params.id]
+        );
+        res.json({ message: "Joueur mis à jour avec succès" });
+    } catch (e) {
+        res.status(500).json({ error: "Erreur lors de la mise à jour" });
+    }
+});
+
 app.delete('/api/admin/players/:id', authenticateToken, async (req, res) => {
     await db.run("DELETE FROM players WHERE id = ?", [req.params.id]);
     res.json({ message: "Joueur supprimé" });
