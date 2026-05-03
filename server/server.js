@@ -141,10 +141,18 @@ const authenticateToken = async (req, res, next) => {
     });
 };
 
-// ==========================================
-// BOT DISCORD : CRÉATION DU MESSAGE INTERACTIF
-// ==========================================
+const getParisDateString = (dateObj) => {
+    return new Intl.DateTimeFormat('fr-FR', {
+        timeZone: 'Europe/Paris',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    }).format(dateObj); 
+};
 
+// ==========================================
+// BOT DISCORD : CRÉATION DU MESSAGE MATCH
+// ==========================================
 const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
     const rows = await db.all("SELECT data FROM matches WHERE id LIKE ?", [`${matchId}_%`]);
     if (!rows || rows.length === 0) return null;
@@ -162,7 +170,6 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
     const blueTeam = allPlayers.filter(p => p.team === 'Blue').sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
     const redTeam = allPlayers.filter(p => p.team === 'Red').sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
 
-    // Construction de l'Embed principal
     const embed = new EmbedBuilder()
         .setTitle(`🚨 FIN DE MATCH (RANKED) : ${baseMatch.map.toUpperCase()}`)
         .setURL(appUrl)
@@ -170,7 +177,6 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
         .setFooter({ text: "KSL Tracker • Interactif" })
         .setTimestamp(baseMatch.timestamp ? baseMatch.timestamp * 1000 : new Date(baseMatch.date).getTime());
 
-    // Image de l'agent du meilleur joueur de l'escouade
     const topTracked = [...playersInMatch].sort((a, b) => b.score - a.score)[0];
     if (topTracked && topTracked.agentImg) {
         embed.setThumbnail(topTracked.agentImg);
@@ -205,14 +211,13 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
     };
 
     if (view === 'global') {
-        let desc = `**Score final :** ${baseMatch.matchScore} (${isWin ? 'Victoire' : 'Défaite'})\n\n**Vos Joueurs :**\n`;
+        let desc = `**Score final :** ${baseMatch.matchScore} (${isWin ? 'Victoire' : 'Défaite'})\n\n**Vos Joueurs (Triés par ACS) :**\n`;
         const trackedAllPlayersInfo = allPlayers.filter(p => allConfigPlayers.find(c => 
             c.id === p.puuid || 
             (p.name && c.name.toLowerCase() === p.name.toLowerCase() && p.tag && c.tag.toLowerCase() === p.tag.toLowerCase())
-        ));
-        trackedAllPlayersInfo.forEach(p => {
-            desc += formatPlayerRow(p) + '\n';
-        });
+        )).sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
+
+        trackedAllPlayersInfo.forEach(p => { desc += formatPlayerRow(p) + '\n'; });
         embed.setDescription(desc);
     } else if (view === 'blue') {
         let desc = `🔵 **ÉQUIPE BLEUE** - *Score : ${baseMatch.teamInfo?.blue?.rounds_won || 0}*\n\n`;
@@ -224,20 +229,124 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
         embed.setDescription(desc);
     }
 
-    // Création des Boutons
     const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId(`match_global_${matchId}`)
-            .setLabel('Bilan Global')
-            .setStyle(view === 'global' ? ButtonStyle.Success : ButtonStyle.Secondary),
-        new ButtonBuilder()
-            .setCustomId(`match_blue_${matchId}`)
-            .setLabel('Équipe Bleue')
-            .setStyle(view === 'blue' ? ButtonStyle.Primary : ButtonStyle.Secondary),
-        new ButtonBuilder()
-            .setCustomId(`match_red_${matchId}`)
-            .setLabel('Équipe Rouge')
-            .setStyle(view === 'red' ? ButtonStyle.Danger : ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId(`match_global_${matchId}`).setLabel('Bilan Global').setStyle(view === 'global' ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`match_blue_${matchId}`).setLabel('Équipe Bleue').setStyle(view === 'blue' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`match_red_${matchId}`).setLabel('Équipe Rouge').setStyle(view === 'red' ? ButtonStyle.Danger : ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [row] };
+};
+
+// ==========================================
+// BOT DISCORD : CRÉATION DU RAPPORT QUOTIDIEN
+// ==========================================
+const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) => {
+    const targetDateStr = dateStr.replace(/-/g, '/');
+
+    const rows = await db.all('SELECT date, data FROM matches ORDER BY date DESC');
+    const dailyRawMatches = rows.map(r => {
+        const m = JSON.parse(r.data);
+        m.dbDate = r.date; 
+        return m;
+    }).filter(m => m.type === 'ranked' && getParisDateString(new Date(m.dbDate)) === targetDateStr);
+
+    if (dailyRawMatches.length === 0) return null;
+
+    const uniqueGames = {};
+    const playerStats = {};
+
+    allConfigPlayers.forEach(p => {
+        playerStats[p.id] = { name: p.name, wins: 0, losses: 0, rrChange: 0, kills: 0, deaths: 0, headshots: 0, shots: 0, games: 0 };
+    });
+
+    dailyRawMatches.forEach(m => {
+        if (!uniqueGames[m.id]) {
+            uniqueGames[m.id] = { id: m.id, map: m.map, result: m.result, score: m.matchScore, time: m.date, players: [] };
+        }
+
+        const pConfig = allConfigPlayers.find(p => p.id === m.playerId);
+        const playerName = pConfig ? pConfig.name : "Inconnu";
+        const kd = m.deaths > 0 ? (m.kills / m.deaths).toFixed(2) : m.kills;
+        const rrSign = m.rrChange > 0 ? '+' : '';
+        const acs = m.acs || Math.round((m.score || 0) / (m.roundsPlayed || 1));
+        const hsPct = m.totalShots > 0 ? Math.round((m.headshots / m.totalShots) * 100) : 0;
+
+        uniqueGames[m.id].players.push({ name: playerName, agent: m.agent || "?", rr: `${rrSign}${m.rrChange}`, kd: kd, result: m.result, acs: acs, hs: hsPct });
+
+        if (playerStats[m.playerId]) {
+            const p = playerStats[m.playerId];
+            p.games++;
+            if (m.result === 'WIN') p.wins++; else p.losses++;
+            p.rrChange += m.rrChange; p.kills += m.kills; p.deaths += m.deaths; p.headshots += (m.headshots || 0); p.shots += (m.totalShots || 0);
+        }
+    });
+
+    const uniqueGamesList = Object.values(uniqueGames).sort((a, b) => new Date(a.time) - new Date(b.time));
+    const totalUniqueGames = uniqueGamesList.length;
+    const totalWins = uniqueGamesList.filter(g => g.result === 'WIN').length;
+    const globalWinrate = Math.round((totalWins / totalUniqueGames) * 100);
+
+    let weatherEmoji = "☁️"; let weatherTitle = "Mitigé"; let color = 0x9ca3af;
+    if (globalWinrate >= 60) { weatherEmoji = "☀️"; weatherTitle = "Grand Soleil"; color = 0x10b981; }
+    else if (globalWinrate >= 45) { weatherEmoji = "🌤️"; weatherTitle = "Éclaircies"; color = 0xfacc15; }
+    else if (globalWinrate >= 25) { weatherEmoji = "🌧️"; weatherTitle = "Averses"; color = 0x3b82f6; }
+    else { weatherEmoji = "⛈️"; weatherTitle = "Tempête"; color = 0xef4444; }
+
+    const activePlayers = Object.values(playerStats).filter(p => p.games > 0);
+    const mvp = [...activePlayers].sort((a, b) => b.rrChange - a.rrChange)[0];
+    const butcher = [...activePlayers].sort((a, b) => {
+        const kdA = a.deaths > 0 ? a.kills/a.deaths : a.kills;
+        const kdB = b.deaths > 0 ? b.kills/b.deaths : b.kills;
+        return kdB - kdA;
+    })[0];
+    const loser = [...activePlayers].sort((a, b) => a.rrChange - b.rrChange)[0];
+    const sniper = [...activePlayers].sort((a, b) => {
+        const hsA = a.shots > 0 ? a.headshots/a.shots : 0;
+        const hsB = b.shots > 0 ? b.headshots/b.shots : 0;
+        return hsB - hsA;
+    })[0];
+
+    const totalRRDay = activePlayers.reduce((acc, p) => acc + p.rrChange, 0);
+
+    const embed = new EmbedBuilder()
+        .setTitle(`📊 RAPPORT QUOTIDIEN • ${targetDateStr}`)
+        .setURL(appUrl)
+        .setColor(color)
+        .setThumbnail("https://media.discordapp.net/attachments/1070058980836540467/1164570087799562300/valorant-logo.png")
+        .setFooter({ text: "KSL Tracker • Interactif" })
+        .setTimestamp();
+
+    if (view === 'summary') {
+        embed.addFields({ name: `${weatherEmoji} Bilan de l'Escouade`, value: `**Météo :** ${weatherTitle}\n**Winrate :** ${globalWinrate}% (${totalWins}W - ${totalUniqueGames - totalWins}L)\n**Rentabilité :** ${totalRRDay > 0 ? '+' : ''}${totalRRDay} RR globaux`, inline: false });
+
+        let fameText = "";
+        if (mvp && mvp.rrChange > 0) fameText += `👑 **MVP :** ${mvp.name} (*+${mvp.rrChange} RR*)\n`;
+        if (butcher && butcher.name !== mvp?.name) fameText += `🔪 **Boucher :** ${butcher.name} (*${(butcher.deaths > 0 ? butcher.kills/butcher.deaths : butcher.kills).toFixed(2)} K/D*)\n`;
+        if (sniper && sniper.shots > 0) fameText += `🎯 **Sniper :** ${sniper.name} (*${Math.round((sniper.headshots/sniper.shots)*100)}% HS*)\n`;
+        if (loser && loser.rrChange < 0) fameText += `🤡 **Poids Mort :** ${loser.name} (*${loser.rrChange} RR*)\n`;
+
+        embed.addFields({ name: "🏆 Tableau d'Honneur", value: fameText || "Pas de trophées marquants aujourd'hui.", inline: false });
+        embed.setDescription(`*Cliquez sur le bouton ci-dessous pour voir le détail des parties de la journée.*`);
+    } else if (view === 'log') {
+        let gamesLog = "";
+        uniqueGamesList.forEach(g => {
+            const icon = g.result === 'WIN' ? "🟢" : (g.result === 'DRAW' ? "⚪" : "🔴");
+            const scoreText = g.score ? `**${g.score}**` : "";
+            gamesLog += `${icon} **${g.map.toUpperCase()}** - ${scoreText}\n`;
+            g.players.sort((a, b) => parseInt(b.rr) - parseInt(a.rr));
+            g.players.forEach(p => {
+                gamesLog += `> \`${p.agent.padEnd(9)}\` **${p.name}** : **${p.rr} RR** | ${p.kd} K/D | ${p.acs} ACS | ${p.hs}% HS\n`;
+            });
+            gamesLog += "\n";
+        });
+        if (gamesLog.length > 3900) gamesLog = gamesLog.substring(0, 3900) + "\n... *[Journal tronqué]*";
+        embed.setDescription(`**📝 Journal détaillé des Matchs**\n\n${gamesLog}`);
+    }
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`report_summary_${dateStr}`).setLabel('🏆 Bilan & Trophées').setStyle(view === 'summary' ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`report_log_${dateStr}`).setLabel('📝 Journal des Matchs').setStyle(view === 'log' ? ButtonStyle.Primary : ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [row] };
@@ -296,24 +405,35 @@ discordClient.on('messageCreate', async (message) => {
     }
 });
 
-// Écouteur pour les clics sur les boutons !
 discordClient.on('interactionCreate', async interaction => {
     if (!interaction.isButton()) return;
 
     const customId = interaction.customId;
+    const appUrl = await getConfig('app_url', 'http://localhost:5173');
+    const allConfigPlayers = await getPlayers();
+
     if (customId.startsWith('match_')) {
         const parts = customId.split('_');
-        const view = parts[1]; // 'global', 'blue', 'red'
+        const view = parts[1]; 
         const matchId = parts.slice(2).join('_');
-
-        const appUrl = await getConfig('app_url', 'http://localhost:5173');
-        const allConfigPlayers = await getPlayers();
 
         const messagePayload = await buildMatchMessage(matchId, view, allConfigPlayers, appUrl);
         if (messagePayload) {
             await interaction.update(messagePayload);
         } else {
             await interaction.reply({ content: "Désolé, ce match n'est plus en base de données.", ephemeral: true });
+        }
+    } 
+    else if (customId.startsWith('report_')) {
+        const parts = customId.split('_');
+        const view = parts[1]; 
+        const dateStr = parts.slice(2).join('_'); 
+
+        const messagePayload = await buildDailyReportMessage(dateStr, view, allConfigPlayers, appUrl);
+        if (messagePayload) {
+            await interaction.update(messagePayload);
+        } else {
+            await interaction.reply({ content: "Désolé, les données de ce rapport ont expiré.", ephemeral: true });
         }
     }
 });
@@ -362,7 +482,6 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
     res.json({ message: "Mot de passe mis à jour avec succès" });
 });
 
-// Récupération de la config publique pour le Frontend
 app.get('/api/public/config', async (req, res) => {
     try {
         const players = await getPlayers();
@@ -374,7 +493,6 @@ app.get('/api/public/config', async (req, res) => {
     }
 });
 
-// Admin : Config Bot Discord & App URL
 app.get('/api/admin/config', authenticateToken, async (req, res) => {
     const discord_bot_token = await getConfig('discord_bot_token');
     const discord_channel_id = await getConfig('discord_channel_id');
@@ -392,7 +510,6 @@ app.post('/api/admin/config', authenticateToken, async (req, res) => {
     res.json({ message: "Configuration sauvegardée (Redémarrez le serveur si vous avez changé le Token du Bot)" });
 });
 
-// Admin : Gestion des Joueurs
 app.get('/api/admin/players', authenticateToken, async (req, res) => {
     const players = await getPlayers();
     res.json(players);
@@ -424,7 +541,6 @@ app.delete('/api/admin/players/:id', authenticateToken, async (req, res) => {
     res.json({ message: "Joueur supprimé" });
 });
 
-// Admin : Gestion des Clés API
 app.get('/api/admin/keys', authenticateToken, async (req, res) => {
     const keys = await db.all("SELECT id, key FROM api_keys");
     res.json(keys);
@@ -702,7 +818,6 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
 
         const relatedMmr = (mmrData.data || []).find(mmr => mmr.match_id === m.metadata.matchid);
         
-        // SECURITE : Si le match n'est pas encore dans l'historique MMR (RR pas prêts), on l'ignore pour ce scan
         if (!relatedMmr) {
             console.log(`⏳ Match ${m.metadata.matchid} ignoré (RR pas encore disponibles).`);
             return null;
@@ -898,23 +1013,54 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
         const abilities = playerStats.ability_casts || { c_cast: 0, q_cast: 0, e_cast: 0, x_cast: 0 };
 
         return {
-          id: m.metadata.matchid, type: 'ranked', playerId: player.id, agent: playerStats.character, agentImg: playerStats.assets?.agent?.small || null,
+          id: m.metadata.matchid,
+          type: 'ranked',
+          playerId: player.id,
+          agent: playerStats.character,
+          agentImg: playerStats.assets?.agent?.small || null,
           matchScore: matchScore,
-          rrChange: relatedMmr.mmr_change_to_last_game || 0, currentRank: relatedMmr.currenttierpatched || 'Unknown', currentRR: relatedMmr.ranking_in_tier || 0, rankValue: rankValue > 0 ? rankValue : null,
-          kills, deaths, assists, score, kd: Number((deaths > 0 ? kills / deaths : kills).toFixed(2)),
-          isMatchMVP, isTeamMVP, mk3, mk4, mk5, 
-          headshots: playerStats.stats?.headshots || 0, bodyshots: playerStats.stats?.bodyshots || 0, legshots: playerStats.stats?.legshots || 0,
+          rrChange: relatedMmr.mmr_change_to_last_game || 0,
+          currentRank: relatedMmr.currenttierpatched || 'Unknown',
+          currentRR: relatedMmr.ranking_in_tier || 0,
+          rankValue: rankValue > 0 ? rankValue : null,
+          kills,
+          deaths,
+          assists,
+          score,
+          kd: Number((deaths > 0 ? kills / deaths : kills).toFixed(2)),
+          isMatchMVP,
+          isTeamMVP,
+          mk3,
+          mk4,
+          mk5, 
+          headshots: playerStats.stats?.headshots || 0,
+          bodyshots: playerStats.stats?.bodyshots || 0,
+          legshots: playerStats.stats?.legshots || 0,
           totalShots: (playerStats.stats?.bodyshots || 0) + (playerStats.stats?.legshots || 0) + (playerStats.stats?.headshots || 0),
           firstKills: matchFkFd[playerStats.puuid]?.fk || 0, 
           firstDeaths: matchFkFd[playerStats.puuid]?.fd || 0, 
           clutches,
-          sides: { atkWins, atkRounds, defWins, defRounds }, plants, defuses, plantSites, weaponStats, deathCoordinates, roundDetails,
+          sides: { atkWins, atkRounds, defWins, defRounds },
+          plants,
+          defuses,
+          plantSites,
+          weaponStats,
+          deathCoordinates,
+          roundDetails,
           timeline: timeline, 
-          adr: Math.round((playerStats.damage_made || 0) / rp), acs: Math.round(score / rp), roundsPlayed: rp, 
+          adr: Math.round((playerStats.damage_made || 0) / rp),
+          acs: Math.round(score / rp),
+          roundsPlayed: rp, 
           economy: { avgSpent: Math.round((playerStats.economy?.spent?.overall || 0) / rp), avgLoadoutValue: Math.round((playerStats.economy?.loadout_value?.overall || 0) / rp) },
           abilities: { ...abilities, total: (abilities.c_cast || 0) + (abilities.q_cast || 0) + (abilities.e_cast || 0) + (abilities.x_cast || 0) },
-          partyId: playerStats.party_id, allPlayers: enrichedAllPlayers, teamInfo: m.teams, myTeam: playerStats.team,
-          result: isWin ? 'WIN' : 'LOSS', date: m.metadata.game_start_patched, timestamp: m.metadata.game_start, map: m.metadata.map
+          partyId: playerStats.party_id,
+          allPlayers: enrichedAllPlayers,
+          teamInfo: m.teams,
+          myTeam: playerStats.team,
+          result: isWin ? 'WIN' : 'LOSS',
+          date: m.metadata.game_start_patched,
+          timestamp: m.metadata.game_start,
+          map: m.metadata.map
         };
       }).filter(Boolean);
       newMatches = [...newMatches, ...cleanRankedMatches];
@@ -1044,16 +1190,6 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
     }
 };
 
-const getParisDateString = (dateObj) => {
-    return new Intl.DateTimeFormat('fr-FR', {
-        timeZone: 'Europe/Paris',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit'
-    }).format(dateObj); 
-};
-
-// --- RAPPORT QUOTIDIEN ---
 const generateDailyReport = async (isManual = false, forceDate = null) => {
     console.log(`📊 [RAPPORT] Génération (Manuel: ${isManual})...`);
     
@@ -1081,123 +1217,14 @@ const generateDailyReport = async (isManual = false, forceDate = null) => {
     const dateStr = getParisDateString(targetDate);
     const dateTitle = targetDate.toLocaleDateString('fr-FR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Europe/Paris' });
 
-    const dailyRawMatches = matches.filter(m => {
-        if (m.type !== 'ranked') return false;
-        return getParisDateString(new Date(m.dbDate)) === dateStr;
-    });
-
-    if (dailyRawMatches.length === 0) {
-        console.log("⚠️ [RAPPORT] Vide.");
-        if (isManual) await sendDiscordMessage(channelId, { content: `🚫 **Rapport du ${dateStr}** : Le calme plat. Aucune game classée enregistrée.` });
-        return;
-    }
-
-    const uniqueGames = {};
-    const playerStats = {};
-
-    allConfigPlayers.forEach(p => {
-        playerStats[p.id] = {
-            name: p.name, wins: 0, losses: 0,
-            rrChange: 0, kills: 0, deaths: 0, headshots: 0, shots: 0,
-            games: 0
-        };
-    });
-
-    dailyRawMatches.forEach(m => {
-        if (!uniqueGames[m.id]) {
-            uniqueGames[m.id] = {
-                id: m.id, map: m.map, result: m.result, score: m.matchScore, time: m.date, players: []
-            };
-        }
-
-        const pConfig = allConfigPlayers.find(p => p.id === m.playerId);
-        const playerName = pConfig ? pConfig.name : "Inconnu";
-        const kd = m.deaths > 0 ? (m.kills / m.deaths).toFixed(2) : m.kills;
-        const rrSign = m.rrChange > 0 ? '+' : '';
-        const acs = m.acs || Math.round((m.score || 0) / (m.roundsPlayed || 1));
-        const hsPct = m.totalShots > 0 ? Math.round((m.headshots / m.totalShots) * 100) : 0;
-
-        uniqueGames[m.id].players.push({
-            name: playerName, agent: m.agent || "?", rr: `${rrSign}${m.rrChange}`, kd: kd, result: m.result, acs: acs, hs: hsPct
-        });
-
-        if (playerStats[m.playerId]) {
-            const p = playerStats[m.playerId];
-            p.games++;
-            if (m.result === 'WIN') p.wins++; else p.losses++;
-            p.rrChange += m.rrChange;
-            p.kills += m.kills;
-            p.deaths += m.deaths;
-            p.headshots += (m.headshots || 0);
-            p.shots += (m.totalShots || 0);
-        }
-    });
-
-    const uniqueGamesList = Object.values(uniqueGames).sort((a, b) => new Date(a.time) - new Date(b.time));
-    const totalUniqueGames = uniqueGamesList.length;
-    const totalWins = uniqueGamesList.filter(g => g.result === 'WIN').length;
-    const globalWinrate = Math.round((totalWins / totalUniqueGames) * 100);
-
-    let weatherEmoji = "☁️"; let weatherTitle = "Mitigé"; let color = 0x9ca3af;
-    if (globalWinrate >= 60) { weatherEmoji = "☀️"; weatherTitle = "Grand Soleil"; color = 0x10b981; }
-    else if (globalWinrate >= 45) { weatherEmoji = "🌤️"; weatherTitle = "Éclaircies"; color = 0xfacc15; }
-    else if (globalWinrate >= 25) { weatherEmoji = "🌧️"; weatherTitle = "Averses"; color = 0x3b82f6; }
-    else { weatherEmoji = "⛈️"; weatherTitle = "Tempête"; color = 0xef4444; }
-
-    const activePlayers = Object.values(playerStats).filter(p => p.games > 0);
-
-    const mvp = [...activePlayers].sort((a, b) => b.rrChange - a.rrChange)[0];
-    const butcher = [...activePlayers].sort((a, b) => {
-        const kdA = a.deaths > 0 ? a.kills/a.deaths : a.kills;
-        const kdB = b.deaths > 0 ? b.kills/b.deaths : b.kills;
-        return kdB - kdA;
-    })[0];
-    const loser = [...activePlayers].sort((a, b) => a.rrChange - b.rrChange)[0];
-    const sniper = [...activePlayers].sort((a, b) => {
-        const hsA = a.shots > 0 ? a.headshots/a.shots : 0;
-        const hsB = b.shots > 0 ? b.headshots/b.shots : 0;
-        return hsB - hsA;
-    })[0];
-
-    const embed = new EmbedBuilder()
-        .setTitle(`📊 RAPPORT QUOTIDIEN • ${dateTitle.toUpperCase()}`)
-        .setURL(appUrl)
-        .setColor(color)
-        .setThumbnail("https://media.discordapp.net/attachments/1070058980836540467/1164570087799562300/valorant-logo.png")
-        .setFooter({ text: "Tracker Custom • Auto-généré" })
-        .setTimestamp();
-
-    embed.addFields(
-        { name: `${weatherEmoji} Bilan de l'Escouade`, value: `**Météo :** ${weatherTitle}\n**Winrate :** ${globalWinrate}% (${totalWins}W - ${totalUniqueGames - totalWins}L)\n**Rentabilité :** ${totalRRDay > 0 ? '+' : ''}${totalRRDay} RR globaux`, inline: false }
-    );
-
-    let fameText = "";
-    if (mvp && mvp.rrChange > 0) fameText += `👑 **MVP :** ${mvp.name} (*+${mvp.rrChange} RR*)\n`;
-    if (butcher && butcher.name !== mvp?.name) fameText += `🔪 **Boucher :** ${butcher.name} (*${(butcher.deaths > 0 ? butcher.kills/butcher.deaths : butcher.kills).toFixed(2)} K/D*)\n`;
-    if (sniper && sniper.shots > 0) fameText += `🎯 **Sniper :** ${sniper.name} (*${Math.round((sniper.headshots/sniper.shots)*100)}% HS*)\n`;
-    if (loser && loser.rrChange < 0) fameText += `🤡 **Poids Mort :** ${loser.name} (*${loser.rrChange} RR*)\n`;
-
-    embed.addFields(
-        { name: "🏆 Tableau d'Honneur", value: fameText || "Pas de trophées marquants aujourd'hui.", inline: false }
-    );
-
-    let gamesLog = "";
-    uniqueGamesList.forEach(g => {
-        const icon = g.result === 'WIN' ? "🟢" : (g.result === 'DRAW' ? "⚪" : "🔴");
-        const scoreText = g.score ? `**${g.score}**` : "";
-        gamesLog += `${icon} **${g.map.toUpperCase()}** - ${scoreText}\n`;
-        g.players.sort((a, b) => parseInt(b.rr) - parseInt(a.rr));
-        g.players.forEach(p => {
-            gamesLog += `> \`${p.agent.padEnd(9)}\` **${p.name}** : **${p.rr} RR** | ${p.kd} K/D | ${p.acs} ACS | ${p.hs}% HS\n`;
-        });
-        gamesLog += "\n";
-    });
-
-    if (gamesLog.length > 3900) gamesLog = gamesLog.substring(0, 3900) + "\n... *[Journal tronqué par limite Discord]*";
+    const safeDateStr = dateStr.replace(/\//g, '-'); 
+    const payload = await buildDailyReportMessage(safeDateStr, 'summary', allConfigPlayers, appUrl);
     
-    embed.setDescription(`**📝 Journal des Matchs**\n\n${gamesLog || "Aucun détail de match."}`);
-
-    await sendDiscordMessage(channelId, { embeds: [embed] });
+    if (payload) {
+        await sendDiscordMessage(channelId, payload);
+    } else if (isManual) {
+        await sendDiscordMessage(channelId, { content: `🚫 **Rapport du ${dateTitle}** : Le calme plat. Aucune game classée enregistrée.` });
+    }
 };
 
 // ==========================================
