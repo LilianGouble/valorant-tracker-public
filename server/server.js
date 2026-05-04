@@ -108,6 +108,39 @@ const discordClient = new Client({
         console.warn("⚠️  Migration discord_id:", e.message);
     }
 
+    // Migration : Architecture Hybride SQL (Extraction des colonnes clés)
+    try {
+        const cols = await db.all("PRAGMA table_info(matches)");
+        if (!cols.some(c => c.name === 'type')) {
+            console.log("🛠️ Migration vers l'architecture hybride SQL en cours...");
+            await db.exec(`
+                ALTER TABLE matches ADD COLUMN type TEXT;
+                ALTER TABLE matches ADD COLUMN result TEXT;
+                ALTER TABLE matches ADD COLUMN map TEXT;
+                ALTER TABLE matches ADD COLUMN agent TEXT;
+                ALTER TABLE matches ADD COLUMN kills INTEGER;
+                ALTER TABLE matches ADD COLUMN deaths INTEGER;
+                ALTER TABLE matches ADD COLUMN assists INTEGER;
+                ALTER TABLE matches ADD COLUMN rr_change INTEGER;
+                ALTER TABLE matches ADD COLUMN acs INTEGER;
+                CREATE INDEX IF NOT EXISTS idx_matches_type ON matches(type);
+            `);
+            
+            const allMatches = await db.all("SELECT id, data FROM matches");
+            await db.exec('BEGIN TRANSACTION');
+            let migratedCount = 0;
+            for (const m of allMatches) {
+                try {
+                    const d = JSON.parse(m.data);
+                    await db.run(`UPDATE matches SET type=?, result=?, map=?, agent=?, kills=?, deaths=?, assists=?, rr_change=?, acs=? WHERE id=?`, [d.type, d.result, d.map, d.agent, d.kills, d.deaths, d.assists, d.rrChange, d.acs, m.id]);
+                    migratedCount++;
+                } catch(e) {}
+            }
+            await db.exec('COMMIT');
+            console.log(`✅ Migration hybride terminée (${migratedCount} matchs convertis) ! Le serveur est maintenant ultra optimisé.`);
+        }
+    } catch (e) { console.warn("⚠️ Migration hybride:", e.message); try { await db.exec('ROLLBACK'); } catch(err) {} }
+
     let jwtSecretRow = await db.get("SELECT value FROM config WHERE key = 'jwt_secret'");
     if (!jwtSecretRow) {
         const secret = crypto.randomBytes(64).toString('hex');
@@ -357,7 +390,7 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
 const buildClassementMessage = async (category, allConfigPlayers, startTs, startFr) => {
     const stats = await Promise.all(allConfigPlayers.map(async p => {
         const rows = await db.all(
-            "SELECT data FROM matches WHERE player_id = ? AND date >= ? AND data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC",
+            "SELECT data FROM matches WHERE player_id = ? AND date >= ? AND type = 'ranked' ORDER BY date DESC",
             [p.id, startTs]
         );
         let rrTotal = 0, wins = 0, currentRank = 'Non classé', rankValue = 0, hsTotal = 0, shotsTotal = 0;
@@ -416,7 +449,8 @@ const buildClassementMessage = async (category, allConfigPlayers, startTs, start
 const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) => {
     const targetDateStr = dateStr.replace(/-/g, '/');
 
-    const rows = await db.all('SELECT date, data FROM matches ORDER BY date DESC');
+    // Optimisation RAM : On ne récupère que les 150 derniers matchs classés au lieu de toute la BDD
+    const rows = await db.all("SELECT date, data FROM matches WHERE type = 'ranked' ORDER BY date DESC LIMIT 150");
     const dailyRawMatches = rows.map(r => {
         const m = JSON.parse(r.data);
         m.dbDate = r.date; 
@@ -561,7 +595,7 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
 // ==========================================
 // BOT DISCORD : SLASH COMMANDS (ENREGISTREMENT)
 // ==========================================
-discordClient.once('ready', async () => {
+discordClient.once('clientReady', async () => {
     const players = await getPlayers();
     const choices = players.slice(0, 25).map(p => ({ name: p.name, value: p.id }));
 
@@ -612,7 +646,7 @@ discordClient.on('messageCreate', async (message) => {
         const target = players.find(p => p.name.toLowerCase() === playerName.toLowerCase());
         if (!target) return message.reply(`❌ Joueur **${playerName}** introuvable dans la liste du tracker.`);
 
-        const rows = await db.all("SELECT data FROM matches WHERE player_id = ? AND data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC LIMIT 20", [target.id]);
+        const rows = await db.all("SELECT data FROM matches WHERE player_id = ? AND type = 'ranked' ORDER BY date DESC LIMIT 20", [target.id]);
         if (rows.length === 0) return message.reply(`⚠️ Aucun match classé trouvé pour **${target.name}**.`);
 
         let wins = 0, kills = 0, deaths = 0, rr = 0;
@@ -675,7 +709,7 @@ discordClient.on('interactionCreate', async interaction => {
             }
 
             const rows = await db.all(
-                "SELECT data FROM matches WHERE player_id = ? AND data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC LIMIT 20",
+                "SELECT data FROM matches WHERE player_id = ? AND type = 'ranked' ORDER BY date DESC LIMIT 20",
                 [target.id]
             );
             if (rows.length === 0) { await interaction.editReply({ content: `⚠️ Aucun match classé pour **${target.name}**.` }); return; }
@@ -763,7 +797,7 @@ discordClient.on('interactionCreate', async interaction => {
             }
 
             const rows = await db.all(
-                "SELECT data FROM matches WHERE player_id = ? AND data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC LIMIT 5",
+                "SELECT data FROM matches WHERE player_id = ? AND type = 'ranked' ORDER BY date DESC LIMIT 5",
                 [target.id]
             );
             if (rows.length === 0) { await interaction.editReply({ content: `⚠️ Aucun match classé pour **${target.name}**.` }); return; }
@@ -1719,7 +1753,7 @@ const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appU
     // Détection rank up / rank down
     for (const match of newlyDiscoveredMatches.filter(m => m.type === 'ranked' && m.rankValue && m.playerId)) {
         const prevRow = await db.get(
-            "SELECT data FROM matches WHERE player_id = ? AND data LIKE '%\"type\":\"ranked\"%' AND id != ? ORDER BY date DESC LIMIT 1",
+            "SELECT data FROM matches WHERE player_id = ? AND type = 'ranked' AND id != ? ORDER BY date DESC LIMIT 1",
             [match.playerId, `${match.id}_${match.playerId}`]
         );
         if (!prevRow) continue;
@@ -1823,8 +1857,8 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
                 }
 
                 const result = await db.run(
-                    `INSERT OR REPLACE INTO matches (id, player_id, date, data) VALUES (?, ?, ?, ?)`,
-                    [uniqueId, match.playerId, timestamp, JSON.stringify(match)]
+                    `INSERT OR REPLACE INTO matches (id, player_id, date, data, type, result, map, agent, kills, deaths, assists, rr_change, acs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [uniqueId, match.playerId, timestamp, JSON.stringify(match), match.type, match.result, match.map, match.agent, match.kills, match.deaths, match.assists, match.rrChange, match.acs]
                 );
                 
                 if (result.changes > 0) {
@@ -1865,13 +1899,6 @@ const generateDailyReport = async (isManual = false, forceDate = null) => {
 
     const appUrl = await getConfig('app_url', 'http://localhost:5173');
     const allConfigPlayers = await getPlayers();
-
-    const rows = await db.all('SELECT date, data FROM matches ORDER BY date DESC');
-    const matches = rows.map(row => {
-        const parsedData = JSON.parse(row.data);
-        parsedData.dbDate = row.date; 
-        return parsedData;
-    });
 
     const targetDate = forceDate ? new Date(forceDate) : new Date();
     if (!isManual && !forceDate) {
@@ -1974,7 +2001,7 @@ app.get('/test-match', async (req, res) => {
         const channelId = await getConfig('discord_channel_id');
         if (!channelId) return res.status(400).send("Aucun ID de Salon Discord configuré.");
 
-        const row = await db.get("SELECT data FROM matches WHERE data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC LIMIT 1");
+        const row = await db.get("SELECT data FROM matches WHERE type = 'ranked' ORDER BY date DESC LIMIT 1");
         if (!row) return res.status(404).send("Aucun match classé en base de données pour simuler l'envoi.");
         
         const sampleMatch = JSON.parse(row.data);
@@ -1993,7 +2020,7 @@ app.get('/test-match', async (req, res) => {
 
 app.get('/test-report', async (req, res) => {
     try {
-        const row = await db.get("SELECT date FROM matches WHERE data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC LIMIT 1");
+        const row = await db.get("SELECT date FROM matches WHERE type = 'ranked' ORDER BY date DESC LIMIT 1");
         if (!row) return res.status(404).send("Aucun match classé en base de données pour faire le rapport.");
         
         await generateDailyReport(true, row.date);
