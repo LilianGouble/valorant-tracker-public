@@ -709,6 +709,35 @@ export const AdminPanel = () => {
                                 Sauvegarder la configuration
                             </button>
                         </form>
+
+                        <div className="bg-[#1c252e] p-6 rounded-xl border border-white/5 space-y-4">
+                            <div>
+                                <h3 className="font-black text-amber-400 uppercase mb-1">Maintenance : Backfill des noms</h3>
+                                <p className="text-[11px] text-gray-500">
+                                    Rejoue tous les matchs stockés et reconstruit les pseudonymes manquants depuis les kill events Riot. À utiliser une fois après l'ajout du fix puuid pour rattraper l'historique.
+                                </p>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={async () => {
+                                    if (!confirm("Lancer le backfill des noms sur tout l'historique ? Cela peut prendre plusieurs minutes.")) return;
+                                    showMsg("Backfill en cours, patientez...", "success");
+                                    try {
+                                        const res = await fetch(`${LOCAL_SERVER_URL}/api/admin/backfill-names`, {
+                                            method: 'POST', headers: authHeaders
+                                        });
+                                        const json = await res.json();
+                                        if (!res.ok) throw new Error(json.error || 'Erreur');
+                                        showMsg(`OK : ${json.fetched} matchs re-fetchés, ${json.updated} enregistrements mis à jour, ${json.skipped} déjà OK.`);
+                                    } catch (e) {
+                                        showMsg(`Erreur backfill : ${e.message}`, "error");
+                                    }
+                                }}
+                                className="w-full bg-amber-500/20 hover:bg-amber-500/40 text-amber-400 font-black py-3 rounded uppercase tracking-wider transition-colors"
+                            >
+                                Lancer le backfill rétroactif des noms
+                            </button>
+                        </div>
                     </div>
                 )}
             </main>

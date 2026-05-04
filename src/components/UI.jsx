@@ -7,8 +7,20 @@ import { User } from 'lucide-react';
 
 const getPlayerColor = (puuid, playersConfig) => {
     if (!puuid) return '#ff0000';
-    const player = playersConfig.find(p => p.id.toLowerCase() === puuid.toLowerCase());
+    const player = playersConfig.find(p =>
+        (p.puuid && p.puuid.toLowerCase() === puuid.toLowerCase())
+        || p.id.toLowerCase() === puuid.toLowerCase()
+    );
     return player ? player.color : '#ff0000';
+};
+
+const findCfgByPuuid = (cfgs, puuid) => {
+    if (!puuid || !cfgs) return null;
+    const lp = puuid.toLowerCase();
+    return cfgs.find(c =>
+        (c.puuid && c.puuid.toLowerCase() === lp)
+        || c.id.toLowerCase() === lp
+    ) || null;
 };
 
 export const Card = ({ children, className = "", style = {}, ...props }) => (
@@ -158,15 +170,23 @@ const MatchDeathMap = ({ mapName, deaths, playersConfig }) => {
     );
 };
 
-const PlayerRow = ({ player, match, isGlobalView = false, playersConfig }) => {
-    const isMe = player.puuid === match.playerId;
-    const isFriend = playersConfig.some(cfg => cfg.id === player.puuid || cfg.name.toLowerCase() === player.name.toLowerCase());
+const PlayerRow = ({ player, match, isGlobalView = false, playersConfig, trackedPartyIds }) => {
+    const myCfg = findCfgByPuuid(playersConfig, match.playerId);
+    const isMe = player.puuid && myCfg && (
+        player.puuid.toLowerCase() === (myCfg.puuid || '').toLowerCase()
+        || player.puuid.toLowerCase() === myCfg.id.toLowerCase()
+    );
+    const playerCfg = findCfgByPuuid(playersConfig, player.puuid);
+    const isFriend = !!playerCfg
+        || (player.name && playersConfig.some(cfg => cfg.name.toLowerCase() === player.name.toLowerCase()));
+
+    const inTrackedParty = !isFriend && player.party_id && trackedPartyIds && trackedPartyIds.has(player.party_id);
 
     const teamColorBg = isGlobalView
         ? (player.team === 'Blue' ? 'bg-cyan-500/5 border-l-2 border-l-cyan-500' : 'bg-red-500/5 border-l-2 border-l-red-500')
-        : (isMe ? 'bg-white/10 border-l-2 border-l-yellow-400' : 'hover:bg-white/5 border-l-2 border-l-transparent');
+        : (isMe ? 'bg-white/10 border-l-2 border-l-yellow-400' : (inTrackedParty ? 'bg-purple-500/5 border-l-2 border-l-purple-400/40' : 'hover:bg-white/5 border-l-2 border-l-transparent'));
 
-    const nameColor = isMe ? 'text-yellow-400' : (isFriend ? 'text-purple-400' : 'text-white');
+    const nameColor = isMe ? 'text-yellow-400' : (isFriend ? 'text-purple-400' : (inTrackedParty ? 'text-purple-300' : 'text-white'));
     const rounds = match.roundsPlayed || 1;
     const acs = Math.round(player.stats.score / rounds);
 
@@ -184,8 +204,13 @@ const PlayerRow = ({ player, match, isGlobalView = false, playersConfig }) => {
                     <img src={getRankIcon(player.currenttier_patched)} alt="Rank" className="w-6 h-6 object-contain drop-shadow-md" title={player.currenttier_patched} />
                 </div>
                 <div className="flex flex-col min-w-0 ml-1">
-                    <span className={`text-xs font-bold truncate ${nameColor}`}>{player.name}</span>
-                    <span className="text-[9px] text-gray-500 font-mono truncate">#{player.tag}</span>
+                    <span className={`text-xs font-bold truncate ${nameColor} flex items-center gap-1`}>
+                        {player.name || player.character || '—'}
+                        {inTrackedParty && (
+                            <span className="text-[8px] font-black uppercase bg-purple-500/20 text-purple-300 border border-purple-400/40 rounded px-1 py-px tracking-wider" title="Membre du groupe d'un joueur tracké">groupe</span>
+                        )}
+                    </span>
+                    {player.tag ? <span className="text-[9px] text-gray-500 font-mono truncate">#{player.tag}</span> : null}
                 </div>
             </div>
             <div className="col-span-3 flex justify-center items-center font-mono text-xs">
@@ -218,8 +243,17 @@ export const MatchDetailModal = ({ match, onClose, playersConfig }) => {
     const redTeam = allPlayers.filter(p => p.team === 'Red').sort((a, b) => b.stats.score - a.stats.score);
     const globalSorted = [...allPlayers].sort((a, b) => b.stats.score - a.stats.score);
 
+    // Set des party_id qui contiennent au moins un joueur tracké
+    const trackedPartyIds = new Set(
+        allPlayers
+            .filter(p => p.party_id && findCfgByPuuid(playersConfig, p.puuid))
+            .map(p => p.party_id)
+    );
+
     const deadPlayerIds = new Set((match.deathCoordinates || []).map(d => d.puuid));
-    const playersInLegend = playersConfig.filter(cfg => deadPlayerIds.has(cfg.id));
+    const playersInLegend = playersConfig.filter(cfg =>
+        deadPlayerIds.has(cfg.id) || (cfg.puuid && deadPlayerIds.has(cfg.puuid))
+    );
     const isTDM = match.type === 'tdm';
 
     // FIX FUSEAU HORAIRE ICI ! (Le navigateur s'occupe de l'offset)
@@ -479,7 +513,7 @@ export const MatchDetailModal = ({ match, onClose, playersConfig }) => {
                                             <div className="col-span-2 text-center" title="First Kills / First Deaths">FK/FD</div>
                                             <div className="col-span-2 text-center">ACS</div>
                                         </div>
-                                        {blueTeam.map(p => <PlayerRow key={p.puuid} player={p} match={match} playersConfig={playersConfig} isGlobalView={false} />)}
+                                        {blueTeam.map(p => <PlayerRow key={p.puuid} player={p} match={match} playersConfig={playersConfig} trackedPartyIds={trackedPartyIds} isGlobalView={false} />)}
                                     </div>
                                     <div>
                                         <div className="flex items-center justify-between mb-3 pb-2 border-b-2 border-red-500/50">
@@ -492,7 +526,7 @@ export const MatchDetailModal = ({ match, onClose, playersConfig }) => {
                                             <div className="col-span-2 text-center" title="First Kills / First Deaths">FK/FD</div>
                                             <div className="col-span-2 text-center">ACS</div>
                                         </div>
-                                        {redTeam.map(p => <PlayerRow key={p.puuid} player={p} match={match} playersConfig={playersConfig} isGlobalView={false} />)}
+                                        {redTeam.map(p => <PlayerRow key={p.puuid} player={p} match={match} playersConfig={playersConfig} trackedPartyIds={trackedPartyIds} isGlobalView={false} />)}
                                     </div>
                                 </div>
                             ) : (
@@ -503,7 +537,7 @@ export const MatchDetailModal = ({ match, onClose, playersConfig }) => {
                                         <div className="col-span-2 text-center" title="First Kills / First Deaths">FK/FD</div>
                                         <div className="col-span-2 text-center">ACS</div>
                                     </div>
-                                    {globalSorted.map(p => <PlayerRow key={p.puuid} player={p} match={match} playersConfig={playersConfig} isGlobalView={true} />)}
+                                    {globalSorted.map(p => <PlayerRow key={p.puuid} player={p} match={match} playersConfig={playersConfig} trackedPartyIds={trackedPartyIds} isGlobalView={true} />)}
                                 </div>
                             )}
                         </div>

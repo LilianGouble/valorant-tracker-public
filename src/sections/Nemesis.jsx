@@ -106,6 +106,14 @@ const NemesisDetailModal = ({ nemesis, onClose }) => {
     );
 };
 
+const findCfgByPuuid = (cfgs, puuid) => {
+    if (!puuid || !cfgs) return null;
+    const lp = puuid.toLowerCase();
+    return cfgs.find(c =>
+        (c.puuid && c.puuid.toLowerCase() === lp) || c.id.toLowerCase() === lp
+    ) || null;
+};
+
 export const Nemesis = ({ matches, playersConfig }) => {
     const [selectedNemesis, setSelectedNemesis] = useState(null);
 
@@ -124,11 +132,11 @@ export const Nemesis = ({ matches, playersConfig }) => {
             let mySquad = [];
             if (m.allPlayers) {
                 mySquad = m.allPlayers
-                    .filter(p => p.team === m.myTeam && playersConfig.some(cfg => cfg.id === p.puuid || cfg.name.toLowerCase() === p.name.toLowerCase()))
+                    .filter(p => p.team === m.myTeam && !!findCfgByPuuid(playersConfig, p.puuid))
                     .map(p => {
-                        const cfg = playersConfig.find(c => c.id === p.puuid || c.name.toLowerCase() === p.name.toLowerCase());
+                        const cfg = findCfgByPuuid(playersConfig, p.puuid);
                         return {
-                            name: cfg ? cfg.name : p.name,
+                            name: cfg ? cfg.name : (p.name || p.character || '—'),
                             agent: p.character,
                             agentImg: p.assets?.agent?.small
                         };
@@ -137,7 +145,7 @@ export const Nemesis = ({ matches, playersConfig }) => {
 
             if (m.allPlayers) {
                 m.allPlayers.forEach(p => {
-                    const isFriend = playersConfig.some(cfg => cfg.id === p.puuid || cfg.name.toLowerCase() === p.name.toLowerCase());
+                    const isFriend = !!findCfgByPuuid(playersConfig, p.puuid);
 
                     if (!isFriend) {
                         if (p.team !== m.myTeam) {

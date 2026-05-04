@@ -10,8 +10,8 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 
-// --- IMPORT DU BOT DISCORD (AVEC COMPOSANTS INTERACTIFS) ---
-import { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
+// --- IMPORT DU BOT DISCORD ---
+import { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, REST, Routes } from 'discord.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,7 +22,7 @@ const DB_FILE = path.join(__dirname, 'database.sqlite');
 const API_BASE = "https://api.henrikdev.xyz/valorant";
 
 app.use(cors());
-app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.json({ limit: '10mb' }));
 
 let db;
 
@@ -38,6 +38,8 @@ const discordClient = new Client({
 // --- INITIALISATION DE LA BASE DE DONNÉES ---
 (async () => {
     db = await open({ filename: DB_FILE, driver: sqlite3.Database });
+    
+    await db.exec('PRAGMA journal_mode = WAL;');
     
     await db.exec(`
         CREATE TABLE IF NOT EXISTS matches (
@@ -66,7 +68,8 @@ const discordClient = new Client({
             name TEXT,
             tag TEXT,
             region TEXT,
-            color TEXT
+            color TEXT,
+            puuid TEXT
         );
 
         CREATE TABLE IF NOT EXISTS api_keys (
@@ -83,6 +86,17 @@ const discordClient = new Client({
         );
     `);
 
+    // Migration : ajoute la colonne puuid si la table existait déjà sans (idempotent)
+    try {
+        const cols = await db.all("PRAGMA table_info(players)");
+        if (!cols.some(c => c.name === 'puuid')) {
+            await db.exec("ALTER TABLE players ADD COLUMN puuid TEXT");
+            console.log("🛠️  Colonne 'puuid' ajoutée à la table players.");
+        }
+    } catch (e) {
+        console.warn("⚠️  Migration puuid:", e.message);
+    }
+
     let jwtSecretRow = await db.get("SELECT value FROM config WHERE key = 'jwt_secret'");
     if (!jwtSecretRow) {
         const secret = crypto.randomBytes(64).toString('hex');
@@ -96,7 +110,6 @@ const discordClient = new Client({
         console.log("🔒 Compte administrateur par défaut créé (admin / admin).");
     }
 
-    // Configurations par défaut
     await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('discord_bot_token', '')");
     await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('discord_channel_id', '')");
     await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('app_url', 'http://localhost:5173')");
@@ -104,7 +117,6 @@ const discordClient = new Client({
 
     console.log("✅ Connecté à la base SQLite & Initialisation terminée.");
     
-    // DÉMARRAGE DU BOT DISCORD
     const botToken = await getConfig('discord_bot_token');
     if (botToken && botToken.trim() !== '') {
         discordClient.login(botToken).then(() => {
@@ -112,12 +124,10 @@ const discordClient = new Client({
         }).catch(err => {
             console.error(`❌ Erreur de connexion du Bot Discord: Vérifiez votre Token dans le panel Admin.`);
         });
-    } else {
-        console.log("⚠️ Aucun Token de Bot Discord trouvé. Allez dans le panel d'administration pour le configurer.");
     }
 
     setTimeout(() => {
-        syncAllPlayers();
+        syncAllPlayers().catch(e => console.error("Erreur de synchro initiale:", e));
     }, 5000);
 })();
 
@@ -141,6 +151,39 @@ const authenticateToken = async (req, res, next) => {
     });
 };
 
+// Lookup unifié : retrouve la config d'un joueur tracké à partir d'un puuid Riot.
+// Tolère les anciens enregistrements où id == puuid.
+const findCfgByPuuid = (cfgs, puuid) => {
+    if (!puuid || !cfgs) return null;
+    return cfgs.find(c => (c.puuid && c.puuid === puuid) || c.id === puuid) || null;
+};
+
+// Résout puuid manquant pour chaque joueur tracké et le persiste en DB.
+// Mutation in-place sur les objets cfg passés en argument.
+const ensurePuuids = async (players, apiKeys) => {
+    if (!apiKeys || apiKeys.length === 0) return;
+    const headers = { 'Content-Type': 'application/json' };
+    for (const p of players) {
+        if (p.puuid && p.puuid.length > 10) continue;
+        try {
+            const url = `${API_BASE}/v1/account/${encodeURIComponent(p.name.trim())}/${encodeURIComponent(p.tag.trim())}`;
+            const res = await fetchWithRetry(url, apiKeys, { headers });
+            if (res?.ok) {
+                const data = await res.json().catch(() => null);
+                const puuid = data?.data?.puuid;
+                if (puuid) {
+                    p.puuid = puuid;
+                    await db.run("UPDATE players SET puuid = ? WHERE id = ?", [puuid, p.id]);
+                    console.log(`🆔 PUUID résolu et persisté pour ${p.name}#${p.tag}`);
+                }
+            }
+        } catch (e) {
+            console.warn(`⚠️  PUUID non résolu pour ${p.name}#${p.tag}: ${e.message}`);
+        }
+        await delay(250);
+    }
+};
+
 const getParisDateString = (dateObj) => {
     return new Intl.DateTimeFormat('fr-FR', {
         timeZone: 'Europe/Paris',
@@ -158,81 +201,93 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
     if (!rows || rows.length === 0) return null;
 
     const playersInMatch = rows.map(r => JSON.parse(r.data));
-    const baseMatch = playersInMatch[0]; 
-    
+    const baseMatch = playersInMatch[0];
+    const rounds = baseMatch.roundsPlayed || 1;
     const isWin = baseMatch.result === 'WIN';
-    const color = isWin ? 0x10b981 : (baseMatch.result === 'LOSS' ? 0xef4444 : 0x9ca3af);
 
-    const allPlayers = baseMatch.allPlayers || [];
-    const globalSorted = [...allPlayers].sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
-    const matchMvpId = globalSorted.length > 0 ? globalSorted[0].puuid : null;
+    // Enrichir les noms (l'API Riot ne renvoie plus les noms dans les données de match)
+    const allPlayers = (baseMatch.allPlayers || []).map(p => {
+        const cfg = findCfgByPuuid(allConfigPlayers, p.puuid);
+        if (cfg) return { ...p, name: cfg.name, tag: cfg.tag };
+        return p;
+    });
 
     const blueTeam = allPlayers.filter(p => p.team === 'Blue').sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
-    const redTeam = allPlayers.filter(p => p.team === 'Red').sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
+    const redTeam  = allPlayers.filter(p => p.team === 'Red').sort((a, b)  => (b.stats?.score || 0) - (a.stats?.score || 0));
+    const globalSorted = [...allPlayers].sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
+    const matchMvpId = globalSorted[0]?.puuid || null;
+
+    const blueScore = baseMatch.teamInfo?.blue?.rounds_won ?? 0;
+    const redScore  = baseMatch.teamInfo?.red?.rounds_won  ?? 0;
+
+    // Calcul des "groupes trackés" : tout party_id qui contient au moins un joueur tracké.
+    // Les coéquipiers non-trackés mais membres d'un de ces groupes sont marqués (▎).
+    const trackedPartyIds = new Set();
+    allPlayers.forEach(p => {
+        if (p.party_id && findCfgByPuuid(allConfigPlayers, p.puuid)) {
+            trackedPartyIds.add(p.party_id);
+        }
+    });
+
+    const formatLine = (p) => {
+        const cfg     = findCfgByPuuid(allConfigPlayers, p.puuid);
+        const tracked = cfg ? playersInMatch.find(t => t.playerId === cfg.id) : null;
+        const isMvp   = p.puuid === matchMvpId;
+        const inParty = !cfg && p.party_id && trackedPartyIds.has(p.party_id);
+        const name    = p.name?.trim() || p.character || '—';
+        const prefix  = cfg ? '★ ' : (inParty ? '▎ ' : '  ');
+        const agent   = (p.character || '?').substring(0, 8).padEnd(9);
+        const nameStr = (prefix + name).substring(0, 16).padEnd(16);
+        const k       = String(p.stats?.kills   || 0).padStart(2);
+        const d       = String(p.stats?.deaths  || 0).padStart(2);
+        const a       = String(p.stats?.assists || 0).padStart(2);
+        const acs     = String(Math.round((p.stats?.score || 0) / rounds)).padStart(4);
+        let rr = '     ';
+        // RR affiché uniquement pour les joueurs trackés (pas pour les coéquipiers randoms)
+        if (tracked?.rrChange !== undefined) {
+            const sign = tracked.rrChange > 0 ? '+' : '';
+            rr = `${sign}${tracked.rrChange}RR`.padEnd(5);
+        }
+        return `${agent}${nameStr}${k}/${d}/${a} ${acs}acs ${rr}${isMvp ? ' 👑' : ''}`;
+    };
+
+    const tableHeader = `${'Agent'.padEnd(9)}${'Joueur'.padEnd(16)}K /D /A   ACS\n` + '─'.repeat(48);
+    const formatTeam  = (team) => team.map(formatLine).join('\n');
+
+    const resultEmoji = isWin ? '🏆' : (baseMatch.result === 'LOSS' ? '💔' : '🤝');
+    const resultText  = isWin ? 'VICTOIRE' : (baseMatch.result === 'LOSS' ? 'DÉFAITE' : 'ÉGALITÉ');
+    const color = view === 'blue' ? 0x3b82f6 : (view === 'red' ? 0xef4444 : (isWin ? 0x10b981 : (baseMatch.result === 'LOSS' ? 0xef4444 : 0x9ca3af)));
 
     const embed = new EmbedBuilder()
-        .setTitle(`🚨 FIN DE MATCH (RANKED) : ${baseMatch.map.toUpperCase()}`)
+        .setTitle(`${resultEmoji} ${resultText} — ${(baseMatch.map || '?').toUpperCase()}`)
         .setURL(appUrl)
-        .setColor(view === 'blue' ? 0x3b82f6 : (view === 'red' ? 0xef4444 : color))
-        .setFooter({ text: "KSL Tracker • Interactif" })
+        .setColor(color)
+        .setFooter({ text: 'KSL Tracker  •  ★ = joueur tracké  •  ▎ = même groupe' })
         .setTimestamp(baseMatch.timestamp ? baseMatch.timestamp * 1000 : new Date(baseMatch.date).getTime());
 
     const topTracked = [...playersInMatch].sort((a, b) => b.score - a.score)[0];
-    if (topTracked && topTracked.agentImg) {
-        embed.setThumbnail(topTracked.agentImg);
-    }
+    if (topTracked?.agentImg) embed.setThumbnail(topTracked.agentImg);
 
-    const formatPlayerRow = (p) => {
-        const isGroupMember = allConfigPlayers.find(c => 
-            c.id === p.puuid || 
-            (p.name && c.name.toLowerCase() === p.name.toLowerCase() && p.tag && c.tag.toLowerCase() === p.tag.toLowerCase())
-        );
-        
-        const isMvp = p.puuid === matchMvpId;
-        const rounds = baseMatch.roundsPlayed || 1;
-        const acs = Math.round((p.stats?.score || 0) / rounds);
-        
-        const agentName = (p.character || '?').padEnd(9);
-        const kills = String(p.stats?.kills || 0).padStart(2, '0');
-        const deaths = String(p.stats?.deaths || 0).padStart(2, '0');
-        const assists = String(p.stats?.assists || 0).padStart(2, '0');
-
-        let title = `**${p.name}**`;
-        if (isMvp) title += ` 👑`;
-        if (isGroupMember) {
-            const trackedData = playersInMatch.find(tm => tm.playerId === isGroupMember.id);
-            if (trackedData && trackedData.rrChange !== undefined && baseMatch.type === 'ranked') {
-                const rrSign = trackedData.rrChange > 0 ? '+' : '';
-                title += `  *( ${rrSign}${trackedData.rrChange} RR )*`;
-            }
-        }
-
-        return `${title}\n> \`${agentName}\` | 🎯 **${kills}/${deaths}/${assists}** | 💥 **${acs}** ACS\n`;
-    };
+    const blueWin   = blueScore > redScore;
+    const blueLabel = `🟦 **ÉQUIPE BLEUE** — ${blueScore} rounds${blueWin ? ' ✅' : ''}`;
+    const redLabel  = `🟥 **ÉQUIPE ROUGE** — ${redScore} rounds${!blueWin && blueScore !== redScore ? ' ✅' : ''}`;
 
     if (view === 'global') {
-        let desc = `**Score final :** ${baseMatch.matchScore} (${isWin ? 'Victoire' : 'Défaite'})\n\n**Vos Joueurs (Triés par ACS) :**\n`;
-        const trackedAllPlayersInfo = allPlayers.filter(p => allConfigPlayers.find(c => 
-            c.id === p.puuid || 
-            (p.name && c.name.toLowerCase() === p.name.toLowerCase() && p.tag && c.tag.toLowerCase() === p.tag.toLowerCase())
-        )).sort((a, b) => (b.stats?.score || 0) - (a.stats?.score || 0));
-
-        trackedAllPlayersInfo.forEach(p => { desc += formatPlayerRow(p) + '\n'; });
+        let desc = `**Score : ${baseMatch.matchScore}** · Classé · ${rounds} rondes\n\n`;
+        desc += `${blueLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(blueTeam)}\n\`\`\`\n`;
+        desc += `${redLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(redTeam)}\n\`\`\``;
+        if (desc.length > 4096) desc = desc.substring(0, 4090) + '\n...';
         embed.setDescription(desc);
     } else if (view === 'blue') {
-        let desc = `🔵 **ÉQUIPE BLEUE** - *Score : ${baseMatch.teamInfo?.blue?.rounds_won || 0}*\n\n`;
-        blueTeam.forEach(p => desc += formatPlayerRow(p) + '\n');
-        embed.setDescription(desc);
+        embed.setDescription(`${blueLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(blueTeam)}\n\`\`\``);
     } else if (view === 'red') {
-        let desc = `🔴 **ÉQUIPE ROUGE** - *Score : ${baseMatch.teamInfo?.red?.rounds_won || 0}*\n\n`;
-        redTeam.forEach(p => desc += formatPlayerRow(p) + '\n');
-        embed.setDescription(desc);
+        embed.setDescription(`${redLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(redTeam)}\n\`\`\``);
     }
 
     const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`match_global_${matchId}`).setLabel('Bilan Global').setStyle(view === 'global' ? ButtonStyle.Success : ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(`match_blue_${matchId}`).setLabel('Équipe Bleue').setStyle(view === 'blue' ? ButtonStyle.Primary : ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(`match_red_${matchId}`).setLabel('Équipe Rouge').setStyle(view === 'red' ? ButtonStyle.Danger : ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId(`match_global_${matchId}`).setLabel('📊 Les deux équipes').setStyle(view === 'global' ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`match_blue_${matchId}`).setLabel('🟦 Équipe Bleue').setStyle(view === 'blue' ? ButtonStyle.Primary : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`match_red_${matchId}`).setLabel('🟥 Équipe Rouge').setStyle(view === 'red' ? ButtonStyle.Danger : ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [row] };
@@ -262,7 +317,7 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
 
     dailyRawMatches.forEach(m => {
         if (!uniqueGames[m.id]) {
-            uniqueGames[m.id] = { id: m.id, map: m.map, result: m.result, score: m.matchScore, time: m.date, players: [] };
+            uniqueGames[m.id] = { id: m.id, map: m.map, result: m.result, score: m.matchScore, time: m.date, players: [], allPlayersRaw: m.allPlayers || [] };
         }
 
         const pConfig = allConfigPlayers.find(p => p.id === m.playerId);
@@ -272,7 +327,15 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
         const acs = m.acs || Math.round((m.score || 0) / (m.roundsPlayed || 1));
         const hsPct = m.totalShots > 0 ? Math.round((m.headshots / m.totalShots) * 100) : 0;
 
-        uniqueGames[m.id].players.push({ name: playerName, agent: m.agent || "?", rr: `${rrSign}${m.rrChange}`, kd: kd, result: m.result, acs: acs, hs: hsPct });
+        // Récupère le party_id du joueur tracké dans le snapshot allPlayers
+        let trackedPartyId = null;
+        if (m.allPlayers && pConfig) {
+            const me = m.allPlayers.find(ap => ap.puuid === pConfig.puuid)
+                || m.allPlayers.find(ap => ap.character === m.agent && ap.team === m.myTeam);
+            trackedPartyId = me?.party_id || null;
+        }
+
+        uniqueGames[m.id].players.push({ name: playerName, agent: m.agent || "?", rr: `${rrSign}${m.rrChange}`, kd: kd, result: m.result, acs: acs, hs: hsPct, partyId: trackedPartyId });
 
         if (playerStats[m.playerId]) {
             const p = playerStats[m.playerId];
@@ -335,8 +398,31 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
             const scoreText = g.score ? `**${g.score}**` : "";
             gamesLog += `${icon} **${g.map.toUpperCase()}** - ${scoreText}\n`;
             g.players.sort((a, b) => parseInt(b.rr) - parseInt(a.rr));
+
+            // Pour chaque tracké, retrouve ses coéquipiers non-trackés du même groupe
+            // afin d'afficher la composition complète du duo/trio.
+            const trackedPuuids = new Set();
+            (g.allPlayersRaw || []).forEach(ap => {
+                if (findCfgByPuuid(allConfigPlayers, ap.puuid)) trackedPuuids.add(ap.puuid);
+            });
+            const partiesShown = new Set();
+
             g.players.forEach(p => {
                 gamesLog += `> \`${p.agent.padEnd(9)}\` **${p.name}** : **${p.rr} RR** | ${p.kd} K/D | ${p.acs} ACS | ${p.hs}% HS\n`;
+
+                // Coéquipiers non-trackés du même party_id (1 seule fois par groupe)
+                if (p.partyId && !partiesShown.has(p.partyId)) {
+                    partiesShown.add(p.partyId);
+                    const mates = (g.allPlayersRaw || []).filter(ap =>
+                        ap.party_id === p.partyId
+                        && !trackedPuuids.has(ap.puuid)
+                    );
+                    mates.forEach(mate => {
+                        const mateName = mate.name?.trim() || mate.character || 'Inconnu';
+                        const mateAgent = (mate.character || '?').padEnd(9);
+                        gamesLog += `> ┗ \`${mateAgent}\` *${mateName}* (groupe, non tracké)\n`;
+                    });
+                }
             });
             gamesLog += "\n";
         });
@@ -355,6 +441,32 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
 // ==========================================
 // BOT DISCORD : ÉCOUTEURS D'ÉVÉNEMENTS
 // ==========================================
+// ==========================================
+// BOT DISCORD : SLASH COMMANDS (ENREGISTREMENT)
+// ==========================================
+discordClient.once('clientReady', async () => {
+    const players = await getPlayers();
+    const choices = players.slice(0, 25).map(p => ({ name: p.name, value: p.id }));
+
+    const commands = [
+        { name: 'classement', description: '🏆 Classement KSL — Rang et RR du challenge' },
+        {
+            name: 'stats',
+            description: '📊 Stats ranked récentes d\'un joueur',
+            options: [{ type: 3, name: 'joueur', description: 'Joueur KSL', required: false, choices }]
+        },
+        { name: 'rapport', description: '📋 Génère le rapport journalier maintenant' },
+    ];
+
+    try {
+        const rest = new REST({ version: '10' }).setToken(discordClient.token);
+        await rest.put(Routes.applicationCommands(discordClient.application.id), { body: commands });
+        console.log('✅ Slash commands Discord enregistrées.');
+    } catch (e) {
+        console.error('❌ Slash commands — erreur enregistrement :', e.message);
+    }
+});
+
 discordClient.on('messageCreate', async (message) => {
     if (message.author.bot) return;
 
@@ -406,34 +518,122 @@ discordClient.on('messageCreate', async (message) => {
 });
 
 discordClient.on('interactionCreate', async interaction => {
+    const allConfigPlayers = await getPlayers();
+    const appUrl = await getConfig('app_url', 'http://localhost:5173');
+
+    // ===== SLASH COMMANDS =====
+    if (interaction.isChatInputCommand()) {
+        const { commandName } = interaction;
+
+        if (commandName === 'classement') {
+            await interaction.deferReply();
+            const challengeStart = await getConfig('challenge_start_date', '2024-01-01T00:00');
+            const startTs = new Date(challengeStart).getTime();
+
+            const stats = await Promise.all(allConfigPlayers.map(async p => {
+                const rows = await db.all(
+                    "SELECT data FROM matches WHERE player_id = ? AND date >= ? AND data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC",
+                    [p.id, startTs]
+                );
+                let rrTotal = 0, wins = 0, currentRank = 'Non classé', rankValue = 0;
+                rows.forEach(r => { const m = JSON.parse(r.data); rrTotal += (m.rrChange || 0); if (m.result === 'WIN') wins++; });
+                if (rows.length > 0) { const last = JSON.parse(rows[0].data); currentRank = last.currentRank || 'Non classé'; rankValue = last.rankValue || 0; }
+                return { name: p.name, rrTotal, wins, games: rows.length, winrate: rows.length > 0 ? Math.round(wins / rows.length * 100) : 0, currentRank, rankValue };
+            }));
+
+            stats.sort((a, b) => b.rankValue - a.rankValue || b.rrTotal - a.rrTotal);
+            const medals = ['🥇', '🥈', '🥉'];
+            const startFr = new Date(challengeStart).toLocaleDateString('fr-FR');
+            const lines = stats.filter(p => p.games > 0).map((p, i) => {
+                const sign = p.rrTotal > 0 ? '+' : '';
+                return `${medals[i] || `**${i + 1}.**`} **${p.name}** — ${p.currentRank}\n> ${sign}${p.rrTotal} RR • ${p.games} games • ${p.winrate}% WR`;
+            }).join('\n\n');
+
+            const embed = new EmbedBuilder()
+                .setTitle('🏆 Classement KSL — Challenge Actuel')
+                .setColor(0xffd700)
+                .setDescription(lines || '*Aucune donnée disponible.*')
+                .setFooter({ text: `Depuis le ${startFr}` })
+                .setTimestamp();
+            await interaction.editReply({ embeds: [embed] });
+        }
+
+        else if (commandName === 'stats') {
+            await interaction.deferReply();
+            const playerId = interaction.options.getString('joueur');
+            const target = playerId ? allConfigPlayers.find(p => p.id === playerId) : allConfigPlayers[0];
+            if (!target) { await interaction.editReply({ content: '❌ Joueur introuvable.' }); return; }
+
+            const rows = await db.all(
+                "SELECT data FROM matches WHERE player_id = ? AND data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC LIMIT 20",
+                [target.id]
+            );
+            if (rows.length === 0) { await interaction.editReply({ content: `⚠️ Aucun match classé pour **${target.name}**.` }); return; }
+
+            let wins = 0, kills = 0, deaths = 0, assists = 0, rrTotal = 0, acsSum = 0, currentRank = 'Inconnu';
+            rows.forEach(r => {
+                const m = JSON.parse(r.data);
+                if (m.result === 'WIN') wins++;
+                kills += m.kills || 0; deaths += m.deaths || 0; assists += m.assists || 0;
+                rrTotal += m.rrChange || 0; acsSum += m.acs || 0;
+            });
+            currentRank = JSON.parse(rows[0].data).currentRank || 'Inconnu';
+            const kd = deaths > 0 ? (kills / deaths).toFixed(2) : kills;
+            const winrate = Math.round((wins / rows.length) * 100);
+            const avgAcs = Math.round(acsSum / rows.length);
+            const sign = rrTotal > 0 ? '+' : '';
+            const color = parseInt((target.color || '#ff4655').replace('#', ''), 16) || 0xff4655;
+
+            const embed = new EmbedBuilder()
+                .setTitle(`📊 ${target.name} — Stats Ranked`)
+                .setColor(color)
+                .setDescription(`*${rows.length} derniers matchs • ${currentRank}*`)
+                .addFields(
+                    { name: '🏆 W/L', value: `**${wins}W** — ${rows.length - wins}L\n${winrate}% WR`, inline: true },
+                    { name: '⚔️ K/D/A', value: `**${kd}** K/D\n${Math.round(kills/rows.length)}/${Math.round(deaths/rows.length)}/${Math.round(assists/rows.length)} moy.`, inline: true },
+                    { name: '💥 Perf.', value: `**${avgAcs}** ACS moy.\n${sign}${rrTotal} RR total`, inline: true }
+                )
+                .setTimestamp();
+            await interaction.editReply({ embeds: [embed] });
+        }
+
+        else if (commandName === 'rapport') {
+            await interaction.deferReply();
+            await generateDailyReport(true);
+            await interaction.editReply({ content: '✅ Rapport journalier généré et envoyé !' });
+        }
+        return;
+    }
+
+    // ===== BOUTONS =====
     if (!interaction.isButton()) return;
 
     const customId = interaction.customId;
-    const appUrl = await getConfig('app_url', 'http://localhost:5173');
-    const allConfigPlayers = await getPlayers();
 
     if (customId.startsWith('match_')) {
+        await interaction.deferUpdate();
         const parts = customId.split('_');
-        const view = parts[1]; 
+        const view = parts[1];
         const matchId = parts.slice(2).join('_');
 
         const messagePayload = await buildMatchMessage(matchId, view, allConfigPlayers, appUrl);
         if (messagePayload) {
-            await interaction.update(messagePayload);
+            await interaction.editReply(messagePayload);
         } else {
-            await interaction.reply({ content: "Désolé, ce match n'est plus en base de données.", ephemeral: true });
+            await interaction.followUp({ content: "Désolé, ce match n'est plus en base de données.", ephemeral: true });
         }
-    } 
+    }
     else if (customId.startsWith('report_')) {
+        await interaction.deferUpdate();
         const parts = customId.split('_');
-        const view = parts[1]; 
-        const dateStr = parts.slice(2).join('_'); 
+        const view = parts[1];
+        const dateStr = parts.slice(2).join('_');
 
         const messagePayload = await buildDailyReportMessage(dateStr, view, allConfigPlayers, appUrl);
         if (messagePayload) {
-            await interaction.update(messagePayload);
+            await interaction.editReply(messagePayload);
         } else {
-            await interaction.reply({ content: "Désolé, les données de ce rapport ont expiré.", ephemeral: true });
+            await interaction.followUp({ content: "Désolé, les données de ce rapport ont expiré.", ephemeral: true });
         }
     }
 });
@@ -663,6 +863,94 @@ app.delete('/api/admin/tournaments/:id', authenticateToken, async (req, res) => 
 });
 
 // ==========================================
+// BACKFILL RETROACTIF DES NOMS (kill events)
+// ==========================================
+
+app.post('/api/admin/backfill-names', authenticateToken, async (req, res) => {
+    try {
+        const apiKeys = await getApiKeys();
+        if (apiKeys.length === 0) return res.status(500).json({ error: 'Aucune clé API configurée.' });
+
+        // Charge tous les enregistrements de matchs
+        const allRows = await db.all("SELECT id, data FROM matches");
+
+        // Groupe les rows par vrai match ID (le champ id stocké est matchId_playerId)
+        const byMatchId = {};
+        for (const row of allRows) {
+            try {
+                const data = JSON.parse(row.data);
+                const realId = data.id; // vrai identifiant Riot du match
+                if (!realId) continue;
+                if (!byMatchId[realId]) byMatchId[realId] = [];
+                byMatchId[realId].push({ rowId: row.id, data });
+            } catch (e) { void e; }
+        }
+
+        const uniqueIds = Object.keys(byMatchId);
+        let fetched = 0, updated = 0, skipped = 0;
+        const errors = [];
+
+        for (const matchId of uniqueIds) {
+            const group = byMatchId[matchId];
+
+            // On saute si tous les joueurs ont déjà un nom
+            const needsBackfill = group.some(r =>
+                (r.data.allPlayers || []).some(p => !p.name?.trim())
+            );
+            if (!needsBackfill) { skipped++; continue; }
+
+            try {
+                const url = `${API_BASE}/v3/match/${matchId}`;
+                const resp = await fetchWithRetry(url, apiKeys, {}, 3);
+                if (!resp.ok) { errors.push(`${matchId}: HTTP ${resp.status}`); continue; }
+                const json = await resp.json();
+                const m = json.data;
+                if (!m) continue;
+                fetched++;
+
+                // Carte puuid → display name depuis les kill events
+                const kills = m.kills || m.kill_events || [];
+                const nameMap = {};
+                kills.forEach(k => {
+                    if (k.killer_puuid && k.killer_display_name) nameMap[k.killer_puuid] = k.killer_display_name;
+                    if (k.victim_puuid && k.victim_display_name) nameMap[k.victim_puuid] = k.victim_display_name;
+                });
+                if (Object.keys(nameMap).length === 0) continue;
+
+                // Met à jour chaque enregistrement DB pour ce match
+                for (const row of group) {
+                    let changed = false;
+                    const updatedPlayers = (row.data.allPlayers || []).map(p => {
+                        if (!p.name?.trim() && p.puuid && nameMap[p.puuid]) {
+                            const parts = nameMap[p.puuid].split('#');
+                            changed = true;
+                            return { ...p, name: parts[0] || p.name, tag: parts[1] || p.tag };
+                        }
+                        return p;
+                    });
+                    if (changed) {
+                        row.data.allPlayers = updatedPlayers;
+                        await db.run("UPDATE matches SET data = ? WHERE id = ?",
+                            [JSON.stringify(row.data), row.rowId]);
+                        updated++;
+                    }
+                }
+
+                await new Promise(r => setTimeout(r, 250)); // respect rate limit
+            } catch (e) {
+                errors.push(`${matchId}: ${e.message}`);
+            }
+        }
+
+        console.log(`✅ Backfill noms : ${fetched} matchs re-fetchés, ${updated} enregistrements mis à jour, ${skipped} ignorés.`);
+        res.json({ fetched, updated, skipped, total: uniqueIds.length, errors: errors.slice(0, 20) });
+    } catch (e) {
+        console.error('❌ Backfill error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ==========================================
 // LOGIQUE DE SCAN ET DE RECUPERATION
 // ==========================================
 
@@ -698,20 +986,47 @@ const fetchWithRetry = async (url, apiKeys, options = {}, retries = 5) => {
 
 const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
     const headers = { 'Content-Type': 'application/json' };
-    const FETCH_SIZE = 50; 
+    const FETCH_SIZE = 20;
     const encodedName = encodeURIComponent(player.name.trim());
     const encodedTag = encodeURIComponent(player.tag.trim());
-    const commonParams = `&size=${FETCH_SIZE}`;
+    const region = (player.region || 'eu').toLowerCase();
     const cacheBuster = `&_t=${Date.now()}`;
     let newMatches = [];
 
+    // Résolution PUUID : les nouveaux matchs Riot n'exposent plus name/tag dans all_players
+    // Si déjà persisté en DB (via ensurePuuids), on évite l'appel réseau.
+    let playerPuuid = player.puuid || null;
+    if (!playerPuuid) {
+        try {
+            const accountRes = await fetchWithRetry(`${API_BASE}/v1/account/${encodedName}/${encodedTag}`, apiKeys, { headers });
+            if (accountRes.ok) {
+                const accountData = await accountRes.json().catch(() => null);
+                playerPuuid = accountData?.data?.puuid || null;
+                if (playerPuuid) {
+                    player.puuid = playerPuuid;
+                    await db.run("UPDATE players SET puuid = ? WHERE id = ?", [playerPuuid, player.id]).catch(() => {});
+                }
+            }
+        } catch { /* PUUID optionnel, fallback name/tag */ }
+    }
+    console.log(`   PUUID: ${playerPuuid ? playerPuuid.substring(0, 8) + '...' : 'non résolu (fallback name/tag)'}`);
+
+    const findPlayer = (allPlayers) => {
+        if (!allPlayers) return null;
+        if (playerPuuid) return allPlayers.find(p => p.puuid === playerPuuid) || null;
+        return allPlayers.find(p =>
+            p.name?.toLowerCase() === player.name.toLowerCase() &&
+            p.tag?.toLowerCase() === player.tag.toLowerCase()
+        ) || null;
+    };
+
     // DM
     try {
-      const url = `${API_BASE}/v3/matches/${player.region}/${encodedName}/${encodedTag}?filter=deathmatch${commonParams}${cacheBuster}`;
+      const url = `${API_BASE}/v3/matches/${region}/${encodedName}/${encodedTag}?size=${FETCH_SIZE}${cacheBuster}`;
       const dmResponse = await fetchWithRetry(url, apiKeys, { headers });
       const dmData = dmResponse.ok ? await dmResponse.json().catch(() => ({ data: [] })) : { data: [] };
       const cleanDmMatches = (dmData.data || []).filter(m => m.metadata?.mode === 'Deathmatch').map(m => {
-        const playerStats = m.players?.all_players?.find(p => p.name.toLowerCase() === player.name.toLowerCase() && p.tag.toLowerCase() === player.tag.toLowerCase());
+        const playerStats = findPlayer(m.players?.all_players);
         if (!playerStats) return null;
         const sortedPlayers = [...(m.players?.all_players || [])].sort((a, b) => {
           const killsA = a.stats?.kills || 0; const killsB = b.stats?.kills || 0;
@@ -729,7 +1044,8 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
           headshots: playerStats.stats?.headshots || 0, bodyshots: playerStats.stats?.bodyshots || 0, legshots: playerStats.stats?.legshots || 0,
           totalShots: (playerStats.stats?.bodyshots || 0) + (playerStats.stats?.legshots || 0) + (playerStats.stats?.headshots || 0),
           adr: Math.round((playerStats.stats?.score || 0) / rounds),
-          allPlayers: m.players.all_players, date: m.metadata.game_start_patched, timestamp: m.metadata.game_start, map: m.metadata.map
+          allPlayers: (m.players?.all_players || []).map(p => { const c = findCfgByPuuid(allConfigPlayers, p.puuid); return c ? { ...p, name: c.name, tag: c.tag } : p; }),
+          date: m.metadata.game_start_patched, timestamp: m.metadata.game_start, map: m.metadata.map
         };
       }).filter(Boolean);
       newMatches = [...newMatches, ...cleanDmMatches];
@@ -739,11 +1055,11 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
 
     // TDM
     try {
-      const url = `${API_BASE}/v3/matches/${player.region}/${encodedName}/${encodedTag}?filter=teamdeathmatch${commonParams}${cacheBuster}`;
+      const url = `${API_BASE}/v3/matches/${region}/${encodedName}/${encodedTag}?size=${FETCH_SIZE}${cacheBuster}`;
       const tdmResponse = await fetchWithRetry(url, apiKeys, { headers });
       const tdmData = tdmResponse.ok ? await tdmResponse.json().catch(() => ({ data: [] })) : { data: [] };
       const cleanTdmMatches = (tdmData.data || []).filter(m => m.metadata?.mode === 'Team Deathmatch').map(m => {
-        const playerStats = m.players?.all_players?.find(p => p.name.toLowerCase() === player.name.toLowerCase() && p.tag.toLowerCase() === player.tag.toLowerCase());
+        const playerStats = findPlayer(m.players?.all_players);
         if (!playerStats) return null;
         const b = m.teams?.blue?.rounds_won || 0; const r = m.teams?.red?.rounds_won || 0;
         const isWin = playerStats.team === 'Blue' ? (b > r) : (r > b);
@@ -758,7 +1074,8 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
           kd: (playerStats.stats?.deaths || 0) > 0 ? (playerStats.stats?.kills || 0) / playerStats.stats?.deaths : playerStats.stats?.kills || 0,
           adr: Math.round((playerStats.damage_made || 0) / 1), acs: Math.round((playerStats.stats?.score || 0) / 1),
           rounds: 1, roundsPlayed: 1, result: isWin ? 'WIN' : 'LOSS', scoreTeam: matchScore,
-          map: m.metadata.map, date: m.metadata.game_start_patched, timestamp: m.metadata.game_start, allPlayers: m.players.all_players, myTeam: playerStats.team
+          map: m.metadata.map, date: m.metadata.game_start_patched, timestamp: m.metadata.game_start, myTeam: playerStats.team,
+          allPlayers: (m.players?.all_players || []).map(p => { const c = findCfgByPuuid(allConfigPlayers, p.puuid); return c ? { ...p, name: c.name, tag: c.tag } : p; })
         };
       }).filter(Boolean);
       newMatches = [...newMatches, ...cleanTdmMatches];
@@ -768,14 +1085,14 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
 
     // SKIRMISH
     try {
-      const url = `${API_BASE}/v3/matches/${player.region}/${encodedName}/${encodedTag}?size=20${cacheBuster}`;
+      const url = `${API_BASE}/v3/matches/${region}/${encodedName}/${encodedTag}?size=${FETCH_SIZE}${cacheBuster}`;
       const skirmishResponse = await fetchWithRetry(url, apiKeys, { headers });
       const skirmishData = skirmishResponse.ok ? await skirmishResponse.json().catch(() => ({ data: [] })) : { data: [] };
       
       const cleanSkirmishMatches = (skirmishData.data || [])
         .filter(m => m.metadata && m.metadata.mode && m.metadata.mode === 'Custom Game') 
         .map(m => {
-          const playerStats = m.players?.all_players?.find(p => p.name.toLowerCase() === player.name.toLowerCase() && p.tag.toLowerCase() === player.tag.toLowerCase());
+          const playerStats = findPlayer(m.players?.all_players);
           if (!playerStats) return null;
           const b = m.teams?.blue?.rounds_won || 0; const r = m.teams?.red?.rounds_won || 0;
           const isWin = playerStats.team === 'Blue' ? (b > r) : (r > b);
@@ -790,7 +1107,8 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
             kd: (playerStats.stats?.deaths || 0) > 0 ? (playerStats.stats?.kills || 0) / playerStats.stats?.deaths : playerStats.stats?.kills || 0,
             adr: Math.round((playerStats.damage_made || 0) / (m.metadata?.rounds_played || 1)), acs: Math.round((playerStats.stats?.score || 0) / (m.metadata?.rounds_played || 1)),
             rounds: m.metadata?.rounds_played || 1, roundsPlayed: m.metadata?.rounds_played || 1, result: isWin ? 'WIN' : 'LOSS', scoreTeam: matchScore,
-            map: m.metadata.map, date: m.metadata.game_start_patched, timestamp: m.metadata.game_start, allPlayers: m.players.all_players, myTeam: playerStats.team
+            map: m.metadata.map, date: m.metadata.game_start_patched, timestamp: m.metadata.game_start, myTeam: playerStats.team,
+            allPlayers: (m.players?.all_players || []).map(p => { const c = findCfgByPuuid(allConfigPlayers, p.puuid); return c ? { ...p, name: c.name, tag: c.tag } : p; })
           };
       }).filter(Boolean);
       newMatches = [...newMatches, ...cleanSkirmishMatches];
@@ -802,25 +1120,33 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
 
     // RANKED
     try {
-      const url = `${API_BASE}/v3/matches/${player.region}/${encodedName}/${encodedTag}?filter=competitive${commonParams}${cacheBuster}`;
+      const url = `${API_BASE}/v3/matches/${region}/${encodedName}/${encodedTag}?size=${FETCH_SIZE}${cacheBuster}`;
       const compResponse = await fetchWithRetry(url, apiKeys, { headers });
       const compData = compResponse.ok ? await compResponse.json().catch(() => ({ data: [] })) : { data: [] };
       
       await delay(500);
       
-      const mmrUrl = `${API_BASE}/v1/mmr-history/${player.region}/${encodedName}/${encodedTag}?size=${FETCH_SIZE}`;
+      const mmrUrl = `${API_BASE}/v1/mmr-history/${region}/${encodedName}/${encodedTag}?size=${FETCH_SIZE}`;
       const mmrResponse = await fetchWithRetry(mmrUrl, apiKeys, { headers });
       const mmrData = mmrResponse.ok ? await mmrResponse.json().catch(() => ({ data: [] })) : { data: [] };
       
-      const cleanRankedMatches = (compData.data || []).filter(m => (m.metadata?.mode ? m.metadata.mode.toLowerCase() : '') === 'competitive').map(m => {
-        const playerStats = m.players?.all_players?.find(p => p.name.toLowerCase() === player.name.toLowerCase() && p.tag.toLowerCase() === player.tag.toLowerCase());
+      const rawCompetitive = (compData.data || []).filter(m => (m.metadata?.mode ? m.metadata.mode.toLowerCase() : '') === 'competitive');
+
+      const cleanRankedMatches = rawCompetitive.map(m => {
+        const playerStats = findPlayer(m.players?.all_players);
         if (!playerStats) return null;
 
         const relatedMmr = (mmrData.data || []).find(mmr => mmr.match_id === m.metadata.matchid);
         
-        if (!relatedMmr) {
-            console.log(`⏳ Match ${m.metadata.matchid} ignoré (RR pas encore disponibles).`);
-            return null;
+        // ⚡ FIX : On n'ignore plus le match s'il manque les points ! On l'ajoute quand même avec 0 RR par défaut.
+        let rrChange = 0, currentRank = 'Unknown', currentRR = 0, rankValue = null;
+        if (relatedMmr) {
+            rrChange = relatedMmr.mmr_change_to_last_game || 0;
+            currentRank = relatedMmr.currenttierpatched || 'Unknown';
+            currentRR = relatedMmr.ranking_in_tier || 0;
+            rankValue = (relatedMmr.currenttier || 0) * 100 + (relatedMmr.ranking_in_tier || 0);
+        } else {
+            console.log(`⏳ Info : RR manquants pour le match de ${player.name} (le match sera quand même sauvegardé)`);
         }
         
         const b = m.teams?.blue?.rounds_won || 0;
@@ -833,8 +1159,6 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
             const oppT = myT === 'blue' ? 'red' : 'blue';
             matchScore = `${m.teams[myT]?.rounds_won || 0} - ${m.teams[oppT]?.rounds_won || 0}`;
         }
-
-        const rankValue = (relatedMmr.currenttier || 0) * 100 + (relatedMmr.ranking_in_tier || 0);
 
         const kills = playerStats.stats?.kills || 0;
         const deaths = playerStats.stats?.deaths || 0;
@@ -870,14 +1194,35 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
             matchFkFd[fb.victim].fd++;
         });
 
-        const enrichedAllPlayers = (m.players?.all_players || []).map(p => ({
-            ...p,
-            stats: {
-                ...p.stats,
-                first_kills: matchFkFd[p.puuid]?.fk || p.stats?.first_kills || 0,
-                first_deaths: matchFkFd[p.puuid]?.fd || p.stats?.first_deaths || 0
+        // Build a name/tag map from kill event display names (e.g. "PlayerName#EUW1")
+        // Riot API stopped returning names in all_players, but kill events still have them
+        const displayNameMap = {};
+        allKills.forEach(k => {
+            if (k.killer_puuid && k.killer_display_name) displayNameMap[k.killer_puuid] = k.killer_display_name;
+            if (k.victim_puuid && k.victim_display_name) displayNameMap[k.victim_puuid] = k.victim_display_name;
+        });
+
+        const enrichedAllPlayers = (m.players?.all_players || []).map(p => {
+            const cfgP = findCfgByPuuid(allConfigPlayers, p.puuid);
+            let name = cfgP ? cfgP.name : p.name;
+            let tag  = cfgP ? cfgP.tag  : p.tag;
+            // Backfill from kill event display names if still empty
+            if (!name?.trim() && p.puuid && displayNameMap[p.puuid]) {
+                const parts = displayNameMap[p.puuid].split('#');
+                name = parts[0] || name;
+                tag  = parts[1] || tag;
             }
-        }));
+            return {
+                ...p,
+                name,
+                tag,
+                stats: {
+                    ...p.stats,
+                    first_kills:  matchFkFd[p.puuid]?.fk || p.stats?.first_kills  || 0,
+                    first_deaths: matchFkFd[p.puuid]?.fd || p.stats?.first_deaths || 0
+                }
+            };
+        });
 
         let mk3 = 0, mk4 = 0, mk5 = 0;
         Object.values(roundKills).forEach(count => {
@@ -930,10 +1275,11 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
             if (fbEvent) {
                 const kInfo = m.players?.all_players?.find(ap => ap.puuid === fbEvent.killer);
                 const vInfo = m.players?.all_players?.find(ap => ap.puuid === fbEvent.victim);
+                const resolveName = (info) => info ? (info.name?.trim() || findCfgByPuuid(allConfigPlayers, info.puuid)?.name || info.character || 'Inconnu') : 'Inconnu';
                 fbDetails = {
-                    killerName: kInfo ? kInfo.name : 'Inconnu',
+                    killerName:  resolveName(kInfo),
                     killerAgent: kInfo?.assets?.agent?.small || null,
-                    victimName: vInfo ? vInfo.name : 'Inconnu',
+                    victimName:  resolveName(vInfo),
                     victimAgent: vInfo?.assets?.agent?.small || null,
                     weapon: fbEvent.weapon || 'Arme inconnue'
                 };
@@ -942,11 +1288,11 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
             let planterName = null; let defuserName = null;
             if (round.plant_events?.planted_by?.puuid) {
                 const pInfo = m.players?.all_players?.find(ap => ap.puuid === round.plant_events.planted_by.puuid);
-                planterName = pInfo ? pInfo.name : null;
+                planterName = pInfo ? (pInfo.name?.trim() || findCfgByPuuid(allConfigPlayers, pInfo.puuid)?.name || pInfo.character) : null;
             }
             if (round.defuse_events?.defused_by?.puuid) {
                 const dInfo = m.players?.all_players?.find(ap => ap.puuid === round.defuse_events.defused_by.puuid);
-                defuserName = dInfo ? dInfo.name : null;
+                defuserName = dInfo ? (dInfo.name?.trim() || findCfgByPuuid(allConfigPlayers, dInfo.puuid)?.name || dInfo.character) : null;
             }
 
             let myTeamEco = 0; let enemyTeamEco = 0;
@@ -984,7 +1330,8 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
               if (!weaponStats[k.damage_weapon_name]) weaponStats[k.damage_weapon_name] = { kills: 0 };
               weaponStats[k.damage_weapon_name].kills++;
             }
-            const victimInGroup = allConfigPlayers.find(p => p.id === k.victim_puuid || (p.name && p.name.toLowerCase() === (k.victim_display_name || '').toLowerCase().split('#')[0] && p.tag && p.tag.toLowerCase() === (k.victim_display_name || '').toLowerCase().split('#')[1]));
+            const victimInGroup = findCfgByPuuid(allConfigPlayers, k.victim_puuid)
+              || allConfigPlayers.find(p => p.name && p.name.toLowerCase() === (k.victim_display_name || '').toLowerCase().split('#')[0] && p.tag && p.tag.toLowerCase() === (k.victim_display_name || '').toLowerCase().split('#')[1]);
             if (victimInGroup) {
               let victimAgentImg = null;
               const vInfo = (m.players?.all_players || []).find(vp => vp.puuid === k.victim_puuid);
@@ -1019,10 +1366,10 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
           agent: playerStats.character,
           agentImg: playerStats.assets?.agent?.small || null,
           matchScore: matchScore,
-          rrChange: relatedMmr.mmr_change_to_last_game || 0,
-          currentRank: relatedMmr.currenttierpatched || 'Unknown',
-          currentRR: relatedMmr.ranking_in_tier || 0,
-          rankValue: rankValue > 0 ? rankValue : null,
+          rrChange: rrChange,
+          currentRank: currentRank,
+          currentRR: currentRR,
+          rankValue: rankValue,
           kills,
           deaths,
           assists,
@@ -1102,12 +1449,38 @@ const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appU
         }
     });
 
+    // Détection rank up / rank down
+    for (const match of newlyDiscoveredMatches.filter(m => m.type === 'ranked' && m.rankValue && m.playerId)) {
+        const prevRow = await db.get(
+            "SELECT data FROM matches WHERE player_id = ? AND data LIKE '%\"type\":\"ranked\"%' AND id != ? ORDER BY date DESC LIMIT 1",
+            [match.playerId, `${match.id}_${match.playerId}`]
+        );
+        if (!prevRow) continue;
+        const prev = JSON.parse(prevRow.data);
+        if (!prev.rankValue) continue;
+        const prevTier = Math.floor(prev.rankValue / 100);
+        const newTier  = Math.floor(match.rankValue / 100);
+        if (prevTier === newTier) continue;
+        const cfg = allConfigPlayers.find(c => c.id === match.playerId);
+        if (!cfg) continue;
+        const isUp = newTier > prevTier;
+        const rankEmbed = new EmbedBuilder()
+            .setTitle(isUp ? `🎉 RANK UP — ${cfg.name} !` : `📉 RANK DOWN — ${cfg.name}`)
+            .setColor(isUp ? 0xffd700 : 0x7c3aed)
+            .setDescription(isUp
+                ? `**${prev.currentRank}** → **${match.currentRank}**\n\n🏅 Félicitations à **${cfg.name}** pour la montée de rang !`
+                : `**${prev.currentRank}** → **${match.currentRank}**\n\n💪 Courage **${cfg.name}**, la remontée arrive !`)
+            .setTimestamp();
+        await sendDiscordMessage(channelId, { embeds: [rankEmbed] });
+        await delay(500);
+    }
+
     for (const matchId of Object.keys(matchesById)) {
         const messagePayload = await buildMatchMessage(matchId, 'global', allConfigPlayers, appUrl);
         if (messagePayload) {
             console.log(`📤 [Discord] Envoi de l'alerte pour le match ${matchId}...`);
             await sendDiscordMessage(channelId, messagePayload);
-            await delay(1500); 
+            await delay(1500);
         }
     }
 };
@@ -1125,23 +1498,28 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
 
         if (allConfigPlayers.length === 0) {
             console.log("⚠️ Aucun joueur configuré. Fin du scan.");
-            isSyncing = false;
             return;
         }
 
         if (apiKeys.length === 0) {
             console.log("⚠️ Aucune clé API configurée. Fin du scan.");
-            isSyncing = false;
             return;
         }
 
         console.log(`🔄 Démarrage du scan Riot API...`);
+
+        // Résolution préalable des PUUIDs manquants (mute le bug "noms = noms d'agents")
+        await ensurePuuids(allConfigPlayers, apiKeys);
+
         const playersToFetch = requestedPlayerId === 'all' ? allConfigPlayers : allConfigPlayers.filter(p => p.id === requestedPlayerId);
         
         let allNewMatches = [];
 
+        // ⚡ NOUVEAU LOG : Pour voir exactement ce qu'il se passe pendant le scan
         for (const player of playersToFetch) {
+            console.log(`\n🔍 Scan en cours pour : ${player.name}#${player.tag} (Région: ${player.region})`);
             const matches = await fetchPlayerData(player, apiKeys, allConfigPlayers);
+            console.log(`   -> ${matches.length} matchs récupérés et filtrés.`);
             allNewMatches.push(...matches);
             await delay(1000); 
         }
@@ -1164,7 +1542,7 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
                 );
                 
                 if (result.changes > 0) {
-                    totalAdded++;
+                    if (isNew) totalAdded++; // ⚡ FIX : N'ajoute au compteur que les VRAIS nouveaux matchs
                     if (isNew && match.type === 'ranked') {
                         newlyAddedRankedMatches.push(match);
                     }
@@ -1173,7 +1551,7 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
             await db.exec('COMMIT');
         }
         
-        console.log(`✅ Fin du scan. ${totalAdded} matchs traités/sauvegardés.`);
+        console.log(`\n✅ Fin du scan complet. ${totalAdded} matchs traités/sauvegardés.`);
 
         if (newlyAddedRankedMatches.length > 0) {
             console.log(`📢 ${newlyAddedRankedMatches.length} nouveau(x) match(s) classé(s) détecté(s).`);
@@ -1233,8 +1611,8 @@ const generateDailyReport = async (isManual = false, forceDate = null) => {
 
 app.get('/history', async (req, res) => {
     try {
-        const { start, end } = req.query;
-        let query = 'SELECT data FROM matches';
+        const { start, end, limit = 5000, offset = 0 } = req.query;
+        let query = 'SELECT id, data FROM matches'; // Ajout de 'id' pour le debug
         let params = [];
         let conditions = [];
 
@@ -1252,24 +1630,36 @@ app.get('/history', async (req, res) => {
         }
         
         query += ' ORDER BY date DESC';
-
-        if (!start && !end) {
-            query += ' LIMIT 500'; 
-        }
+        query += ` LIMIT ${parseInt(limit)} OFFSET ${parseInt(offset)}`; 
 
         const rows = await db.all(query, params);
-        const matches = rows.map(row => JSON.parse(row.data));
+        
+        // ⚡ FIX : On gère les matchs corrompus un par un sans faire planter le serveur
+        const matches = rows.map(row => {
+            try {
+                return JSON.parse(row.data);
+            } catch (err) {
+                console.error(`❌ Erreur JSON.parse ignorée sur le match ID : ${row.id}`);
+                return null;
+            }
+        }).filter(Boolean); // On filtre/supprime les matchs null
+
         res.json({ matches });
     } catch (e) {
-        res.status(500).json({ matches: [] });
+        // ⚡ FIX : On affiche la VRAIE erreur dans la console du serveur !
+        console.error("❌ ERREUR CRITIQUE SUR LA ROUTE /history :", e);
+        res.status(500).json({ matches: [], error: e.message });
     }
 });
 
 app.post('/sync', async (req, res) => {
     const { playerId } = req.body;
-    if (isSyncing) return res.status(429).send("Une synchro est déjà en cours");
-    await syncAllPlayers(playerId || 'all');
-    res.status(200).send("Synchronisation terminée");
+    if (isSyncing) return res.status(429).json({ error: "Une synchro est déjà en cours" });
+    
+    // ⚡ FIX : Lancement asynchrone pour ne pas faire planter ton site avec un "Timeout"
+    syncAllPlayers(playerId || 'all').catch(console.error);
+    
+    res.status(202).json({ message: "Synchronisation lancée en arrière-plan. Les matchs apparaîtront d'ici peu." });
 });
 
 app.get('/test-send', async (req, res) => {
@@ -1342,5 +1732,5 @@ cron.schedule('*/5 * * * *', () => { syncAllPlayers('all'); });
 cron.schedule('0 1 * * *', () => { generateDailyReport(false); }, { timezone: "Europe/Paris" });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Serveur Backend lancé sur le port ${PORT}`);
+    console.log(`✅ Serveur Backend lancé et optimisé sur le port ${PORT}`);
 });

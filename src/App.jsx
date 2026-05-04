@@ -147,13 +147,17 @@ function MainApp() {
       let params = new URLSearchParams();
 
       // On demande au backend uniquement les dates nécessaires
-      if (selectedPeriod === 'challenge' && challengeStartDate) {
+      if (selectedPeriod === 'global') {
+        params.append('limit', 5000);
+      } else if (selectedPeriod === 'challenge' && challengeStartDate) {
         params.append('start', new Date(challengeStartDate).getTime());
-      } else if (selectedPeriod !== 'global' && selectedPeriod !== 'challenge') {
+        params.append('limit', 5000);
+      } else {
         const act = valorantSeasons.find(s => s.uuid === selectedPeriod);
         if (act) {
           params.append('start', act.startTime);
           params.append('end', act.endTime);
+          params.append('limit', 5000);
         }
       }
 

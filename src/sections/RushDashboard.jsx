@@ -157,10 +157,18 @@ const DailyGamesList = ({ matches, onSelectMatch, playersConfig }) => {
                     if (meta.allPlayers && myPartyIds.size > 0) {
                         displaySquad = meta.allPlayers.filter(p => p.party_id && myPartyIds.has(p.party_id));
                         displaySquad = displaySquad.map(rawPlayer => {
-                            const trackedData = players.find(p => p.playerId === rawPlayer.puuid);
+                            // Match d'un tracké via son puuid de configuration (peuplé au sync)
+                            const cfg = playersConfig.find(c =>
+                                (c.puuid && c.puuid.toLowerCase() === (rawPlayer.puuid || '').toLowerCase())
+                                || c.id.toLowerCase() === (rawPlayer.puuid || '').toLowerCase()
+                            );
+                            const trackedData = cfg ? players.find(p => p.playerId === cfg.id) : null;
                             if (trackedData) return { ...trackedData, isGuest: false };
                             else return {
-                                playerId: rawPlayer.puuid, name: rawPlayer.name, agent: rawPlayer.character,
+                                playerId: rawPlayer.puuid,
+                                // Si le nom Riot est vide (API ne le renvoie plus), on garde au moins le character
+                                name: rawPlayer.name?.trim() || rawPlayer.character || 'Inconnu',
+                                agent: rawPlayer.character,
                                 agentImg: rawPlayer.assets?.agent?.small, kills: rawPlayer.stats?.kills || 0,
                                 deaths: rawPlayer.stats?.deaths || 0, headshots: rawPlayer.stats?.headshots || 0,
                                 totalShots: (rawPlayer.stats?.bodyshots + rawPlayer.stats?.legshots + rawPlayer.stats?.headshots) || 0,
