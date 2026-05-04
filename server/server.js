@@ -97,6 +97,17 @@ const discordClient = new Client({
         console.warn("⚠️  Migration puuid:", e.message);
     }
 
+    // Migration : ajoute la colonne discord_id si elle n'existe pas
+    try {
+        const cols = await db.all("PRAGMA table_info(players)");
+        if (!cols.some(c => c.name === 'discord_id')) {
+            await db.exec("ALTER TABLE players ADD COLUMN discord_id TEXT");
+            console.log("🛠️  Colonne 'discord_id' ajoutée à la table players.");
+        }
+    } catch (e) {
+        console.warn("⚠️  Migration discord_id:", e.message);
+    }
+
     let jwtSecretRow = await db.get("SELECT value FROM config WHERE key = 'jwt_secret'");
     if (!jwtSecretRow) {
         const secret = crypto.randomBytes(64).toString('hex');
@@ -193,6 +204,20 @@ const getParisDateString = (dateObj) => {
     }).format(dateObj); 
 };
 
+const MAP_SPLASHES = {
+    ascent: "https://media.valorant-api.com/maps/7eaecc1b-4337-bbf6-6ab9-04b8f06b3319/splash.png",
+    split: "https://media.valorant-api.com/maps/d960549e-485c-e861-8d71-aa9d1aed12a2/splash.png",
+    fracture: "https://media.valorant-api.com/maps/bbee028c-4115-4ebb-4cb1-cebb65ec83f4/splash.png",
+    bind: "https://media.valorant-api.com/maps/2c9d57ec-4431-9c5e-2939-8f9ef6dd5cba/splash.png",
+    breeze: "https://media.valorant-api.com/maps/2c22ca7d-411a-a8cb-3ba2-66a8775f0a0d/splash.png",
+    lotus: "https://media.valorant-api.com/maps/2fe4ed3a-450a-948b-6d6b-e89a78e680a9/splash.png",
+    pearl: "https://media.valorant-api.com/maps/fd267378-4d1d-484f-ff52-77821ed10dc2/splash.png",
+    icebox: "https://media.valorant-api.com/maps/e2ad5c54-4114-a870-9641-8ea21279598c/splash.png",
+    haven: "https://media.valorant-api.com/maps/2bee0dc9-4ffe-519b-1cbd-7fbe763a6047/splash.png",
+    sunset: "https://media.valorant-api.com/maps/2c09d728-42d5-30d8-43dc-96a05ce7ce8d/splash.png",
+    abyss: "https://media.valorant-api.com/maps/224b0a95-48b9-f703-1e9d-1ca6761376f5/splash.png"
+};
+
 // ==========================================
 // BOT DISCORD : CRÉATION DU MESSAGE MATCH
 // ==========================================
@@ -235,23 +260,45 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
         const isMvp   = p.puuid === matchMvpId;
         const inParty = !cfg && p.party_id && trackedPartyIds.has(p.party_id);
         const name    = p.name?.trim() || p.character || '—';
-        const prefix  = cfg ? '★ ' : (inParty ? '▎ ' : '  ');
-        const agent   = (p.character || '?').substring(0, 8).padEnd(9);
-        const nameStr = (prefix + name).substring(0, 16).padEnd(16);
+        const prefix  = cfg ? '❖ ' : (inParty ? '| ' : '  ');
+        const agent   = (p.character || '?').substring(0, 7).padEnd(8);
+        
+        let cleanName = prefix + name;
+        if (cleanName.length > 10) cleanName = cleanName.substring(0, 9) + '.';
+        const nameStr = cleanName.padEnd(11);
+        
+        // Raccourci du Rang (ex: "Diamond 3" -> "D3")
+        const rankStr = p.currenttier_patched || '—';
+        let shortRank = '—';
+        if (rankStr !== '—') {
+            const r = rankStr.toUpperCase();
+            if (r.includes('IRON')) shortRank = 'I' + r.replace(/[^0-9]/g, '');
+            else if (r.includes('BRONZE')) shortRank = 'B' + r.replace(/[^0-9]/g, '');
+            else if (r.includes('SILVER')) shortRank = 'S' + r.replace(/[^0-9]/g, '');
+            else if (r.includes('GOLD')) shortRank = 'G' + r.replace(/[^0-9]/g, '');
+            else if (r.includes('PLATINUM')) shortRank = 'P' + r.replace(/[^0-9]/g, '');
+            else if (r.includes('DIAMOND')) shortRank = 'D' + r.replace(/[^0-9]/g, '');
+            else if (r.includes('ASCENDANT')) shortRank = 'A' + r.replace(/[^0-9]/g, '');
+            else if (r.includes('IMMORTAL')) shortRank = 'Im' + r.replace(/[^0-9]/g, '');
+            else if (r.includes('RADIANT')) shortRank = 'R';
+            else if (r.includes('UNRATED')) shortRank = 'U';
+        }
+        const rankCol = shortRank.padEnd(3);
+        
         const k       = String(p.stats?.kills   || 0).padStart(2);
         const d       = String(p.stats?.deaths  || 0).padStart(2);
         const a       = String(p.stats?.assists || 0).padStart(2);
-        const acs     = String(Math.round((p.stats?.score || 0) / rounds)).padStart(4);
-        let rr = '     ';
-        // RR affiché uniquement pour les joueurs trackés (pas pour les coéquipiers randoms)
+        const kda     = `${k}/${d}/${a}`.padEnd(8);
+        const acs     = String(Math.round((p.stats?.score || 0) / rounds)).padStart(3);
+        let rr = '    ';
         if (tracked?.rrChange !== undefined) {
             const sign = tracked.rrChange > 0 ? '+' : '';
-            rr = `${sign}${tracked.rrChange}RR`.padEnd(5);
+            rr = `${sign}${tracked.rrChange}`.padEnd(4);
         }
-        return `${agent}${nameStr}${k}/${d}/${a} ${acs}acs ${rr}${isMvp ? ' 👑' : ''}`;
+        return `${rankCol}${nameStr}${agent}${kda} ${acs} ${rr}${isMvp ? ' 👑' : ''}`;
     };
 
-    const tableHeader = `${'Agent'.padEnd(9)}${'Joueur'.padEnd(16)}K /D /A   ACS\n` + '─'.repeat(48);
+    const tableHeader = `${'Rk'.padEnd(3)}${'Joueur'.padEnd(11)}${'Agent'.padEnd(8)}${'K/D/A'.padEnd(8)} ACS   RR\n` + '─'.repeat(39);
     const formatTeam  = (team) => team.map(formatLine).join('\n');
 
     const resultEmoji = isWin ? '🏆' : (baseMatch.result === 'LOSS' ? '💔' : '🤝');
@@ -262,32 +309,102 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
         .setTitle(`${resultEmoji} ${resultText} — ${(baseMatch.map || '?').toUpperCase()}`)
         .setURL(appUrl)
         .setColor(color)
-        .setFooter({ text: 'KSL Tracker  •  ★ = joueur tracké  •  ▎ = même groupe' })
+        .setFooter({ text: 'KSL Tracker  •  ❖ = escouade KSL  •  | = avec l\'escouade' })
         .setTimestamp(baseMatch.timestamp ? baseMatch.timestamp * 1000 : new Date(baseMatch.date).getTime());
-
-    const topTracked = [...playersInMatch].sort((a, b) => b.score - a.score)[0];
-    if (topTracked?.agentImg) embed.setThumbnail(topTracked.agentImg);
+        
+    const mapName = (baseMatch.map || '').toLowerCase();
+    if (MAP_SPLASHES[mapName]) {
+        embed.setThumbnail(MAP_SPLASHES[mapName]);
+    }
 
     const blueWin   = blueScore > redScore;
     const blueLabel = `🟦 **ÉQUIPE BLEUE** — ${blueScore} rounds${blueWin ? ' ✅' : ''}`;
     const redLabel  = `🟥 **ÉQUIPE ROUGE** — ${redScore} rounds${!blueWin && blueScore !== redScore ? ' ✅' : ''}`;
 
+    // Récupération des joueurs trackés pour les mentionner
+    const trackedConfigs = [];
+    allPlayers.forEach(p => {
+        const cfg = findCfgByPuuid(allConfigPlayers, p.puuid);
+        if (cfg && !trackedConfigs.some(c => c.id === cfg.id)) trackedConfigs.push(cfg);
+    });
+    const mentionsText = trackedConfigs.map(c => c.discord_id ? `<@${c.discord_id}>` : `**${c.name}**`).join(' · ');
+    const mentionsPrefix = mentionsText ? `👥 ${mentionsText}\n\n` : '';
+
     if (view === 'global') {
-        let desc = `**Score : ${baseMatch.matchScore}** · Classé · ${rounds} rondes\n\n`;
+        let desc = `${mentionsPrefix}**Score : ${baseMatch.matchScore}** · Classé · ${rounds} rounds\n\n`;
         desc += `${blueLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(blueTeam)}\n\`\`\`\n`;
         desc += `${redLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(redTeam)}\n\`\`\``;
         if (desc.length > 4096) desc = desc.substring(0, 4090) + '\n...';
         embed.setDescription(desc);
     } else if (view === 'blue') {
-        embed.setDescription(`${blueLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(blueTeam)}\n\`\`\``);
+        embed.setDescription(`${mentionsPrefix}${blueLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(blueTeam)}\n\`\`\``);
     } else if (view === 'red') {
-        embed.setDescription(`${redLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(redTeam)}\n\`\`\``);
+        embed.setDescription(`${mentionsPrefix}${redLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(redTeam)}\n\`\`\``);
     }
 
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`match_global_${matchId}`).setLabel('📊 Les deux équipes').setStyle(view === 'global' ? ButtonStyle.Success : ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId(`match_blue_${matchId}`).setLabel('🟦 Équipe Bleue').setStyle(view === 'blue' ? ButtonStyle.Primary : ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId(`match_red_${matchId}`).setLabel('🟥 Équipe Rouge').setStyle(view === 'red' ? ButtonStyle.Danger : ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [row] };
+};
+
+// ==========================================
+// BOT DISCORD : CRÉATION DU CLASSEMENT
+// ==========================================
+const buildClassementMessage = async (category, allConfigPlayers, startTs, startFr) => {
+    const stats = await Promise.all(allConfigPlayers.map(async p => {
+        const rows = await db.all(
+            "SELECT data FROM matches WHERE player_id = ? AND date >= ? AND data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC",
+            [p.id, startTs]
+        );
+        let rrTotal = 0, wins = 0, currentRank = 'Non classé', rankValue = 0, hsTotal = 0, shotsTotal = 0;
+        rows.forEach(r => {
+            const m = JSON.parse(r.data);
+            rrTotal += (m.rrChange || 0);
+            if (m.result === 'WIN') wins++;
+            hsTotal += (m.headshots || 0);
+            shotsTotal += (m.totalShots || 0);
+        });
+        if (rows.length > 0) { const last = JSON.parse(rows[0].data); currentRank = last.currentRank || 'Non classé'; rankValue = last.rankValue || 0; }
+        return {
+            name: p.name, rrTotal, wins, games: rows.length,
+            winrate: rows.length > 0 ? Math.round((wins / rows.length) * 100) : 0,
+            hsPct: shotsTotal > 0 ? Math.round((hsTotal / shotsTotal) * 100) : 0,
+            currentRank, rankValue
+        };
+    }));
+
+    const activePlayers = stats.filter(p => p.games > 0);
+    let title = ''; let color = 0xffd700; let mapFn;
+
+    if (category === 'rr') {
+        title = '🏆 Classement — Rank Rating (RR)'; activePlayers.sort((a, b) => b.rankValue - a.rankValue || b.rrTotal - a.rrTotal); mapFn = p => `> **${p.rrTotal > 0 ? '+' : ''}${p.rrTotal} RR** • ${p.currentRank}`;
+    } else if (category === 'hs') {
+        title = '🎯 Classement — Headshot %'; color = 0xef4444; activePlayers.sort((a, b) => b.hsPct - a.hsPct); mapFn = p => `> **${p.hsPct}% HS** • ${p.games} parties`;
+    } else if (category === 'winrate') {
+        title = '📈 Classement — Winrate'; color = 0x10b981; activePlayers.sort((a, b) => b.winrate - a.winrate || b.games - a.games); mapFn = p => `> **${p.winrate}% Winrate** • ${p.wins}W - ${p.games - p.wins}L`;
+    } else if (category === 'games') {
+        title = '🕹️ Classement — Parties Jouées'; color = 0x3b82f6; activePlayers.sort((a, b) => b.games - a.games); mapFn = p => `> **${p.games} parties** • Joueur très actif`;
+    }
+
+    const medals = ['🥇', '🥈', '🥉'];
+    const lines = activePlayers.map((p, i) => `${medals[i] || `**${i + 1}.**`} **${p.name}**\n${mapFn(p)}`).join('\n\n');
+
+    const embed = new EmbedBuilder()
+        .setTitle(title)
+        .setColor(color)
+        .setDescription(lines || '*Aucune donnée disponible.*')
+        .setFooter({ text: `Depuis le ${startFr}` })
+        .setTimestamp();
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('class_rr').setLabel('📈 RR').setStyle(category === 'rr' ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('class_hs').setLabel('🎯 HS%').setStyle(category === 'hs' ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('class_winrate').setLabel('🏆 Win').setStyle(category === 'winrate' ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId('class_games').setLabel('🕹️ Games').setStyle(category === 'games' ? ButtonStyle.Success : ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [row] };
@@ -444,23 +561,30 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
 // ==========================================
 // BOT DISCORD : SLASH COMMANDS (ENREGISTREMENT)
 // ==========================================
-discordClient.once('clientReady', async () => {
+discordClient.once('ready', async () => {
     const players = await getPlayers();
     const choices = players.slice(0, 25).map(p => ({ name: p.name, value: p.id }));
 
+    const playerOption = { type: 3, name: 'joueur', description: 'Joueur KSL (Optionnel si compte lié)', required: false };
+    const linkOption = { type: 3, name: 'joueur', description: 'Ton pseudo KSL', required: true };
+    
+    // Sécurité : Discord bloque le démarrage si les choix sont vides
+    if (choices.length > 0) {
+        playerOption.choices = choices;
+        linkOption.choices = choices;
+    }
+
     const commands = [
-        { name: 'classement', description: '🏆 Classement KSL — Rang et RR du challenge' },
-        {
-            name: 'stats',
-            description: '📊 Stats ranked récentes d\'un joueur',
-            options: [{ type: 3, name: 'joueur', description: 'Joueur KSL', required: false, choices }]
-        },
+        { name: 'classement', description: '🏆 Classements KSL (RR, Winrate, HS%, Parties)' },
+        { name: 'stats', description: '📊 Stats ranked et courbe de RR d\'un joueur', options: [playerOption] },
+        { name: 'historique', description: '🕒 Affiche les 5 derniers matchs classés', options: [playerOption] },
+        { name: 'link', description: '🔗 Lier ton compte Discord à ton profil tracker', options: [linkOption] },
         { name: 'rapport', description: '📋 Génère le rapport journalier maintenant' },
     ];
 
     try {
         const rest = new REST({ version: '10' }).setToken(discordClient.token);
-        await rest.put(Routes.applicationCommands(discordClient.application.id), { body: commands });
+        await rest.put(Routes.applicationCommands(discordClient.user.id), { body: commands });
         console.log('✅ Slash commands Discord enregistrées.');
     } catch (e) {
         console.error('❌ Slash commands — erreur enregistrement :', e.message);
@@ -529,53 +653,53 @@ discordClient.on('interactionCreate', async interaction => {
             await interaction.deferReply();
             const challengeStart = await getConfig('challenge_start_date', '2024-01-01T00:00');
             const startTs = new Date(challengeStart).getTime();
-
-            const stats = await Promise.all(allConfigPlayers.map(async p => {
-                const rows = await db.all(
-                    "SELECT data FROM matches WHERE player_id = ? AND date >= ? AND data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC",
-                    [p.id, startTs]
-                );
-                let rrTotal = 0, wins = 0, currentRank = 'Non classé', rankValue = 0;
-                rows.forEach(r => { const m = JSON.parse(r.data); rrTotal += (m.rrChange || 0); if (m.result === 'WIN') wins++; });
-                if (rows.length > 0) { const last = JSON.parse(rows[0].data); currentRank = last.currentRank || 'Non classé'; rankValue = last.rankValue || 0; }
-                return { name: p.name, rrTotal, wins, games: rows.length, winrate: rows.length > 0 ? Math.round(wins / rows.length * 100) : 0, currentRank, rankValue };
-            }));
-
-            stats.sort((a, b) => b.rankValue - a.rankValue || b.rrTotal - a.rrTotal);
-            const medals = ['🥇', '🥈', '🥉'];
             const startFr = new Date(challengeStart).toLocaleDateString('fr-FR');
-            const lines = stats.filter(p => p.games > 0).map((p, i) => {
-                const sign = p.rrTotal > 0 ? '+' : '';
-                return `${medals[i] || `**${i + 1}.**`} **${p.name}** — ${p.currentRank}\n> ${sign}${p.rrTotal} RR • ${p.games} games • ${p.winrate}% WR`;
-            }).join('\n\n');
 
-            const embed = new EmbedBuilder()
-                .setTitle('🏆 Classement KSL — Challenge Actuel')
-                .setColor(0xffd700)
-                .setDescription(lines || '*Aucune donnée disponible.*')
-                .setFooter({ text: `Depuis le ${startFr}` })
-                .setTimestamp();
-            await interaction.editReply({ embeds: [embed] });
+            const payload = await buildClassementMessage('rr', allConfigPlayers, startTs, startFr);
+            await interaction.editReply(payload);
         }
 
         else if (commandName === 'stats') {
             await interaction.deferReply();
             const playerId = interaction.options.getString('joueur');
-            const target = playerId ? allConfigPlayers.find(p => p.id === playerId) : allConfigPlayers[0];
-            if (!target) { await interaction.editReply({ content: '❌ Joueur introuvable.' }); return; }
+            let target;
+            if (playerId) {
+                target = allConfigPlayers.find(p => p.id === playerId);
+            } else {
+                target = allConfigPlayers.find(p => p.discord_id === interaction.user.id);
+            }
+            
+            if (!target) { 
+                await interaction.editReply({ content: '❌ Joueur introuvable. Précise un joueur ou utilise /link pour lier ton compte.' }); 
+                return; 
+            }
 
             const rows = await db.all(
                 "SELECT data FROM matches WHERE player_id = ? AND data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC LIMIT 20",
                 [target.id]
             );
             if (rows.length === 0) { await interaction.editReply({ content: `⚠️ Aucun match classé pour **${target.name}**.` }); return; }
+            
+            const matchesChronological = [...rows].reverse().map(r => JSON.parse(r.data));
 
             let wins = 0, kills = 0, deaths = 0, assists = 0, rrTotal = 0, acsSum = 0, currentRank = 'Inconnu';
+            
+            let currentRRValue = 0;
+            const rrDataPoints = [0];
+            const labels = ['Start'];
+
+            matchesChronological.forEach((m, index) => {
+                rrTotal += m.rrChange || 0;
+                currentRRValue += m.rrChange || 0;
+                rrDataPoints.push(currentRRValue);
+                labels.push(`#${index + 1}`);
+            });
+            
             rows.forEach(r => {
                 const m = JSON.parse(r.data);
                 if (m.result === 'WIN') wins++;
                 kills += m.kills || 0; deaths += m.deaths || 0; assists += m.assists || 0;
-                rrTotal += m.rrChange || 0; acsSum += m.acs || 0;
+                acsSum += m.acs || 0;
             });
             currentRank = JSON.parse(rows[0].data).currentRank || 'Inconnu';
             const kd = deaths > 0 ? (kills / deaths).toFixed(2) : kills;
@@ -583,6 +707,31 @@ discordClient.on('interactionCreate', async interaction => {
             const avgAcs = Math.round(acsSum / rows.length);
             const sign = rrTotal > 0 ? '+' : '';
             const color = parseInt((target.color || '#ff4655').replace('#', ''), 16) || 0xff4655;
+            
+            const chartConfig = {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'RR Evolution',
+                        data: rrDataPoints,
+                        borderColor: target.color || '#ff4655',
+                        backgroundColor: 'rgba(255, 70, 85, 0.1)',
+                        borderWidth: 3,
+                        pointRadius: 0,
+                        fill: true,
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    legend: { display: false },
+                    scales: {
+                        yAxes: [{ gridLines: { color: 'rgba(255,255,255,0.1)' }, ticks: { fontColor: '#aaa' } }],
+                        xAxes: [{ gridLines: { display: false }, ticks: { fontColor: '#aaa' } }]
+                    }
+                }
+            };
+            const chartUrl = `https://quickchart.io/chart?w=500&h=250&c=${encodeURIComponent(JSON.stringify(chartConfig))}&bkg=${encodeURIComponent('#1c252e')}`;
 
             const embed = new EmbedBuilder()
                 .setTitle(`📊 ${target.name} — Stats Ranked`)
@@ -593,8 +742,67 @@ discordClient.on('interactionCreate', async interaction => {
                     { name: '⚔️ K/D/A', value: `**${kd}** K/D\n${Math.round(kills/rows.length)}/${Math.round(deaths/rows.length)}/${Math.round(assists/rows.length)} moy.`, inline: true },
                     { name: '💥 Perf.', value: `**${avgAcs}** ACS moy.\n${sign}${rrTotal} RR total`, inline: true }
                 )
+                .setImage(chartUrl)
                 .setTimestamp();
             await interaction.editReply({ embeds: [embed] });
+        }
+        
+        else if (commandName === 'historique') {
+            await interaction.deferReply();
+            const playerId = interaction.options.getString('joueur');
+            let target;
+            if (playerId) {
+                target = allConfigPlayers.find(p => p.id === playerId);
+            } else {
+                target = allConfigPlayers.find(p => p.discord_id === interaction.user.id);
+            }
+            
+            if (!target) { 
+                await interaction.editReply({ content: '❌ Joueur introuvable. Précise un joueur ou utilise /link pour lier ton compte.' }); 
+                return; 
+            }
+
+            const rows = await db.all(
+                "SELECT data FROM matches WHERE player_id = ? AND data LIKE '%\"type\":\"ranked\"%' ORDER BY date DESC LIMIT 5",
+                [target.id]
+            );
+            if (rows.length === 0) { await interaction.editReply({ content: `⚠️ Aucun match classé pour **${target.name}**.` }); return; }
+            
+            const embed = new EmbedBuilder()
+                .setTitle(`🕒 Historique récent — ${target.name}`)
+                .setColor(parseInt((target.color || '#ff4655').replace('#', ''), 16) || 0xff4655)
+                .setTimestamp();
+
+            let desc = "";
+            rows.forEach((r, i) => {
+                const m = JSON.parse(r.data);
+                if (i === 0 && m.agentImg) embed.setThumbnail(m.agentImg);
+                const emoji = m.result === 'WIN' ? '🟢' : (m.result === 'LOSS' ? '🔴' : '⚪');
+                const sign = m.rrChange > 0 ? '+' : '';
+        
+        let favWeapon = '';
+        if (m.weaponStats) {
+            const weapons = Object.entries(m.weaponStats).sort((a, b) => b[1].kills - a[1].kills);
+            if (weapons.length > 0) favWeapon = ` 🔫 ${weapons[0][0]}`;
+        }
+        
+        desc += `${emoji} **${(m.map || '?').toUpperCase()}** (${m.matchScore || '? - ?'})\n> \`${(m.agent || '?').padEnd(9)}\` : **${sign}${m.rrChange || 0} RR** | ${m.kills}/${m.deaths}/${m.assists} (*${m.kd} K/D*) | ${m.acs || 0} ACS${favWeapon}\n\n`;
+            });
+            
+            embed.setDescription(desc);
+            await interaction.editReply({ embeds: [embed] });
+        }
+        
+        else if (commandName === 'link') {
+            await interaction.deferReply({ ephemeral: true });
+            const playerId = interaction.options.getString('joueur');
+            const target = allConfigPlayers.find(p => p.id === playerId);
+            if (!target) { await interaction.editReply({ content: '❌ Joueur introuvable.' }); return; }
+
+            const discordId = interaction.user.id;
+            await db.run("UPDATE players SET discord_id = ? WHERE id = ?", [discordId, target.id]);
+            await interaction.editReply({ content: `✅ Ton compte Discord a été lié avec succès au joueur **${target.name}** ! Tu peux maintenant utiliser \`/stats\` directement.` });
+            return;
         }
 
         else if (commandName === 'rapport') {
@@ -622,6 +830,16 @@ discordClient.on('interactionCreate', async interaction => {
         } else {
             await interaction.followUp({ content: "Désolé, ce match n'est plus en base de données.", ephemeral: true });
         }
+    }
+    else if (customId.startsWith('class_')) {
+        await interaction.deferUpdate();
+        const category = customId.split('_')[1];
+        const challengeStart = await getConfig('challenge_start_date', '2024-01-01T00:00');
+        const startTs = new Date(challengeStart).getTime();
+        const startFr = new Date(challengeStart).toLocaleDateString('fr-FR');
+        
+        const messagePayload = await buildClassementMessage(category, allConfigPlayers, startTs, startFr);
+        await interaction.editReply(messagePayload);
     }
     else if (customId.startsWith('report_')) {
         await interaction.deferUpdate();
@@ -716,19 +934,19 @@ app.get('/api/admin/players', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/admin/players', authenticateToken, async (req, res) => {
-    const { name, tag, region, color } = req.body;
+    const { name, tag, region, color, discord_id } = req.body;
     const countRow = await db.get("SELECT COUNT(*) as count FROM players");
     const id = `p${countRow.count + 1}_${Date.now()}`;
-    await db.run("INSERT INTO players (id, name, tag, region, color) VALUES (?, ?, ?, ?, ?)", [id, name, tag, region, color || '#ffffff']);
+    await db.run("INSERT INTO players (id, name, tag, region, color, discord_id) VALUES (?, ?, ?, ?, ?, ?)", [id, name, tag, region, color || '#ffffff', discord_id || '']);
     res.json({ message: "Joueur ajouté", id });
 });
 
 app.put('/api/admin/players/:id', authenticateToken, async (req, res) => {
-    const { name, tag, color } = req.body;
+    const { name, tag, color, discord_id } = req.body;
     try {
         await db.run(
-            "UPDATE players SET name = ?, tag = ?, color = ? WHERE id = ?",
-            [name, tag, color, req.params.id]
+            "UPDATE players SET name = ?, tag = ?, color = ?, discord_id = ? WHERE id = ?",
+            [name, tag, color, discord_id || '', req.params.id]
         );
         res.json({ message: "Joueur mis à jour avec succès" });
     } catch (e) {
@@ -899,32 +1117,56 @@ app.post('/api/admin/backfill-names', authenticateToken, async (req, res) => {
             );
             if (!needsBackfill) { skipped++; continue; }
 
+            console.log(`[DEBUG] Backfill du match : ${matchId}`);
             try {
-                const url = `${API_BASE}/v3/match/${matchId}`;
+                // L'API HenrikDev requiert /v2/match/{matchId} pour interroger un match spécifique
+                const url = `${API_BASE}/v2/match/${matchId}`;
                 const resp = await fetchWithRetry(url, apiKeys, {}, 3);
-                if (!resp.ok) { errors.push(`${matchId}: HTTP ${resp.status}`); continue; }
+                if (!resp.ok) { 
+                    console.log(`[DEBUG] ❌ Erreur HTTP ${resp.status} pour le match ${matchId}`);
+                    errors.push(`${matchId}: HTTP ${resp.status}`); 
+                    continue; 
+                }
                 const json = await resp.json();
                 const m = json.data;
-                if (!m) continue;
+                if (!m) {
+                    console.log(`[DEBUG] ⚠️ Pas de donnees valides reçues pour le match ${matchId}`);
+                    continue;
+                }
                 fetched++;
 
-                // Carte puuid → display name depuis les kill events
-                const kills = m.kills || m.kill_events || [];
                 const nameMap = {};
-                kills.forEach(k => {
-                    if (k.killer_puuid && k.killer_display_name) nameMap[k.killer_puuid] = k.killer_display_name;
-                    if (k.victim_puuid && k.victim_display_name) nameMap[k.victim_puuid] = k.victim_display_name;
-                });
-                if (Object.keys(nameMap).length === 0) continue;
+                
+                // 1. On cherche d'abord directement dans la liste des joueurs du match
+                if (m.players && Array.isArray(m.players.all_players)) {
+                    m.players.all_players.forEach(p => {
+                        if (p.puuid && p.name && p.name.trim() !== '') {
+                            nameMap[p.puuid] = `${p.name}#${p.tag}`;
+                        }
+                    });
+                }
 
+                // 2. Fallback sur les kill events au cas où
+                const kills = m.kills || m.kill_events || [];
+                kills.forEach(k => {
+                    if (k.killer_puuid && k.killer_display_name && !nameMap[k.killer_puuid]) nameMap[k.killer_puuid] = k.killer_display_name;
+                    if (k.victim_puuid && k.victim_display_name && !nameMap[k.victim_puuid]) nameMap[k.victim_puuid] = k.victim_display_name;
+                });
+                
                 // Met à jour chaque enregistrement DB pour ce match
                 for (const row of group) {
                     let changed = false;
                     const updatedPlayers = (row.data.allPlayers || []).map(p => {
-                        if (!p.name?.trim() && p.puuid && nameMap[p.puuid]) {
-                            const parts = nameMap[p.puuid].split('#');
+                        if (!p.name?.trim()) {
                             changed = true;
-                            return { ...p, name: parts[0] || p.name, tag: parts[1] || p.tag };
+                            if (p.puuid && nameMap[p.puuid]) {
+                                const parts = nameMap[p.puuid].split('#');
+                                return { ...p, name: parts[0] || p.name, tag: parts[1] || p.tag };
+                            } else {
+                                // ⚡ FIX : Si Riot censure vraiment le nom (ex: Deathmatch anonyme)
+                                // On utilise le nom de l'agent pour valider le joueur.
+                                return { ...p, name: p.character || 'Inconnu', tag: '' };
+                            }
                         }
                         return p;
                     });
@@ -1020,6 +1262,27 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
         ) || null;
     };
 
+    // Fonction de sauvetage des pseudos : fouille dans les kill events ou utilise le nom de l'agent.
+    const enrichPlayersList = (allPlayersRaw, killEvents, allConfigPlayers) => {
+        const displayNameMap = {};
+        (killEvents || []).forEach(k => {
+            if (k.killer_puuid && k.killer_display_name) displayNameMap[k.killer_puuid] = k.killer_display_name;
+            if (k.victim_puuid && k.victim_display_name) displayNameMap[k.victim_puuid] = k.victim_display_name;
+        });
+        return (allPlayersRaw || []).map(p => {
+            const c = findCfgByPuuid(allConfigPlayers, p.puuid);
+            let name = c ? c.name : p.name;
+            let tag = c ? c.tag : p.tag;
+            if (!name?.trim() && p.puuid && displayNameMap[p.puuid]) {
+                const parts = displayNameMap[p.puuid].split('#');
+                name = parts[0] || name;
+                tag = parts[1] || tag;
+            }
+            if (!name?.trim()) { name = p.character || 'Inconnu'; tag = ''; }
+            return { ...p, name, tag };
+        });
+    };
+
     // DM
     try {
       const url = `${API_BASE}/v3/matches/${region}/${encodedName}/${encodedTag}?size=${FETCH_SIZE}${cacheBuster}`;
@@ -1044,7 +1307,7 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
           headshots: playerStats.stats?.headshots || 0, bodyshots: playerStats.stats?.bodyshots || 0, legshots: playerStats.stats?.legshots || 0,
           totalShots: (playerStats.stats?.bodyshots || 0) + (playerStats.stats?.legshots || 0) + (playerStats.stats?.headshots || 0),
           adr: Math.round((playerStats.stats?.score || 0) / rounds),
-          allPlayers: (m.players?.all_players || []).map(p => { const c = findCfgByPuuid(allConfigPlayers, p.puuid); return c ? { ...p, name: c.name, tag: c.tag } : p; }),
+          allPlayers: enrichPlayersList(m.players?.all_players, m.kills || m.kill_events, allConfigPlayers),
           date: m.metadata.game_start_patched, timestamp: m.metadata.game_start, map: m.metadata.map
         };
       }).filter(Boolean);
@@ -1075,7 +1338,7 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
           adr: Math.round((playerStats.damage_made || 0) / 1), acs: Math.round((playerStats.stats?.score || 0) / 1),
           rounds: 1, roundsPlayed: 1, result: isWin ? 'WIN' : 'LOSS', scoreTeam: matchScore,
           map: m.metadata.map, date: m.metadata.game_start_patched, timestamp: m.metadata.game_start, myTeam: playerStats.team,
-          allPlayers: (m.players?.all_players || []).map(p => { const c = findCfgByPuuid(allConfigPlayers, p.puuid); return c ? { ...p, name: c.name, tag: c.tag } : p; })
+          allPlayers: enrichPlayersList(m.players?.all_players, m.kills || m.kill_events, allConfigPlayers)
         };
       }).filter(Boolean);
       newMatches = [...newMatches, ...cleanTdmMatches];
@@ -1108,7 +1371,7 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
             adr: Math.round((playerStats.damage_made || 0) / (m.metadata?.rounds_played || 1)), acs: Math.round((playerStats.stats?.score || 0) / (m.metadata?.rounds_played || 1)),
             rounds: m.metadata?.rounds_played || 1, roundsPlayed: m.metadata?.rounds_played || 1, result: isWin ? 'WIN' : 'LOSS', scoreTeam: matchScore,
             map: m.metadata.map, date: m.metadata.game_start_patched, timestamp: m.metadata.game_start, myTeam: playerStats.team,
-            allPlayers: (m.players?.all_players || []).map(p => { const c = findCfgByPuuid(allConfigPlayers, p.puuid); return c ? { ...p, name: c.name, tag: c.tag } : p; })
+            allPlayers: enrichPlayersList(m.players?.all_players, m.kills || m.kill_events, allConfigPlayers)
           };
       }).filter(Boolean);
       newMatches = [...newMatches, ...cleanSkirmishMatches];
@@ -1211,6 +1474,10 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
                 const parts = displayNameMap[p.puuid].split('#');
                 name = parts[0] || name;
                 tag  = parts[1] || tag;
+            }
+            if (!name?.trim()) {
+                name = p.character || 'Inconnu';
+                tag = '';
             }
             return {
                 ...p,
@@ -1464,12 +1731,13 @@ const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appU
         const cfg = allConfigPlayers.find(c => c.id === match.playerId);
         if (!cfg) continue;
         const isUp = newTier > prevTier;
+        const playerMention = cfg.discord_id ? `<@${cfg.discord_id}>` : `**${cfg.name}**`;
         const rankEmbed = new EmbedBuilder()
             .setTitle(isUp ? `🎉 RANK UP — ${cfg.name} !` : `📉 RANK DOWN — ${cfg.name}`)
             .setColor(isUp ? 0xffd700 : 0x7c3aed)
             .setDescription(isUp
-                ? `**${prev.currentRank}** → **${match.currentRank}**\n\n🏅 Félicitations à **${cfg.name}** pour la montée de rang !`
-                : `**${prev.currentRank}** → **${match.currentRank}**\n\n💪 Courage **${cfg.name}**, la remontée arrive !`)
+                ? `**${prev.currentRank}** → **${match.currentRank}**\n\n🏅 Félicitations à ${playerMention} pour la montée de rang !`
+                : `**${prev.currentRank}** → **${match.currentRank}**\n\n💪 Courage ${playerMention}, la remontée arrive !`)
             .setTimestamp();
         await sendDiscordMessage(channelId, { embeds: [rankEmbed] });
         await delay(500);
@@ -1535,6 +1803,24 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
 
                 const existing = await db.get(`SELECT id FROM matches WHERE id = ?`, [uniqueId]);
                 const isNew = !existing;
+
+                // ⚡ FIX: Ne pas écraser les noms Backfillés si le match existe déjà !
+                if (!isNew) {
+                    const existingRow = await db.get(`SELECT data FROM matches WHERE id = ?`, [uniqueId]);
+                    const oldMatch = JSON.parse(existingRow.data);
+                    const oldNames = {};
+                    (oldMatch.allPlayers || []).forEach(p => {
+                        if (p.puuid && p.name && p.name.trim() !== '' && p.name !== p.character) {
+                            oldNames[p.puuid] = { name: p.name, tag: p.tag };
+                        }
+                    });
+                    (match.allPlayers || []).forEach(p => {
+                        if (oldNames[p.puuid] && (!p.name || p.name.trim() === '' || p.name === p.character)) {
+                            p.name = oldNames[p.puuid].name;
+                            p.tag = oldNames[p.puuid].tag;
+                        }
+                    });
+                }
 
                 const result = await db.run(
                     `INSERT OR REPLACE INTO matches (id, player_id, date, data) VALUES (?, ?, ?, ?)`,

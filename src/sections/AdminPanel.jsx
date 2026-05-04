@@ -23,7 +23,7 @@ export const AdminPanel = () => {
     // NOUVELLE CONFIGURATION AVEC LE BOT DISCORD
     const [config, setConfig] = useState({ discord_bot_token: '', discord_channel_id: '', app_url: '', challenge_start_date: '' });
 
-    const [newPlayer, setNewPlayer] = useState({ name: '', tag: '', region: 'eu', color: '#ff4655' });
+    const [newPlayer, setNewPlayer] = useState({ name: '', tag: '', region: 'eu', color: '#ff4655', discord_id: '' });
     const [newKey, setNewKey] = useState('');
 
     // Etats Tournois
@@ -122,7 +122,7 @@ export const AdminPanel = () => {
             });
             if (res.ok) {
                 showMsg("Joueur ajouté");
-                setNewPlayer({ name: '', tag: '', region: 'eu', color: '#ff4655' });
+                setNewPlayer({ name: '', tag: '', region: 'eu', color: '#ff4655', discord_id: '' });
                 fetchData();
             }
         } catch (err) {
@@ -143,7 +143,7 @@ export const AdminPanel = () => {
     // --- FONCTIONS ÉDITION JOUEUR ---
     const startEditPlayer = (p) => {
         setEditingPlayerId(p.id);
-        setEditPlayerForm({ name: p.name, tag: p.tag, color: p.color });
+        setEditPlayerForm({ name: p.name, tag: p.tag, color: p.color, discord_id: p.discord_id || '' });
     };
 
     const saveEditPlayer = async (id) => {
@@ -426,7 +426,7 @@ export const AdminPanel = () => {
                         </div>
                         <div className="bg-[#1c252e] p-6 rounded-xl border border-white/5">
                             <h3 className="font-bold text-white mb-4 flex items-center gap-2"><Plus size={18} /> Ajouter un joueur</h3>
-                            <form onSubmit={addPlayer} className="grid grid-cols-1 md:grid-cols-5 gap-4 items-end">
+                            <form onSubmit={addPlayer} className="grid grid-cols-1 md:grid-cols-6 gap-4 items-end">
                                 <div className="col-span-2">
                                     <label className="text-[10px] text-gray-500 uppercase font-bold block mb-1">Pseudo Valorant</label>
                                     <input type="text" placeholder="Ex: Tenz" value={newPlayer.name} onChange={e => setNewPlayer({ ...newPlayer, name: e.target.value })} className="w-full bg-[#0f1923] text-white p-2 rounded border border-white/10 outline-none" required />
@@ -442,6 +442,10 @@ export const AdminPanel = () => {
                                         <input type="text" value={newPlayer.color} onChange={e => setNewPlayer({ ...newPlayer, color: e.target.value })} className="w-full bg-[#0f1923] text-white p-2 rounded border border-white/10 outline-none text-xs font-mono uppercase" />
                                     </div>
                                 </div>
+                                <div>
+                                    <label className="text-[10px] text-gray-500 uppercase font-bold block mb-1">Discord ID (Opt.)</label>
+                                    <input type="text" placeholder="12345..." value={newPlayer.discord_id} onChange={e => setNewPlayer({ ...newPlayer, discord_id: e.target.value })} className="w-full bg-[#0f1923] text-white p-2 rounded border border-white/10 outline-none text-xs" />
+                                </div>
                                 <button type="submit" className="bg-[#ff4655] hover:bg-[#d93442] text-white font-bold h-10 rounded transition-colors">Ajouter</button>
                             </form>
                         </div>
@@ -452,16 +456,17 @@ export const AdminPanel = () => {
                                     {editingPlayerId === p.id ? (
                                         <div className="flex-grow flex items-center gap-2 mr-4">
                                             <input type="color" value={editPlayerForm.color} onChange={e => setEditPlayerForm({ ...editPlayerForm, color: e.target.value })} className="h-8 w-8 p-0 bg-transparent border border-white/10 rounded cursor-pointer shrink-0" />
-                                            <input type="text" value={editPlayerForm.name} onChange={e => setEditPlayerForm({ ...editPlayerForm, name: e.target.value })} className="bg-[#0f1923] text-white px-2 py-1.5 rounded border border-white/10 text-sm font-bold w-full outline-none focus:border-blue-500" />
+                                            <input type="text" value={editPlayerForm.name} onChange={e => setEditPlayerForm({ ...editPlayerForm, name: e.target.value })} className="bg-[#0f1923] text-white px-2 py-1.5 rounded border border-white/10 text-sm font-bold w-full max-w-[120px] outline-none focus:border-blue-500" />
                                             <span className="text-gray-500 font-bold">#</span>
                                             <input type="text" value={editPlayerForm.tag} onChange={e => setEditPlayerForm({ ...editPlayerForm, tag: e.target.value })} className="bg-[#0f1923] text-white px-2 py-1.5 rounded border border-white/10 text-sm font-bold w-24 outline-none focus:border-blue-500" />
+                                            <input type="text" placeholder="Discord ID" value={editPlayerForm.discord_id} onChange={e => setEditPlayerForm({ ...editPlayerForm, discord_id: e.target.value })} className="bg-[#0f1923] text-white px-2 py-1.5 rounded border border-white/10 text-sm font-bold w-28 outline-none focus:border-blue-500" title="ID Utilisateur Discord" />
                                         </div>
                                     ) : (
                                         <div className="flex items-center gap-3">
                                             <div className="w-4 h-4 rounded-full" style={{ backgroundColor: p.color }}></div>
                                             <div>
                                                 <div className="font-bold text-white leading-none">{p.name} <span className="text-gray-500 text-xs">#{p.tag}</span></div>
-                                                <div className="text-[10px] text-gray-500 font-mono mt-1">ID: {p.id}</div>
+                                                <div className="text-[10px] text-gray-500 font-mono mt-1">ID: {p.id} {p.discord_id ? `| 🔗 Discord: ${p.discord_id}` : ''}</div>
                                             </div>
                                         </div>
                                     )}
