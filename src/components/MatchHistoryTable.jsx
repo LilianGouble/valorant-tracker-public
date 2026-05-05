@@ -51,6 +51,8 @@ export const MatchHistoryTable = ({ matches, onSelectMatch, mode = 'full', playe
 
                     let isMatchMVP = match.isMatchMVP;
                     let isTeamMVP = match.isTeamMVP;
+                    const isMatchMVP = match.isMatchMVP;
+                    const isTeamMVP = match.isTeamMVP;
 
                     if (isMatchMVP === undefined && match.allPlayers && match.score > 0) {
                         const allScores = match.allPlayers.map(p => p.stats?.score || 0);

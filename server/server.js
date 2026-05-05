@@ -278,52 +278,50 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
         }
     });
 
-    const formatLine = (p) => {
+    const shortRank = (rankStr) => {
+        if (!rankStr) return '';
+        const r = rankStr.toUpperCase();
+        if (r.includes('IRON'))       return 'I'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('BRONZE'))     return 'B'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('SILVER'))     return 'S'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('GOLD'))       return 'G'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('PLATINUM'))   return 'P'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('DIAMOND'))    return 'D'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('ASCENDANT'))  return 'A'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('IMMORTAL'))   return 'Im' + r.replace(/[^0-9]/g, '');
+        if (r.includes('RADIANT'))    return 'R';
+        if (r.includes('UNRATED'))    return 'NR';
+        return '';
+    };
+
+    const MEDALS = ['🥇', '🥈', '🥉', '4.', '5.'];
+    const formatLine = (p, idx) => {
         const cfg     = findCfgByPuuid(allConfigPlayers, p.puuid);
         const tracked = cfg ? playersInMatch.find(t => t.playerId === cfg.id) : null;
         const isMvp   = p.puuid === matchMvpId;
         const inParty = !cfg && p.party_id && trackedPartyIds.has(p.party_id);
         const name    = p.name?.trim() || p.character || '—';
-        const prefix  = cfg ? '❖ ' : (inParty ? '| ' : '  ');
-        const agent   = (p.character || '?').substring(0, 7).padEnd(8);
-        
-        let cleanName = prefix + name;
-        if (cleanName.length > 10) cleanName = cleanName.substring(0, 9) + '.';
-        const nameStr = cleanName.padEnd(11);
-        
-        // Raccourci du Rang (ex: "Diamond 3" -> "D3")
-        const rankStr = p.currenttier_patched || '—';
-        let shortRank = '—';
-        if (rankStr !== '—') {
-            const r = rankStr.toUpperCase();
-            if (r.includes('IRON')) shortRank = 'I' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('BRONZE')) shortRank = 'B' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('SILVER')) shortRank = 'S' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('GOLD')) shortRank = 'G' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('PLATINUM')) shortRank = 'P' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('DIAMOND')) shortRank = 'D' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('ASCENDANT')) shortRank = 'A' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('IMMORTAL')) shortRank = 'Im' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('RADIANT')) shortRank = 'R';
-            else if (r.includes('UNRATED')) shortRank = 'U';
-        }
-        const rankCol = shortRank.padEnd(3);
-        
-        const k       = String(p.stats?.kills   || 0).padStart(2);
-        const d       = String(p.stats?.deaths  || 0).padStart(2);
-        const a       = String(p.stats?.assists || 0).padStart(2);
-        const kda     = `${k}/${d}/${a}`.padEnd(8);
-        const acs     = String(Math.round((p.stats?.score || 0) / rounds)).padStart(3);
-        let rr = '    ';
+
+        const pos     = MEDALS[idx] ?? `${idx + 1}.`;
+        const nameStr = cfg ? `**${name}**` : (inParty ? `*${name}*` : name);
+        const agent   = p.character || '?';
+        const k = p.stats?.kills   || 0;
+        const d = p.stats?.deaths  || 0;
+        const a = p.stats?.assists || 0;
+        const acs = Math.round((p.stats?.score || 0) / rounds);
+        const rank = shortRank(p.currenttier_patched);
+
+        const parts = [`${pos} ${nameStr}`, agent, `\`${k}/${d}/${a}\``, `${acs} ACS`];
         if (tracked?.rrChange !== undefined) {
             const sign = tracked.rrChange > 0 ? '+' : '';
-            rr = `${sign}${tracked.rrChange}`.padEnd(4);
+            parts.push(`**${sign}${tracked.rrChange} RR**`);
         }
-        return `${rankCol}${nameStr}${agent}${kda} ${acs} ${rr}${isMvp ? ' 👑' : ''}`;
+        if (rank) parts.push(rank);
+        if (isMvp) parts.push('👑');
+        return parts.join(' · ');
     };
 
-    const tableHeader = `${'Rk'.padEnd(3)}${'Joueur'.padEnd(11)}${'Agent'.padEnd(8)}${'K/D/A'.padEnd(8)} ACS   RR\n` + '─'.repeat(39);
-    const formatTeam  = (team) => team.map(formatLine).join('\n');
+    const formatTeam = (team) => team.map((p, i) => formatLine(p, i)).join('\n');
 
     const resultEmoji = isWin ? '🏆' : (baseMatch.result === 'LOSS' ? '💔' : '🤝');
     const resultText  = isWin ? 'VICTOIRE' : (baseMatch.result === 'LOSS' ? 'DÉFAITE' : 'ÉGALITÉ');
@@ -333,7 +331,7 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
         .setTitle(`${resultEmoji} ${resultText} — ${(baseMatch.map || '?').toUpperCase()}`)
         .setURL(appUrl)
         .setColor(color)
-        .setFooter({ text: 'KSL Tracker  •  ❖ = escouade KSL  •  | = avec l\'escouade' })
+        .setFooter({ text: 'KSL Tracker  •  gras = tracké KSL  •  italique = avec l\'escouade  •  👑 = MVP' })
         .setTimestamp(baseMatch.timestamp ? baseMatch.timestamp * 1000 : new Date(baseMatch.date).getTime());
         
     const mapName = (baseMatch.map || '').toLowerCase();
@@ -356,14 +354,14 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
 
     if (view === 'global') {
         let desc = `${mentionsPrefix}**Score : ${baseMatch.matchScore}** · Classé · ${rounds} rounds\n\n`;
-        desc += `${blueLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(blueTeam)}\n\`\`\`\n`;
-        desc += `${redLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(redTeam)}\n\`\`\``;
+        desc += `${blueLabel}\n${formatTeam(blueTeam)}\n\n`;
+        desc += `${redLabel}\n${formatTeam(redTeam)}`;
         if (desc.length > 4096) desc = desc.substring(0, 4090) + '\n...';
         embed.setDescription(desc);
     } else if (view === 'blue') {
-        embed.setDescription(`${mentionsPrefix}${blueLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(blueTeam)}\n\`\`\``);
+        embed.setDescription(`${mentionsPrefix}${blueLabel}\n${formatTeam(blueTeam)}`);
     } else if (view === 'red') {
-        embed.setDescription(`${mentionsPrefix}${redLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(redTeam)}\n\`\`\``);
+        embed.setDescription(`${mentionsPrefix}${redLabel}\n${formatTeam(redTeam)}`);
     }
 
     const row = new ActionRowBuilder().addComponents(
@@ -536,12 +534,10 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
         let gamesLog = "";
         uniqueGamesList.forEach(g => {
             const icon = g.result === 'WIN' ? "🟢" : (g.result === 'DRAW' ? "⚪" : "🔴");
-            const scoreText = g.score ? `**${g.score}**` : "";
-            gamesLog += `${icon} **${g.map.toUpperCase()}** - ${scoreText}\n`;
+            const scoreText = g.score ? ` **${g.score}**` : "";
+            gamesLog += `${icon} **${(g.map || '?').toUpperCase()}**${scoreText}\n`;
             g.players.sort((a, b) => parseInt(b.rr) - parseInt(a.rr));
 
-            // Pour chaque tracké, retrouve ses coéquipiers non-trackés du même groupe
-            // afin d'afficher la composition complète du duo/trio.
             const trackedPuuids = new Set();
             (g.allPlayersRaw || []).forEach(ap => {
                 if (findCfgByPuuid(allConfigPlayers, ap.puuid)) trackedPuuids.add(ap.puuid);
@@ -549,26 +545,25 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
             const partiesShown = new Set();
 
             g.players.forEach(p => {
-                gamesLog += `> \`${p.agent.padEnd(9)}\` **${p.name}** : **${p.rr} RR** | ${p.kd} K/D | ${p.acs} ACS | ${p.hs}% HS\n`;
+                const rrNum = parseInt(p.rr) || 0;
+                const rrStr = rrNum > 0 ? `**+${rrNum} RR**` : (rrNum < 0 ? `**${rrNum} RR**` : `${rrNum} RR`);
+                gamesLog += `> **${p.name}** · ${p.agent} — ${rrStr} · \`${p.kd}\` K/D · ${p.acs} ACS · ${p.hs}% HS\n`;
 
-                // Coéquipiers non-trackés du même party_id (1 seule fois par groupe)
                 if (p.partyId && !partiesShown.has(p.partyId)) {
                     partiesShown.add(p.partyId);
                     const mates = (g.allPlayersRaw || []).filter(ap =>
-                        ap.party_id === p.partyId
-                        && !trackedPuuids.has(ap.puuid)
+                        ap.party_id === p.partyId && !trackedPuuids.has(ap.puuid)
                     );
                     mates.forEach(mate => {
                         const mateName = mate.name?.trim() || mate.character || 'Inconnu';
-                        const mateAgent = (mate.character || '?').padEnd(9);
-                        gamesLog += `> ┗ \`${mateAgent}\` *${mateName}* (groupe, non tracké)\n`;
+                        gamesLog += `> ↳ *${mateName}* (${mate.character || '?'}) — groupe\n`;
                     });
                 }
             });
             gamesLog += "\n";
         });
         if (gamesLog.length > 3900) gamesLog = gamesLog.substring(0, 3900) + "\n... *[Journal tronqué]*";
-        embed.setDescription(`**📝 Journal détaillé des Matchs**\n\n${gamesLog}`);
+        embed.setDescription(`**📝 Journal des Matchs**\n\n${gamesLog}`);
     }
 
     const row = new ActionRowBuilder().addComponents(
