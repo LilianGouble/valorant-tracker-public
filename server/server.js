@@ -1081,111 +1081,99 @@ app.delete('/api/admin/tournaments/:id', authenticateToken, async (req, res) => 
 });
 
 // ==========================================
-// BACKFILL RETROACTIF DES NOMS (kill events)
+// BACKFILL DES NOMS (correspondance PUUID -> pseudo)
+// Utilisé automatiquement après chaque sync pour résoudre les pseudos
+// que /v3/matches ne renvoie plus. Une route admin permet aussi le
+// rattrapage massif sur tout l'historique.
 // ==========================================
+
+const isMissingPseudo = (p) => !p.name?.trim() || p.name === p.character;
+
+const backfillNamesForMatches = async (matchIds, apiKeys) => {
+    const result = { fetched: 0, updated: 0, skipped: 0, errors: [] };
+    if (!apiKeys?.length || !matchIds?.length) return result;
+
+    for (const matchId of matchIds) {
+        const rows = await db.all("SELECT id, data FROM matches WHERE id LIKE ?", [`${matchId}_%`]);
+        if (!rows.length) { result.skipped++; continue; }
+
+        const group = rows.map(r => {
+            try { return { rowId: r.id, data: JSON.parse(r.data) }; }
+            catch { return null; }
+        }).filter(Boolean);
+
+        const needs = group.some(r => (r.data.allPlayers || []).some(isMissingPseudo));
+        if (!needs) { result.skipped++; continue; }
+
+        try {
+            const resp = await fetchWithRetry(`${API_BASE}/v2/match/${matchId}`, apiKeys, {}, 3);
+            if (!resp.ok) {
+                result.errors.push(`${matchId}: HTTP ${resp.status}`);
+                continue;
+            }
+            const json = await resp.json();
+            const m = json?.data;
+            if (!m) continue;
+            result.fetched++;
+
+            // Construit la table de correspondance PUUID -> "name#tag"
+            const nameMap = {};
+            (m.players?.all_players || []).forEach(p => {
+                if (p.puuid && p.name && p.name.trim() !== '') {
+                    nameMap[p.puuid] = `${p.name}#${p.tag}`;
+                }
+            });
+            (m.kills || m.kill_events || []).forEach(k => {
+                if (k.killer_puuid && k.killer_display_name && !nameMap[k.killer_puuid]) nameMap[k.killer_puuid] = k.killer_display_name;
+                if (k.victim_puuid && k.victim_display_name && !nameMap[k.victim_puuid]) nameMap[k.victim_puuid] = k.victim_display_name;
+            });
+
+            for (const row of group) {
+                let changed = false;
+                const updatedPlayers = (row.data.allPlayers || []).map(p => {
+                    if (isMissingPseudo(p) && p.puuid && nameMap[p.puuid]) {
+                        const parts = nameMap[p.puuid].split('#');
+                        changed = true;
+                        return { ...p, name: parts[0] || p.name, tag: parts[1] || p.tag };
+                    }
+                    return p;
+                });
+                if (changed) {
+                    row.data.allPlayers = updatedPlayers;
+                    await db.run("UPDATE matches SET data = ? WHERE id = ?", [JSON.stringify(row.data), row.rowId]);
+                    result.updated++;
+                }
+            }
+
+            await delay(250);
+        } catch (e) {
+            result.errors.push(`${matchId}: ${e.message}`);
+        }
+    }
+
+    return result;
+};
 
 app.post('/api/admin/backfill-names', authenticateToken, async (req, res) => {
     try {
         const apiKeys = await getApiKeys();
         if (apiKeys.length === 0) return res.status(500).json({ error: 'Aucune clé API configurée.' });
 
-        // Charge tous les enregistrements de matchs
         const allRows = await db.all("SELECT id, data FROM matches");
-
-        // Groupe les rows par vrai match ID (le champ id stocké est matchId_playerId)
-        const byMatchId = {};
+        const matchIds = new Set();
         for (const row of allRows) {
             try {
                 const data = JSON.parse(row.data);
-                const realId = data.id; // vrai identifiant Riot du match
-                if (!realId) continue;
-                if (!byMatchId[realId]) byMatchId[realId] = [];
-                byMatchId[realId].push({ rowId: row.id, data });
+                if (data.id && (data.allPlayers || []).some(isMissingPseudo)) {
+                    matchIds.add(data.id);
+                }
             } catch (e) { void e; }
         }
 
-        const uniqueIds = Object.keys(byMatchId);
-        let fetched = 0, updated = 0, skipped = 0;
-        const errors = [];
-
-        for (const matchId of uniqueIds) {
-            const group = byMatchId[matchId];
-
-            // On saute si tous les joueurs ont déjà un nom
-            const needsBackfill = group.some(r =>
-                (r.data.allPlayers || []).some(p => !p.name?.trim())
-            );
-            if (!needsBackfill) { skipped++; continue; }
-
-            console.log(`[DEBUG] Backfill du match : ${matchId}`);
-            try {
-                // L'API HenrikDev requiert /v2/match/{matchId} pour interroger un match spécifique
-                const url = `${API_BASE}/v2/match/${matchId}`;
-                const resp = await fetchWithRetry(url, apiKeys, {}, 3);
-                if (!resp.ok) { 
-                    console.log(`[DEBUG] ❌ Erreur HTTP ${resp.status} pour le match ${matchId}`);
-                    errors.push(`${matchId}: HTTP ${resp.status}`); 
-                    continue; 
-                }
-                const json = await resp.json();
-                const m = json.data;
-                if (!m) {
-                    console.log(`[DEBUG] ⚠️ Pas de donnees valides reçues pour le match ${matchId}`);
-                    continue;
-                }
-                fetched++;
-
-                const nameMap = {};
-                
-                // 1. On cherche d'abord directement dans la liste des joueurs du match
-                if (m.players && Array.isArray(m.players.all_players)) {
-                    m.players.all_players.forEach(p => {
-                        if (p.puuid && p.name && p.name.trim() !== '') {
-                            nameMap[p.puuid] = `${p.name}#${p.tag}`;
-                        }
-                    });
-                }
-
-                // 2. Fallback sur les kill events au cas où
-                const kills = m.kills || m.kill_events || [];
-                kills.forEach(k => {
-                    if (k.killer_puuid && k.killer_display_name && !nameMap[k.killer_puuid]) nameMap[k.killer_puuid] = k.killer_display_name;
-                    if (k.victim_puuid && k.victim_display_name && !nameMap[k.victim_puuid]) nameMap[k.victim_puuid] = k.victim_display_name;
-                });
-                
-                // Met à jour chaque enregistrement DB pour ce match
-                for (const row of group) {
-                    let changed = false;
-                    const updatedPlayers = (row.data.allPlayers || []).map(p => {
-                        if (!p.name?.trim()) {
-                            changed = true;
-                            if (p.puuid && nameMap[p.puuid]) {
-                                const parts = nameMap[p.puuid].split('#');
-                                return { ...p, name: parts[0] || p.name, tag: parts[1] || p.tag };
-                            } else {
-                                // ⚡ FIX : Si Riot censure vraiment le nom (ex: Deathmatch anonyme)
-                                // On utilise le nom de l'agent pour valider le joueur.
-                                return { ...p, name: p.character || 'Inconnu', tag: '' };
-                            }
-                        }
-                        return p;
-                    });
-                    if (changed) {
-                        row.data.allPlayers = updatedPlayers;
-                        await db.run("UPDATE matches SET data = ? WHERE id = ?",
-                            [JSON.stringify(row.data), row.rowId]);
-                        updated++;
-                    }
-                }
-
-                await new Promise(r => setTimeout(r, 250)); // respect rate limit
-            } catch (e) {
-                errors.push(`${matchId}: ${e.message}`);
-            }
-        }
-
-        console.log(`✅ Backfill noms : ${fetched} matchs re-fetchés, ${updated} enregistrements mis à jour, ${skipped} ignorés.`);
-        res.json({ fetched, updated, skipped, total: uniqueIds.length, errors: errors.slice(0, 20) });
+        const ids = [...matchIds];
+        const result = await backfillNamesForMatches(ids, apiKeys);
+        console.log(`✅ Backfill admin : ${result.fetched} matchs re-fetchés, ${result.updated} enregistrements mis à jour, ${result.skipped} ignorés.`);
+        res.json({ ...result, total: ids.length, errors: result.errors.slice(0, 20) });
     } catch (e) {
         console.error('❌ Backfill error:', e.message);
         res.status(500).json({ error: e.message });
@@ -1838,6 +1826,30 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
         }
         
         console.log(`\n✅ Fin du scan complet. ${totalAdded} matchs traités/sauvegardés.`);
+
+        // Backfill automatique des pseudos manquants sur les matchs touchés par ce scan.
+        // /v3/matches renvoie souvent des name/tag vides — on rattrape via /v2/match/{id}.
+        const idsToBackfill = new Set();
+        for (const m of allNewMatches) {
+            if ((m.allPlayers || []).some(isMissingPseudo)) idsToBackfill.add(m.id);
+        }
+        if (idsToBackfill.size > 0) {
+            console.log(`🔧 Backfill auto sur ${idsToBackfill.size} match(s) avec pseudos manquants...`);
+            const r = await backfillNamesForMatches([...idsToBackfill], apiKeys);
+            console.log(`   -> ${r.fetched} re-fetchés, ${r.updated} mis à jour, ${r.skipped} ignorés.`);
+
+            // Recharge les matchs ranked qui viennent d'être backfillés pour que
+            // les notifications Discord utilisent les pseudos corrects.
+            for (let i = 0; i < newlyAddedRankedMatches.length; i++) {
+                const m = newlyAddedRankedMatches[i];
+                if (idsToBackfill.has(m.id)) {
+                    const fresh = await db.get("SELECT data FROM matches WHERE id = ?", [`${m.id}_${m.playerId}`]);
+                    if (fresh) {
+                        try { newlyAddedRankedMatches[i] = JSON.parse(fresh.data); } catch (e) { void e; }
+                    }
+                }
+            }
+        }
 
         if (newlyAddedRankedMatches.length > 0) {
             console.log(`📢 ${newlyAddedRankedMatches.length} nouveau(x) match(s) classé(s) détecté(s).`);

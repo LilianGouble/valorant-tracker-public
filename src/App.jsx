@@ -318,7 +318,7 @@ function MainApp() {
         </div>
       )}
 
-      <div className="flex-grow min-w-0 h-[100dvh] overflow-y-auto overflow-x-hidden relative z-0 custom-scrollbar">
+      <div className="flex-grow min-w-0 h-[100dvh] overflow-y-auto overflow-x-hidden relative custom-scrollbar">
         <div className={`p-4 sm:p-6 md:p-8 xl:p-10 w-full max-w-[1600px] mx-auto pb-24 transition-all duration-300 ${isMobile ? 'pt-20' : 'pt-6 xl:pt-10'}`}>
           {selectedMatch && <MatchDetailModal match={selectedMatch} playersConfig={playersConfig} onClose={() => setSelectedMatch(null)} />}
 

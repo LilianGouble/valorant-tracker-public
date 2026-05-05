@@ -191,41 +191,41 @@ const PlayerRow = ({ player, match, isGlobalView = false, playersConfig, tracked
     const acs = Math.round(player.stats.score / rounds);
 
     return (
-        <div className={`grid grid-cols-12 gap-2 items-center px-3 py-2 rounded mb-1 transition-colors ${teamColorBg} min-w-[500px]`}>
-            <div className="col-span-5 flex items-center gap-2">
+        <div className={`grid grid-cols-12 gap-1 sm:gap-2 items-center px-2 sm:px-3 py-2 rounded mb-1 transition-colors ${teamColorBg}`}>
+            <div className="col-span-5 flex items-center gap-1 sm:gap-2 min-w-0">
                 <div className="relative shrink-0">
                     {player.assets?.agent?.small ? (
-                        <img src={player.assets.agent.small} className="w-8 h-8 rounded-md bg-black object-cover shadow-sm" alt={player.character} />
+                        <img src={player.assets.agent.small} className="w-7 h-7 sm:w-8 sm:h-8 rounded-md bg-black object-cover shadow-sm" alt={player.character} />
                     ) : (
-                        <div className="w-8 h-8 rounded-md bg-gray-700"></div>
+                        <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-md bg-gray-700"></div>
                     )}
                 </div>
-                <div className="w-7 h-7 shrink-0 flex items-center justify-center bg-black/30 rounded-md border border-white/5">
-                    <img src={getRankIcon(player.currenttier_patched)} alt="Rank" className="w-6 h-6 object-contain drop-shadow-md" title={player.currenttier_patched} />
+                <div className="w-6 h-6 sm:w-7 sm:h-7 shrink-0 hidden sm:flex items-center justify-center bg-black/30 rounded-md border border-white/5">
+                    <img src={getRankIcon(player.currenttier_patched)} alt="Rank" className="w-5 h-5 sm:w-6 sm:h-6 object-contain drop-shadow-md" title={player.currenttier_patched} />
                 </div>
-                <div className="flex flex-col min-w-0 ml-1">
-                    <span className={`text-xs font-bold truncate ${nameColor} flex items-center gap-1`}>
+                <div className="flex flex-col min-w-0">
+                    <span className={`text-[10px] sm:text-xs font-bold truncate ${nameColor} flex items-center gap-1`}>
                         {player.name || player.character || '—'}
                         {inTrackedParty && (
-                            <span className="text-[8px] font-black uppercase bg-purple-500/20 text-purple-300 border border-purple-400/40 rounded px-1 py-px tracking-wider" title="Membre du groupe d'un joueur tracké">groupe</span>
+                            <span className="text-[7px] sm:text-[8px] font-black uppercase bg-purple-500/20 text-purple-300 border border-purple-400/40 rounded px-1 py-px tracking-wider" title="Membre du groupe d'un joueur tracké">groupe</span>
                         )}
                     </span>
-                    {player.tag ? <span className="text-[9px] text-gray-500 font-mono truncate">#{player.tag}</span> : null}
+                    {player.tag ? <span className="text-[8px] sm:text-[9px] text-gray-500 font-mono truncate">#{player.tag}</span> : null}
                 </div>
             </div>
-            <div className="col-span-3 flex justify-center items-center font-mono text-xs">
+            <div className="col-span-3 flex justify-center items-center font-mono text-[10px] sm:text-xs">
                 <span className="text-white font-bold">{player.stats.kills}</span>
-                <span className="text-gray-600 mx-1">/</span>
+                <span className="text-gray-600 mx-0.5 sm:mx-1">/</span>
                 <span className="text-red-400 font-bold">{player.stats.deaths}</span>
-                <span className="text-gray-600 mx-1">/</span>
+                <span className="text-gray-600 mx-0.5 sm:mx-1">/</span>
                 <span className="text-gray-500">{player.stats.assists}</span>
             </div>
-            <div className="col-span-2 flex justify-center items-center font-mono text-[10px]">
+            <div className="col-span-2 flex justify-center items-center font-mono text-[9px] sm:text-[10px]">
                 <span className="text-emerald-400 font-bold" title="First Kills">{player.stats.first_kills || 0}</span>
-                <span className="text-gray-600 mx-1">/</span>
+                <span className="text-gray-600 mx-0.5">/</span>
                 <span className="text-red-400 font-bold" title="First Deaths">{player.stats.first_deaths || 0}</span>
             </div>
-            <div className="col-span-2 text-center font-black text-white text-xs">{acs}</div>
+            <div className="col-span-2 text-center font-black text-white text-[10px] sm:text-xs">{acs}</div>
         </div>
     );
 };
@@ -499,15 +499,15 @@ export const MatchDetailModal = ({ match, onClose, playersConfig }) => {
                             </div>
                         )}
 
-                        <div className="overflow-x-auto custom-scrollbar pb-4">
+                        <div className="pb-4">
                             {scoreboardView === 'split' && !isDM ? (
-                                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 min-w-[500px]">
+                                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                                     <div>
                                         <div className="flex items-center justify-between mb-3 pb-2 border-b-2 border-cyan-500/50">
                                             <h4 className="text-cyan-400 font-black uppercase text-sm">ÉQUIPE BLEUE</h4>
                                             <span className="text-white font-mono font-bold">{match.teamInfo?.blue?.rounds_won || 0}</span>
                                         </div>
-                                        <div className="grid grid-cols-12 gap-2 px-3 py-1 text-[9px] font-bold uppercase text-gray-600 mb-2">
+                                        <div className="grid grid-cols-12 gap-1 sm:gap-2 px-2 sm:px-3 py-1 text-[9px] font-bold uppercase text-gray-600 mb-2">
                                             <div className="col-span-5">Joueur</div>
                                             <div className="col-span-3 text-center">K/D/A</div>
                                             <div className="col-span-2 text-center" title="First Kills / First Deaths">FK/FD</div>
@@ -520,7 +520,7 @@ export const MatchDetailModal = ({ match, onClose, playersConfig }) => {
                                             <h4 className="text-red-400 font-black uppercase text-sm">ÉQUIPE ROUGE</h4>
                                             <span className="text-white font-mono font-bold">{match.teamInfo?.red?.rounds_won || 0}</span>
                                         </div>
-                                        <div className="grid grid-cols-12 gap-2 px-3 py-1 text-[9px] font-bold uppercase text-gray-600 mb-2">
+                                        <div className="grid grid-cols-12 gap-1 sm:gap-2 px-2 sm:px-3 py-1 text-[9px] font-bold uppercase text-gray-600 mb-2">
                                             <div className="col-span-5">Joueur</div>
                                             <div className="col-span-3 text-center">K/D/A</div>
                                             <div className="col-span-2 text-center" title="First Kills / First Deaths">FK/FD</div>
@@ -530,8 +530,8 @@ export const MatchDetailModal = ({ match, onClose, playersConfig }) => {
                                     </div>
                                 </div>
                             ) : (
-                                <div className="max-w-3xl mx-auto min-w-[500px]">
-                                    <div className="grid grid-cols-12 gap-2 px-3 py-2 text-[10px] font-black uppercase text-gray-500 border-b border-white/10 mb-2">
+                                <div className="max-w-3xl mx-auto">
+                                    <div className="grid grid-cols-12 gap-1 sm:gap-2 px-2 sm:px-3 py-2 text-[10px] font-black uppercase text-gray-500 border-b border-white/10 mb-2">
                                         <div className="col-span-5">Joueur (Global)</div>
                                         <div className="col-span-3 text-center">K/D/A</div>
                                         <div className="col-span-2 text-center" title="First Kills / First Deaths">FK/FD</div>
