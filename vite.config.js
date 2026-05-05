@@ -37,4 +37,19 @@ export default defineConfig({
       }
     })
   ],
+  build: {
+    // Vendor chunks séparés : meilleurs cache hits (libs changent rarement),
+    // téléchargement parallèle, et le bundle initial reste petit.
+    chunkSizeWarningLimit: 1000,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'vendor-react': ['react', 'react-dom', 'react-router-dom'],
+          'vendor-charts': ['recharts'],
+          'vendor-motion': ['framer-motion'],
+          'vendor-icons': ['lucide-react'],
+        }
+      }
+    }
+  }
 });

@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
+import compression from 'compression';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import cron from 'node-cron';
@@ -22,6 +23,8 @@ const DB_FILE = path.join(__dirname, 'database.sqlite');
 const API_BASE = "https://api.henrikdev.xyz/valorant";
 
 app.use(cors());
+// gzip pour toutes les réponses > 1KB ; gain énorme sur /history (JSON volumineux)
+app.use(compression({ level: 6, threshold: 1024 }));
 app.use(bodyParser.json({ limit: '10mb' }));
 
 let db;
@@ -38,8 +41,20 @@ const discordClient = new Client({
 // --- INITIALISATION DE LA BASE DE DONNÉES ---
 (async () => {
     db = await open({ filename: DB_FILE, driver: sqlite3.Database });
-    
-    await db.exec('PRAGMA journal_mode = WAL;');
+
+    // Tuning SQLite pour serveur à faible RAM (447 MB).
+    // - WAL : lectures concurrentes pendant les écritures
+    // - synchronous=NORMAL : safe avec WAL, plus rapide que FULL
+    // - cache_size négatif = KB (4 MB)
+    // - mmap_size 64 MB : couvre la DB (~47 MB), réduit drastiquement les I/O disque
+    // - temp_store=MEMORY : tables temporaires en RAM (très petites)
+    await db.exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA cache_size = -4000;
+        PRAGMA mmap_size = 67108864;
+        PRAGMA temp_store = MEMORY;
+    `);
     
     await db.exec(`
         CREATE TABLE IF NOT EXISTS matches (
@@ -148,6 +163,15 @@ const getConfig = async (key, defaultVal = '') => {
 };
 const getPlayers = async () => await db.all("SELECT * FROM players");
 const getApiKeys = async () => (await db.all("SELECT key FROM api_keys")).map(r => r.key);
+
+// Caches en mémoire (faible empreinte) pour éviter de retaper la DB
+// sur chaque requête publique. Invalidés par les writes admin et par les syncs.
+const PUBLIC_CONFIG_TTL_MS = 30 * 1000;
+let publicConfigCache = { data: null, expiry: 0 };
+let lastDataChange = Date.now();
+
+const invalidatePublicConfigCache = () => { publicConfigCache.expiry = 0; };
+const markDataChanged = () => { lastDataChange = Math.floor(Date.now() / 1000) * 1000; };
 
 const authenticateToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
@@ -902,10 +926,16 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
 
 app.get('/api/public/config', async (req, res) => {
     try {
+        const now = Date.now();
+        if (publicConfigCache.data && publicConfigCache.expiry > now) {
+            return res.json(publicConfigCache.data);
+        }
         const players = await getPlayers();
         const appUrl = await getConfig('app_url', 'http://localhost:5173');
         const challengeStartDate = await getConfig('challenge_start_date', '2024-01-01T00:00');
-        res.json({ players, appUrl, challengeStartDate });
+        const payload = { players, appUrl, challengeStartDate };
+        publicConfigCache = { data: payload, expiry: now + PUBLIC_CONFIG_TTL_MS };
+        res.json(payload);
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -925,6 +955,7 @@ app.post('/api/admin/config', authenticateToken, async (req, res) => {
     if (discord_channel_id !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'discord_channel_id'", [discord_channel_id]);
     if (app_url !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'app_url'", [app_url]);
     if (challenge_start_date !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'challenge_start_date'", [challenge_start_date]);
+    invalidatePublicConfigCache();
     res.json({ message: "Configuration sauvegardée (Redémarrez le serveur si vous avez changé le Token du Bot)" });
 });
 
@@ -938,6 +969,7 @@ app.post('/api/admin/players', authenticateToken, async (req, res) => {
     const countRow = await db.get("SELECT COUNT(*) as count FROM players");
     const id = `p${countRow.count + 1}_${Date.now()}`;
     await db.run("INSERT INTO players (id, name, tag, region, color, discord_id) VALUES (?, ?, ?, ?, ?, ?)", [id, name, tag, region, color || '#ffffff', discord_id || '']);
+    invalidatePublicConfigCache();
     res.json({ message: "Joueur ajouté", id });
 });
 
@@ -948,6 +980,7 @@ app.put('/api/admin/players/:id', authenticateToken, async (req, res) => {
             "UPDATE players SET name = ?, tag = ?, color = ?, discord_id = ? WHERE id = ?",
             [name, tag, color, discord_id || '', req.params.id]
         );
+        invalidatePublicConfigCache();
         res.json({ message: "Joueur mis à jour avec succès" });
     } catch (e) {
         res.status(500).json({ error: "Erreur lors de la mise à jour" });
@@ -956,6 +989,7 @@ app.put('/api/admin/players/:id', authenticateToken, async (req, res) => {
 
 app.delete('/api/admin/players/:id', authenticateToken, async (req, res) => {
     await db.run("DELETE FROM players WHERE id = ?", [req.params.id]);
+    invalidatePublicConfigCache();
     res.json({ message: "Joueur supprimé" });
 });
 
@@ -1172,6 +1206,7 @@ app.post('/api/admin/backfill-names', authenticateToken, async (req, res) => {
 
         const ids = [...matchIds];
         const result = await backfillNamesForMatches(ids, apiKeys);
+        if (result.updated > 0) markDataChanged();
         console.log(`✅ Backfill admin : ${result.fetched} matchs re-fetchés, ${result.updated} enregistrements mis à jour, ${result.skipped} ignorés.`);
         res.json({ ...result, total: ids.length, errors: result.errors.slice(0, 20) });
     } catch (e) {
@@ -1823,8 +1858,9 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
                 }
             }
             await db.exec('COMMIT');
+            if (totalAdded > 0) markDataChanged();
         }
-        
+
         console.log(`\n✅ Fin du scan complet. ${totalAdded} matchs traités/sauvegardés.`);
 
         // Backfill automatique des pseudos manquants sur les matchs touchés par ce scan.
@@ -1837,6 +1873,7 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
             console.log(`🔧 Backfill auto sur ${idsToBackfill.size} match(s) avec pseudos manquants...`);
             const r = await backfillNamesForMatches([...idsToBackfill], apiKeys);
             console.log(`   -> ${r.fetched} re-fetchés, ${r.updated} mis à jour, ${r.skipped} ignorés.`);
+            if (r.updated > 0) markDataChanged();
 
             // Recharge les matchs ranked qui viennent d'être backfillés pour que
             // les notifications Discord utilisent les pseudos corrects.
@@ -1909,8 +1946,21 @@ const generateDailyReport = async (isManual = false, forceDate = null) => {
 
 app.get('/history', async (req, res) => {
     try {
+        // Cache HTTP : si rien n'a bougé depuis la dernière sync,
+        // le navigateur garde sa copie locale et on renvoie 304.
+        const lastModified = new Date(lastDataChange).toUTCString();
+        res.setHeader('Last-Modified', lastModified);
+        res.setHeader('Cache-Control', 'private, max-age=10, must-revalidate');
+        const ifModSince = req.headers['if-modified-since'];
+        if (ifModSince) {
+            const ifModTime = Date.parse(ifModSince);
+            if (!isNaN(ifModTime) && ifModTime >= lastDataChange) {
+                return res.status(304).end();
+            }
+        }
+
         const { start, end, limit = 5000, offset = 0 } = req.query;
-        let query = 'SELECT id, data FROM matches'; // Ajout de 'id' pour le debug
+        let query = 'SELECT data FROM matches';
         let params = [];
         let conditions = [];
 
@@ -1926,25 +1976,21 @@ app.get('/history', async (req, res) => {
         if (conditions.length > 0) {
             query += ' WHERE ' + conditions.join(' AND ');
         }
-        
+
         query += ' ORDER BY date DESC';
-        query += ` LIMIT ${parseInt(limit)} OFFSET ${parseInt(offset)}`; 
+        query += ` LIMIT ${parseInt(limit)} OFFSET ${parseInt(offset)}`;
 
         const rows = await db.all(query, params);
-        
-        // ⚡ FIX : On gère les matchs corrompus un par un sans faire planter le serveur
-        const matches = rows.map(row => {
-            try {
-                return JSON.parse(row.data);
-            } catch (err) {
-                console.error(`❌ Erreur JSON.parse ignorée sur le match ID : ${row.id}`);
-                return null;
-            }
-        }).filter(Boolean); // On filtre/supprime les matchs null
 
-        res.json({ matches });
+        // Optim: row.data est déjà une string JSON valide. On évite le
+        // round-trip parse+stringify qui allouait ~10-20 MB pour 5000 matchs.
+        const jsonParts = [];
+        for (const r of rows) {
+            if (r.data) jsonParts.push(r.data);
+        }
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.send('{"matches":[' + jsonParts.join(',') + ']}');
     } catch (e) {
-        // ⚡ FIX : On affiche la VRAIE erreur dans la console du serveur !
         console.error("❌ ERREUR CRITIQUE SUR LA ROUTE /history :", e);
         res.status(500).json({ matches: [], error: e.message });
     }
