@@ -5,6 +5,7 @@ import { LOCAL_SERVER_URL } from '../config/constants';
 
 export const AdminPanel = () => {
     const [token, setToken] = useState(localStorage.getItem('adminToken'));
+    const [isVerifying, setIsVerifying] = useState(!!localStorage.getItem('adminToken'));
     const [needsPasswordChange, setNeedsPasswordChange] = useState(false);
     const [activeTab, setActiveTab] = useState('players');
 
@@ -83,6 +84,7 @@ export const AdminPanel = () => {
     const handleLogout = useCallback(() => {
         localStorage.removeItem('adminToken');
         setToken(null);
+        setIsVerifying(false);
     }, []);
 
     const fetchData = useCallback(async () => {
@@ -103,8 +105,10 @@ export const AdminPanel = () => {
             if (tRes.ok) {
                 setTournaments(await tRes.json());
             }
+            setIsVerifying(false);
         } catch (err) {
             console.error("Erreur Fetch Admin:", err);
+            setIsVerifying(false);
         }
     }, [token, authHeaders, handleLogout]);
 
@@ -278,6 +282,17 @@ export const AdminPanel = () => {
             showMsg("Erreur de mise à jour", "error");
         }
     };
+
+    if (token && isVerifying) {
+        return (
+            <div className="min-h-screen bg-[#0f1923] flex items-center justify-center p-4">
+                <div className="flex flex-col items-center gap-4 text-gray-400">
+                    <Shield size={48} className="text-[#ff4655] animate-pulse" />
+                    <p className="text-sm uppercase tracking-wider font-bold">Vérification de la session…</p>
+                </div>
+            </div>
+        );
+    }
 
     if (!token) {
         return (

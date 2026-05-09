@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react';
 import {
   Crosshair, Swords, Trophy, Award, Cloud, BrainCircuit, Server,
   RefreshCw, AlertTriangle, Users, BarChart2, Handshake, Menu, User,
@@ -8,29 +8,35 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Routes, Route, Navigate, useNavigate, useParams } from 'react-router-dom';
 
 import { LOCAL_SERVER_URL } from './config/constants';
-import { MatchDetailModal } from './components/UI';
 
-// Import Sections
-import { HallOfFameAndShame } from './sections/HallOfFame.jsx';
-import { VersusMode } from './sections/VersusMode.jsx';
-import { ServerWeather } from './sections/ServerWeather.jsx';
-import { RoleAnalysis } from './sections/RoleAnalysis.jsx';
-import { RushDashboard } from './sections/RushDashboard.jsx';
-import { Leaderboard } from './sections/Leaderboard.jsx';
-import { DeathmatchAnalysis } from './sections/DeathmatchAnalysis.jsx';
-import { SynergyAnalysis } from './sections/SynergyAnalysis.jsx';
-import { Arsenal } from './sections/Arsenal.jsx';
-import { AgentAnalysis } from './sections/AgentAnalysis.jsx';
-import { MapAnalysis } from './sections/MapAnalysis.jsx';
-import { Nemesis } from './sections/Nemesis.jsx';
-import { PlaystyleMatrix } from './sections/PlaystyleMatrix.jsx';
-import { EcoRating } from './sections/EcoRating.jsx';
-import { TDMChallenge } from './sections/TDMChallenge.jsx';
-import { Spellcaster } from './sections/Spellcaster.jsx';
-import { AdminPanel } from './sections/AdminPanel.jsx';
-import { SkirmishAnalysis } from './sections/SkirmishAnalysis.jsx';
-import { Tournaments } from './sections/Tournaments.jsx';
-import { SeasonWrapUp } from './sections/SeasonWrapUp.jsx';
+// Code splitting : chaque section est dans son propre chunk JS,
+// téléchargé seulement quand l'utilisateur ouvre l'onglet correspondant.
+// Les sections exportent en named export, d'où le `then(m => ({ default: m.X }))`.
+const namedLazy = (importFn, name) => lazy(() => importFn().then(m => ({ default: m[name] })));
+
+const HallOfFameAndShame = namedLazy(() => import('./sections/HallOfFame.jsx'), 'HallOfFameAndShame');
+const VersusMode = namedLazy(() => import('./sections/VersusMode.jsx'), 'VersusMode');
+const ServerWeather = namedLazy(() => import('./sections/ServerWeather.jsx'), 'ServerWeather');
+const RoleAnalysis = namedLazy(() => import('./sections/RoleAnalysis.jsx'), 'RoleAnalysis');
+const RushDashboard = namedLazy(() => import('./sections/RushDashboard.jsx'), 'RushDashboard');
+const Leaderboard = namedLazy(() => import('./sections/Leaderboard.jsx'), 'Leaderboard');
+const DeathmatchAnalysis = namedLazy(() => import('./sections/DeathmatchAnalysis.jsx'), 'DeathmatchAnalysis');
+const SynergyAnalysis = namedLazy(() => import('./sections/SynergyAnalysis.jsx'), 'SynergyAnalysis');
+const Arsenal = namedLazy(() => import('./sections/Arsenal.jsx'), 'Arsenal');
+const AgentAnalysis = namedLazy(() => import('./sections/AgentAnalysis.jsx'), 'AgentAnalysis');
+const MapAnalysis = namedLazy(() => import('./sections/MapAnalysis.jsx'), 'MapAnalysis');
+const Nemesis = namedLazy(() => import('./sections/Nemesis.jsx'), 'Nemesis');
+const PlaystyleMatrix = namedLazy(() => import('./sections/PlaystyleMatrix.jsx'), 'PlaystyleMatrix');
+const EcoRating = namedLazy(() => import('./sections/EcoRating.jsx'), 'EcoRating');
+const TDMChallenge = namedLazy(() => import('./sections/TDMChallenge.jsx'), 'TDMChallenge');
+const Spellcaster = namedLazy(() => import('./sections/Spellcaster.jsx'), 'Spellcaster');
+const AdminPanel = namedLazy(() => import('./sections/AdminPanel.jsx'), 'AdminPanel');
+const SkirmishAnalysis = namedLazy(() => import('./sections/SkirmishAnalysis.jsx'), 'SkirmishAnalysis');
+const Tournaments = namedLazy(() => import('./sections/Tournaments.jsx'), 'Tournaments');
+const SeasonWrapUp = namedLazy(() => import('./sections/SeasonWrapUp.jsx'), 'SeasonWrapUp');
+
+// Modale lourde, chargée seulement au clic sur un match
+const MatchDetailModal = namedLazy(() => import('./components/UI'), 'MatchDetailModal');
 
 const SidebarItem = ({ id, label, icon: Icon, activeTab, onNavigate, isMobile, setIsSidebarOpen }) => {
   const isActive = activeTab === id;
@@ -103,28 +109,37 @@ function MainApp() {
         setChallengeStartDate(configData.challengeStartDate);
       }
 
-      // Fetch Saisons Valorant (API Officielle Publique)
+      // Saisons Valorant : cache localStorage 24h pour éviter le fetch externe
+      // à chaque chargement (les saisons changent quelques fois par an).
+      const SEASONS_TTL = 24 * 60 * 60 * 1000;
       try {
-        const seasonRes = await fetch('https://valorant-api.com/v1/seasons');
-        const seasonData = await seasonRes.json();
-        if (seasonData.status === 200) {
-          const episodes = seasonData.data.filter(s => !s.parentUuid);
-          const acts = seasonData.data.filter(s => s.parentUuid);
+        const cachedRaw = localStorage.getItem('valorantSeasons');
+        const cachedAt = parseInt(localStorage.getItem('valorantSeasonsAt') || '0', 10);
+        if (cachedRaw && Date.now() - cachedAt < SEASONS_TTL) {
+          setValorantSeasons(JSON.parse(cachedRaw));
+        } else {
+          const seasonRes = await fetch('https://valorant-api.com/v1/seasons');
+          const seasonData = await seasonRes.json();
+          if (seasonData.status === 200) {
+            const episodes = seasonData.data.filter(s => !s.parentUuid);
+            const acts = seasonData.data.filter(s => s.parentUuid);
 
-          const formattedActs = acts.map(act => {
-            const parent = episodes.find(e => e.uuid === act.parentUuid);
-            const epName = parent ? parent.displayName : 'Épisode Inconnu';
-            return {
-              uuid: act.uuid,
-              displayName: `${epName} - ${act.displayName}`,
-              startTime: new Date(act.startTime).getTime(),
-              endTime: new Date(act.endTime).getTime()
-            };
-          }).filter(act => !isNaN(act.startTime));
+            const formattedActs = acts.map(act => {
+              const parent = episodes.find(e => e.uuid === act.parentUuid);
+              const epName = parent ? parent.displayName : 'Épisode Inconnu';
+              return {
+                uuid: act.uuid,
+                displayName: `${epName} - ${act.displayName}`,
+                startTime: new Date(act.startTime).getTime(),
+                endTime: new Date(act.endTime).getTime()
+              };
+            }).filter(act => !isNaN(act.startTime));
 
-          // On trie du plus récent au plus ancien
-          formattedActs.sort((a, b) => b.startTime - a.startTime);
-          setValorantSeasons(formattedActs);
+            formattedActs.sort((a, b) => b.startTime - a.startTime);
+            setValorantSeasons(formattedActs);
+            localStorage.setItem('valorantSeasons', JSON.stringify(formattedActs));
+            localStorage.setItem('valorantSeasonsAt', String(Date.now()));
+          }
         }
       } catch (e) { console.error("Erreur Saisons Valorant API:", e); }
 
@@ -318,110 +333,46 @@ function MainApp() {
         </div>
       )}
 
-      <div className="flex-grow min-w-0 h-[100dvh] overflow-y-auto overflow-x-hidden relative z-0 custom-scrollbar">
+      <div className="flex-grow min-w-0 h-[100dvh] overflow-y-auto overflow-x-hidden relative custom-scrollbar">
         <div className={`p-4 sm:p-6 md:p-8 xl:p-10 w-full max-w-[1600px] mx-auto pb-24 transition-all duration-300 ${isMobile ? 'pt-20' : 'pt-6 xl:pt-10'}`}>
-          {selectedMatch && <MatchDetailModal match={selectedMatch} playersConfig={playersConfig} onClose={() => setSelectedMatch(null)} />}
+          {selectedMatch && (
+            <Suspense fallback={null}>
+              <MatchDetailModal match={selectedMatch} playersConfig={playersConfig} onClose={() => setSelectedMatch(null)} />
+            </Suspense>
+          )}
 
           {isInitialLoading ? (
             <SkeletonLoader />
           ) : (
+            <Suspense fallback={<SkeletonLoader />}>
             <AnimatePresence mode="wait">
-              {activeTab === 'rush' && (
-                <motion.div key="rush" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <RushDashboard matches={globalFilteredMatches} filteredData={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} onSelectMatch={setSelectedMatch} />
-                </motion.div>
-              )}
-              {activeTab === 'wrapup' && (
-                <motion.div key="wrapup" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <SeasonWrapUp matches={globalFilteredMatches} playersConfig={playersConfig} />
-                </motion.div>
-              )}
-              {activeTab === 'skirmish' && (
-                <motion.div key="skirmish" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <SkirmishAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'deathmatch' && (
-                <motion.div key="dm" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <DeathmatchAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />
-                </motion.div>
-              )}
-              {activeTab === 'tdm' && (
-                <motion.div key="tdm" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <TDMChallenge matches={globalFilteredMatches} playersConfig={playersConfig} />
-                </motion.div>
-              )}
-              {activeTab === 'tournaments' && (
-                <motion.div key="tournaments" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <Tournaments />
-                </motion.div>
-              )}
-              {activeTab === 'leaderboard' && (
-                <motion.div key="lead" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <Leaderboard matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'agents' && (
-                <motion.div key="agents" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <AgentAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />
-                </motion.div>
-              )}
-              {activeTab === 'arsenal' && (
-                <motion.div key="arsenal" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <Arsenal matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'maps' && (
-                <motion.div key="maps" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <MapAnalysis matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'nemesis' && (
-                <motion.div key="nemesis" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <Nemesis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />
-                </motion.div>
-              )}
-              {activeTab === 'synergy' && (
-                <motion.div key="synergy" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <SynergyAnalysis matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'shame' && (
-                <motion.div key="shame" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <HallOfFameAndShame matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'versus' && (
-                <motion.div key="vs" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <VersusMode matches={globalFilteredMatches} players={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'weather' && (
-                <motion.div key="weather" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <ServerWeather matches={globalFilteredMatches} playersConfig={playersConfig} />
-                </motion.div>
-              )}
-              {activeTab === 'roles' && (
-                <motion.div key="roles" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <RoleAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'matrix' && (
-                <motion.div key="matrix" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <PlaystyleMatrix matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'eco' && (
-                <motion.div key="eco" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <EcoRating matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'spells' && (
-                <motion.div key="spells" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <Spellcaster matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
+              <motion.div key={activeTab} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
+                {
+                  {
+                    'rush': <RushDashboard matches={globalFilteredMatches} filteredData={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} onSelectMatch={setSelectedMatch} />,
+                    'wrapup': <SeasonWrapUp matches={globalFilteredMatches} playersConfig={playersConfig} />,
+                    'skirmish': <SkirmishAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'deathmatch': <DeathmatchAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />,
+                    'tdm': <TDMChallenge matches={globalFilteredMatches} playersConfig={playersConfig} />,
+                    'tournaments': <Tournaments />,
+                    'leaderboard': <Leaderboard matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'agents': <AgentAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />,
+                    'arsenal': <Arsenal matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'maps': <MapAnalysis matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'nemesis': <Nemesis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />,
+                    'synergy': <SynergyAnalysis matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'shame': <HallOfFameAndShame matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'versus': <VersusMode matches={globalFilteredMatches} players={playersConfig} challengeStartDate={null} />,
+                    'weather': <ServerWeather matches={globalFilteredMatches} playersConfig={playersConfig} />,
+                    'roles': <RoleAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'matrix': <PlaystyleMatrix matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'eco': <EcoRating matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'spells': <Spellcaster matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
+                  }[activeTab]
+                }
+              </motion.div>
             </AnimatePresence>
+            </Suspense>
           )}
         </div>
       </div>
@@ -431,11 +382,13 @@ function MainApp() {
 
 export default function AppWrapper() {
   return (
-    <Routes>
-      <Route path="/admin" element={<AdminPanel />} />
-      <Route path="/" element={<Navigate to="/global/rush" replace />} />
-      <Route path="/:scope/:tab" element={<MainApp />} />
-      <Route path="/:scope" element={<Navigate to={`/:scope/rush`} replace />} />
-    </Routes>
+    <Suspense fallback={<SkeletonLoader />}>
+      <Routes>
+        <Route path="/admin" element={<AdminPanel />} />
+        <Route path="/" element={<Navigate to="/global/rush" replace />} />
+        <Route path="/:scope/:tab" element={<MainApp />} />
+        <Route path="/:scope" element={<Navigate to={`/:scope/rush`} replace />} />
+      </Routes>
+    </Suspense>
   );
 }

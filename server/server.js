@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
+import compression from 'compression';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import cron from 'node-cron';
@@ -22,6 +23,8 @@ const DB_FILE = path.join(__dirname, 'database.sqlite');
 const API_BASE = "https://api.henrikdev.xyz/valorant";
 
 app.use(cors());
+// gzip pour toutes les réponses > 1KB ; gain énorme sur /history (JSON volumineux)
+app.use(compression({ level: 6, threshold: 1024 }));
 app.use(bodyParser.json({ limit: '10mb' }));
 
 let db;
@@ -38,8 +41,20 @@ const discordClient = new Client({
 // --- INITIALISATION DE LA BASE DE DONNÉES ---
 (async () => {
     db = await open({ filename: DB_FILE, driver: sqlite3.Database });
-    
-    await db.exec('PRAGMA journal_mode = WAL;');
+
+    // Tuning SQLite pour serveur à faible RAM (447 MB).
+    // - WAL : lectures concurrentes pendant les écritures
+    // - synchronous=NORMAL : safe avec WAL, plus rapide que FULL
+    // - cache_size négatif = KB (4 MB)
+    // - mmap_size 64 MB : couvre la DB (~47 MB), réduit drastiquement les I/O disque
+    // - temp_store=MEMORY : tables temporaires en RAM (très petites)
+    await db.exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA cache_size = -4000;
+        PRAGMA mmap_size = 67108864;
+        PRAGMA temp_store = MEMORY;
+    `);
     
     await db.exec(`
         CREATE TABLE IF NOT EXISTS matches (
@@ -182,6 +197,15 @@ const getConfig = async (key, defaultVal = '') => {
 const getPlayers = async () => await db.all("SELECT * FROM players");
 const getApiKeys = async () => (await db.all("SELECT key FROM api_keys")).map(r => r.key);
 
+// Caches en mémoire (faible empreinte) pour éviter de retaper la DB
+// sur chaque requête publique. Invalidés par les writes admin et par les syncs.
+const PUBLIC_CONFIG_TTL_MS = 30 * 1000;
+let publicConfigCache = { data: null, expiry: 0 };
+let lastDataChange = Date.now();
+
+const invalidatePublicConfigCache = () => { publicConfigCache.expiry = 0; };
+const markDataChanged = () => { lastDataChange = Math.floor(Date.now() / 1000) * 1000; };
+
 const authenticateToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -251,6 +275,21 @@ const MAP_SPLASHES = {
     abyss: "https://media.valorant-api.com/maps/224b0a95-48b9-f703-1e9d-1ca6761376f5/splash.png"
 };
 
+// Remplacez les valeurs ci-dessous par vos balises d'émojis Discord (format <:nom:ID> ou de simples émojis natifs)
+// Émojis natifs "universels" par défaut (ne nécessitent aucun import côté serveur).
+const RANK_EMOJIS = {
+    'UNRATED': '❔',
+    'IRON 1': '<:IR1:1501226611284906026>', 'IRON 2': 'I2', 'IRON 3': 'I3',
+    'BRONZE 1': 'B1', 'BRONZE 2': 'B2', 'BRONZE 3': 'B3',
+    'SILVER 1': 'S1', 'SILVER 2': 'S2', 'SILVER 3': 'S3',
+    'GOLD 1': 'G1', 'GOLD 2': 'G2', 'GOLD 3': 'G3',
+    'PLATINUM 1': '<:PL1:1501227322529808656>', 'PLATINUM 2': '<:PL2:1501227372152619160>', 'PLATINUM 3': '<:PL3:1501227471897366754>',
+    'DIAMOND 1': '<:DI1:1501227521117782016>', 'DIAMOND 2': '<:DI2:1501227562360377465>', 'DIAMOND 3': '<:DI3:1501227605393801216>',
+    'ASCENDANT 1': '<:AS1:1501227688738951328>', 'ASCENDANT 2': '<:AS2:1501227728555216957>', 'ASCENDANT 3': '<:AS3:1501227757525405807>',
+    'IMMORTAL 1': '<:IM1:1501226021385666760>', 'IMMORTAL 2': '<:IM2:1501226084732108991>', 'IMMORTAL 3': '<:IM3:1501226484592021685>',
+    'RADIANT': '<:RA:1501227811103572059>'
+};
+
 // ==========================================
 // BOT DISCORD : CRÉATION DU MESSAGE MATCH
 // ==========================================
@@ -287,52 +326,59 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
         }
     });
 
-    const formatLine = (p) => {
+    const shortRank = (rankStr) => {
+        if (!rankStr) return '';
+        const r = rankStr.toUpperCase().trim();
+        if (RANK_EMOJIS[r]) return RANK_EMOJIS[r];
+        if (r.includes('IRON'))       return 'I'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('BRONZE'))     return 'B'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('SILVER'))     return 'S'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('GOLD'))       return 'G'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('PLATINUM'))   return 'P'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('DIAMOND'))    return 'D'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('ASCENDANT'))  return 'A'  + r.replace(/[^0-9]/g, '');
+        if (r.includes('IMMORTAL'))   return 'Im' + r.replace(/[^0-9]/g, '');
+        if (r.includes('RADIANT'))    return 'R';
+        if (r.includes('UNRATED'))    return 'NR';
+        return '';
+    };
+
+    const MEDALS = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
+    const formatLine = (p, idx) => {
         const cfg     = findCfgByPuuid(allConfigPlayers, p.puuid);
         const tracked = cfg ? playersInMatch.find(t => t.playerId === cfg.id) : null;
         const isMvp   = p.puuid === matchMvpId;
         const inParty = !cfg && p.party_id && trackedPartyIds.has(p.party_id);
         const name    = p.name?.trim() || p.character || '—';
-        const prefix  = cfg ? '❖ ' : (inParty ? '| ' : '  ');
-        const agent   = (p.character || '?').substring(0, 7).padEnd(8);
-        
-        let cleanName = prefix + name;
-        if (cleanName.length > 10) cleanName = cleanName.substring(0, 9) + '.';
-        const nameStr = cleanName.padEnd(11);
-        
-        // Raccourci du Rang (ex: "Diamond 3" -> "D3")
-        const rankStr = p.currenttier_patched || '—';
-        let shortRank = '—';
-        if (rankStr !== '—') {
-            const r = rankStr.toUpperCase();
-            if (r.includes('IRON')) shortRank = 'I' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('BRONZE')) shortRank = 'B' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('SILVER')) shortRank = 'S' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('GOLD')) shortRank = 'G' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('PLATINUM')) shortRank = 'P' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('DIAMOND')) shortRank = 'D' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('ASCENDANT')) shortRank = 'A' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('IMMORTAL')) shortRank = 'Im' + r.replace(/[^0-9]/g, '');
-            else if (r.includes('RADIANT')) shortRank = 'R';
-            else if (r.includes('UNRATED')) shortRank = 'U';
-        }
-        const rankCol = shortRank.padEnd(3);
-        
-        const k       = String(p.stats?.kills   || 0).padStart(2);
-        const d       = String(p.stats?.deaths  || 0).padStart(2);
-        const a       = String(p.stats?.assists || 0).padStart(2);
-        const kda     = `${k}/${d}/${a}`.padEnd(8);
-        const acs     = String(Math.round((p.stats?.score || 0) / rounds)).padStart(3);
-        let rr = '    ';
+
+        let pos       = MEDALS[idx] ?? String(idx + 1 + '.').padEnd(3, ' ');
+        const nameStr = cfg ? `**${name}**` : (inParty ? `*${name}*` : name);
+        const agent   = p.character || '?';
+        const k = p.stats?.kills   || 0;
+        const d = p.stats?.deaths  || 0;
+        const a = p.stats?.assists || 0;
+        const acs = Math.round((p.stats?.score || 0) / rounds);
+        const rank = shortRank(p.currenttier_patched);
+
+        const kdaStr = `\`${String(k).padStart(2, ' ')}/${String(d).padStart(2, ' ')}/${String(a).padStart(2, ' ')}\``;
+        const acsStr = `\`${String(acs).padStart(3, ' ')} ACS\``;
+
+        const parts = [];
         if (tracked?.rrChange !== undefined) {
             const sign = tracked.rrChange > 0 ? '+' : '';
-            rr = `${sign}${tracked.rrChange}`.padEnd(4);
+            parts.push(`**${sign}${tracked.rrChange} RR**`);
         }
-        return `${rankCol}${nameStr}${agent}${kda} ${acs} ${rr}${isMvp ? ' 👑' : ''}`;
+
+        const rankDisplay = rank ? `${rank} ` : '';
+        const teamIndicator = view === 'global' ? (p.team === 'Blue' ? '🟦 ' : (p.team === 'Red' ? '🟥 ' : '')) : '';
+        let line = `${pos} ${teamIndicator}${rankDisplay}${kdaStr} ${acsStr} · ${nameStr} (${agent})${isMvp ? ' 👑' : ''}`;
+        if (parts.length > 0) {
+            line += ` · ${parts.join(' · ')}`;
+        }
+        return line;
     };
 
-    const tableHeader = `${'Rk'.padEnd(3)}${'Joueur'.padEnd(11)}${'Agent'.padEnd(8)}${'K/D/A'.padEnd(8)} ACS   RR\n` + '─'.repeat(39);
-    const formatTeam  = (team) => team.map(formatLine).join('\n');
+    const formatTeam = (team) => team.map((p, i) => formatLine(p, i)).join('\n');
 
     const resultEmoji = isWin ? '🏆' : (baseMatch.result === 'LOSS' ? '💔' : '🤝');
     const resultText  = isWin ? 'VICTOIRE' : (baseMatch.result === 'LOSS' ? 'DÉFAITE' : 'ÉGALITÉ');
@@ -342,7 +388,7 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
         .setTitle(`${resultEmoji} ${resultText} — ${(baseMatch.map || '?').toUpperCase()}`)
         .setURL(appUrl)
         .setColor(color)
-        .setFooter({ text: 'KSL Tracker  •  ❖ = escouade KSL  •  | = avec l\'escouade' })
+        .setFooter({ text: 'KSL Tracker  •  gras = tracké KSL  •  italique = avec l\'escouade  •  👑 = MVP' })
         .setTimestamp(baseMatch.timestamp ? baseMatch.timestamp * 1000 : new Date(baseMatch.date).getTime());
         
     const mapName = (baseMatch.map || '').toLowerCase();
@@ -351,8 +397,9 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
     }
 
     const blueWin   = blueScore > redScore;
-    const blueLabel = `🟦 **ÉQUIPE BLEUE** — ${blueScore} rounds${blueWin ? ' ✅' : ''}`;
-    const redLabel  = `🟥 **ÉQUIPE ROUGE** — ${redScore} rounds${!blueWin && blueScore !== redScore ? ' ✅' : ''}`;
+    const globalLabel = `__🌐 **SCOREBOARD GLOBAL** — ${blueScore} à ${redScore}__`;
+    const blueLabel = `__🟦 **ÉQUIPE BLEUE** — ${blueScore} rounds${blueWin ? ' ✅' : ''}__`;
+    const redLabel  = `__🟥 **ÉQUIPE ROUGE** — ${redScore} rounds${!blueWin && blueScore !== redScore ? ' ✅' : ''}__`;
 
     // Récupération des joueurs trackés pour les mentionner
     const trackedConfigs = [];
@@ -363,16 +410,16 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
     const mentionsText = trackedConfigs.map(c => c.discord_id ? `<@${c.discord_id}>` : `**${c.name}**`).join(' · ');
     const mentionsPrefix = mentionsText ? `👥 ${mentionsText}\n\n` : '';
 
+    const headerDesc = `${mentionsPrefix}**Score : ${baseMatch.matchScore}** · Classé · ${rounds} rounds\n\n`;
+
     if (view === 'global') {
-        let desc = `${mentionsPrefix}**Score : ${baseMatch.matchScore}** · Classé · ${rounds} rounds\n\n`;
-        desc += `${blueLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(blueTeam)}\n\`\`\`\n`;
-        desc += `${redLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(redTeam)}\n\`\`\``;
+        let desc = `${headerDesc}${globalLabel}\n${formatTeam(globalSorted)}`;
         if (desc.length > 4096) desc = desc.substring(0, 4090) + '\n...';
         embed.setDescription(desc);
     } else if (view === 'blue') {
-        embed.setDescription(`${mentionsPrefix}${blueLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(blueTeam)}\n\`\`\``);
+        embed.setDescription(`${headerDesc}${blueLabel}\n${formatTeam(blueTeam)}`);
     } else if (view === 'red') {
-        embed.setDescription(`${mentionsPrefix}${redLabel}\n\`\`\`\n${tableHeader}\n${formatTeam(redTeam)}\n\`\`\``);
+        embed.setDescription(`${headerDesc}${redLabel}\n${formatTeam(redTeam)}`);
     }
 
     const row = new ActionRowBuilder().addComponents(
@@ -414,17 +461,21 @@ const buildClassementMessage = async (category, allConfigPlayers, startTs, start
     let title = ''; let color = 0xffd700; let mapFn;
 
     if (category === 'rr') {
-        title = '🏆 Classement — Rank Rating (RR)'; activePlayers.sort((a, b) => b.rankValue - a.rankValue || b.rrTotal - a.rrTotal); mapFn = p => `> **${p.rrTotal > 0 ? '+' : ''}${p.rrTotal} RR** • ${p.currentRank}`;
+        title = '🏆 Classement — Rank Rating (RR)'; activePlayers.sort((a, b) => b.rankValue - a.rankValue || b.rrTotal - a.rrTotal); mapFn = p => `${RANK_EMOJIS[p.currentRank?.toUpperCase()] || p.currentRank} \`${(p.rrTotal > 0 ? '+' : '') + String(p.rrTotal).padStart(3, ' ')} RR\` · **${p.name}**`;
     } else if (category === 'hs') {
-        title = '🎯 Classement — Headshot %'; color = 0xef4444; activePlayers.sort((a, b) => b.hsPct - a.hsPct); mapFn = p => `> **${p.hsPct}% HS** • ${p.games} parties`;
+        title = '🎯 Classement — Headshot %'; color = 0xef4444; activePlayers.sort((a, b) => b.hsPct - a.hsPct); mapFn = p => `🎯 \`${String(p.hsPct).padStart(3, ' ')}% HS\` · **${p.name}** (${p.games} parties)`;
     } else if (category === 'winrate') {
-        title = '📈 Classement — Winrate'; color = 0x10b981; activePlayers.sort((a, b) => b.winrate - a.winrate || b.games - a.games); mapFn = p => `> **${p.winrate}% Winrate** • ${p.wins}W - ${p.games - p.wins}L`;
+        title = '📈 Classement — Winrate'; color = 0x10b981; activePlayers.sort((a, b) => b.winrate - a.winrate || b.games - a.games); mapFn = p => `🏆 \`${String(p.winrate).padStart(3, ' ')}% WR\` · **${p.name}** (${p.wins}W - ${p.games - p.wins}L)`;
     } else if (category === 'games') {
-        title = '🕹️ Classement — Parties Jouées'; color = 0x3b82f6; activePlayers.sort((a, b) => b.games - a.games); mapFn = p => `> **${p.games} parties** • Joueur très actif`;
+        title = '🕹️ Classement — Parties Jouées'; color = 0x3b82f6; activePlayers.sort((a, b) => b.games - a.games); mapFn = p => `🕹️ \`${String(p.games).padStart(3, ' ')} GAMES\` · **${p.name}**`;
     }
 
     const medals = ['🥇', '🥈', '🥉'];
-    const lines = activePlayers.map((p, i) => `${medals[i] || `**${i + 1}.**`} **${p.name}**\n${mapFn(p)}`).join('\n\n');
+    const lines = activePlayers.map((p, i) => {
+        let pos = medals[i] ?? `${i + 1}.`;
+        if (i > 2) pos = String(pos).padEnd(3, ' ');
+        return `${pos} ${mapFn(p)}`;
+    }).join('\n');
 
     const embed = new EmbedBuilder()
         .setTitle(title)
@@ -486,7 +537,9 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
             trackedPartyId = me?.party_id || null;
         }
 
-        uniqueGames[m.id].players.push({ name: playerName, agent: m.agent || "?", rr: `${rrSign}${m.rrChange}`, kd: kd, result: m.result, acs: acs, hs: hsPct, partyId: trackedPartyId });
+        const currentRank = m.currentRank || 'Inconnu';
+        const rankEmoji = RANK_EMOJIS[currentRank.toUpperCase().trim()] || currentRank;
+        uniqueGames[m.id].players.push({ name: playerName, agent: m.agent || "?", rr: `${rrSign}${m.rrChange}`, kd: kd, result: m.result, acs: acs, hs: hsPct, partyId: trackedPartyId, rank: rankEmoji });
 
         if (playerStats[m.playerId]) {
             const p = playerStats[m.playerId];
@@ -535,10 +588,10 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
         embed.addFields({ name: `${weatherEmoji} Bilan de l'Escouade`, value: `**Météo :** ${weatherTitle}\n**Winrate :** ${globalWinrate}% (${totalWins}W - ${totalUniqueGames - totalWins}L)\n**Rentabilité :** ${totalRRDay > 0 ? '+' : ''}${totalRRDay} RR globaux`, inline: false });
 
         let fameText = "";
-        if (mvp && mvp.rrChange > 0) fameText += `👑 **MVP :** ${mvp.name} (*+${mvp.rrChange} RR*)\n`;
-        if (butcher && butcher.name !== mvp?.name) fameText += `🔪 **Boucher :** ${butcher.name} (*${(butcher.deaths > 0 ? butcher.kills/butcher.deaths : butcher.kills).toFixed(2)} K/D*)\n`;
-        if (sniper && sniper.shots > 0) fameText += `🎯 **Sniper :** ${sniper.name} (*${Math.round((sniper.headshots/sniper.shots)*100)}% HS*)\n`;
-        if (loser && loser.rrChange < 0) fameText += `🤡 **Poids Mort :** ${loser.name} (*${loser.rrChange} RR*)\n`;
+        if (mvp && mvp.rrChange > 0) fameText += `👑 \`${('+' + mvp.rrChange).padStart(4, ' ')} RR\` · **MVP :** ${mvp.name}\n`;
+        if (butcher && butcher.name !== mvp?.name) fameText += `🔪 \`${String((butcher.deaths > 0 ? butcher.kills/butcher.deaths : butcher.kills).toFixed(2)).padStart(4, ' ')} K/D\` · **Boucher :** ${butcher.name}\n`;
+        if (sniper && sniper.shots > 0) fameText += `🎯 \`${String(Math.round((sniper.headshots/sniper.shots)*100)).padStart(3, ' ')}% HS\` · **Sniper :** ${sniper.name}\n`;
+        if (loser && loser.rrChange < 0) fameText += `🤡 \`${String(loser.rrChange).padStart(4, ' ')} RR\` · **Poids Mort :** ${loser.name}\n`;
 
         embed.addFields({ name: "🏆 Tableau d'Honneur", value: fameText || "Pas de trophées marquants aujourd'hui.", inline: false });
         embed.setDescription(`*Cliquez sur le bouton ci-dessous pour voir le détail des parties de la journée.*`);
@@ -546,12 +599,10 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
         let gamesLog = "";
         uniqueGamesList.forEach(g => {
             const icon = g.result === 'WIN' ? "🟢" : (g.result === 'DRAW' ? "⚪" : "🔴");
-            const scoreText = g.score ? `**${g.score}**` : "";
-            gamesLog += `${icon} **${g.map.toUpperCase()}** - ${scoreText}\n`;
+            const scoreText = g.score ? ` **${g.score}**` : "";
+            gamesLog += `${icon} **${(g.map || '?').toUpperCase()}**${scoreText}\n`;
             g.players.sort((a, b) => parseInt(b.rr) - parseInt(a.rr));
 
-            // Pour chaque tracké, retrouve ses coéquipiers non-trackés du même groupe
-            // afin d'afficher la composition complète du duo/trio.
             const trackedPuuids = new Set();
             (g.allPlayersRaw || []).forEach(ap => {
                 if (findCfgByPuuid(allConfigPlayers, ap.puuid)) trackedPuuids.add(ap.puuid);
@@ -559,26 +610,27 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
             const partiesShown = new Set();
 
             g.players.forEach(p => {
-                gamesLog += `> \`${p.agent.padEnd(9)}\` **${p.name}** : **${p.rr} RR** | ${p.kd} K/D | ${p.acs} ACS | ${p.hs}% HS\n`;
+                const rrNum = parseInt(p.rr) || 0;
+                const rrStr = rrNum > 0 ? `**+${rrNum} RR**` : (rrNum < 0 ? `**${rrNum} RR**` : `${rrNum} RR`);
+                const padKd = String(p.kd).padStart(4, ' ');
+                const padAcs = String(p.acs).padStart(3, ' ');
+            gamesLog += `> ${p.rank} \`${padKd} K/D\` \`${padAcs} ACS\` · **${p.name}** (${p.agent}) — ${rrStr} · ${p.hs}% HS\n`;
 
-                // Coéquipiers non-trackés du même party_id (1 seule fois par groupe)
                 if (p.partyId && !partiesShown.has(p.partyId)) {
                     partiesShown.add(p.partyId);
                     const mates = (g.allPlayersRaw || []).filter(ap =>
-                        ap.party_id === p.partyId
-                        && !trackedPuuids.has(ap.puuid)
+                        ap.party_id === p.partyId && !trackedPuuids.has(ap.puuid)
                     );
                     mates.forEach(mate => {
                         const mateName = mate.name?.trim() || mate.character || 'Inconnu';
-                        const mateAgent = (mate.character || '?').padEnd(9);
-                        gamesLog += `> ┗ \`${mateAgent}\` *${mateName}* (groupe, non tracké)\n`;
+                        gamesLog += `> ↳ *${mateName}* (${mate.character || '?'}) — groupe\n`;
                     });
                 }
             });
             gamesLog += "\n";
         });
         if (gamesLog.length > 3900) gamesLog = gamesLog.substring(0, 3900) + "\n... *[Journal tronqué]*";
-        embed.setDescription(`**📝 Journal détaillé des Matchs**\n\n${gamesLog}`);
+        embed.setDescription(`**📝 Journal des Matchs**\n\n${gamesLog}`);
     }
 
     const row = new ActionRowBuilder().addComponents(
@@ -741,6 +793,7 @@ discordClient.on('interactionCreate', async interaction => {
             const avgAcs = Math.round(acsSum / rows.length);
             const sign = rrTotal > 0 ? '+' : '';
             const color = parseInt((target.color || '#ff4655').replace('#', ''), 16) || 0xff4655;
+            const currentRankEmoji = RANK_EMOJIS[currentRank.toUpperCase()] || currentRank;
             
             const chartConfig = {
                 type: 'line',
@@ -770,7 +823,7 @@ discordClient.on('interactionCreate', async interaction => {
             const embed = new EmbedBuilder()
                 .setTitle(`📊 ${target.name} — Stats Ranked`)
                 .setColor(color)
-                .setDescription(`*${rows.length} derniers matchs • ${currentRank}*`)
+                .setDescription(`*${rows.length} derniers matchs • ${currentRankEmoji}*`)
                 .addFields(
                     { name: '🏆 W/L', value: `**${wins}W** — ${rows.length - wins}L\n${winrate}% WR`, inline: true },
                     { name: '⚔️ K/D/A', value: `**${kd}** K/D\n${Math.round(kills/rows.length)}/${Math.round(deaths/rows.length)}/${Math.round(assists/rows.length)} moy.`, inline: true },
@@ -820,7 +873,9 @@ discordClient.on('interactionCreate', async interaction => {
             if (weapons.length > 0) favWeapon = ` 🔫 ${weapons[0][0]}`;
         }
         
-        desc += `${emoji} **${(m.map || '?').toUpperCase()}** (${m.matchScore || '? - ?'})\n> \`${(m.agent || '?').padEnd(9)}\` : **${sign}${m.rrChange || 0} RR** | ${m.kills}/${m.deaths}/${m.assists} (*${m.kd} K/D*) | ${m.acs || 0} ACS${favWeapon}\n\n`;
+        const kda = `${m.kills}/${m.deaths}/${m.assists}`;
+        const rankStr = m.currentRank ? (RANK_EMOJIS[m.currentRank.toUpperCase().trim()] || m.currentRank) : '';
+        desc += `${emoji} **${(m.map || '?').toUpperCase()}** (${m.matchScore || '? - ?'})\n> ${rankStr ? rankStr + ' ' : ''}\`${kda.padStart(8, ' ')} | ${String(m.acs || 0).padStart(3, ' ')} ACS\` · **${sign}${m.rrChange || 0} RR** · ${m.agent || '?'}${favWeapon}\n\n`;
             });
             
             embed.setDescription(desc);
@@ -853,7 +908,7 @@ discordClient.on('interactionCreate', async interaction => {
     const customId = interaction.customId;
 
     if (customId.startsWith('match_')) {
-        await interaction.deferUpdate();
+        try { await interaction.deferUpdate(); } catch (e) { return; }
         const parts = customId.split('_');
         const view = parts[1];
         const matchId = parts.slice(2).join('_');
@@ -866,7 +921,7 @@ discordClient.on('interactionCreate', async interaction => {
         }
     }
     else if (customId.startsWith('class_')) {
-        await interaction.deferUpdate();
+        try { await interaction.deferUpdate(); } catch (e) { return; }
         const category = customId.split('_')[1];
         const challengeStart = await getConfig('challenge_start_date', '2024-01-01T00:00');
         const startTs = new Date(challengeStart).getTime();
@@ -876,7 +931,7 @@ discordClient.on('interactionCreate', async interaction => {
         await interaction.editReply(messagePayload);
     }
     else if (customId.startsWith('report_')) {
-        await interaction.deferUpdate();
+        try { await interaction.deferUpdate(); } catch (e) { return; }
         const parts = customId.split('_');
         const view = parts[1];
         const dateStr = parts.slice(2).join('_');
@@ -936,10 +991,16 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
 
 app.get('/api/public/config', async (req, res) => {
     try {
+        const now = Date.now();
+        if (publicConfigCache.data && publicConfigCache.expiry > now) {
+            return res.json(publicConfigCache.data);
+        }
         const players = await getPlayers();
         const appUrl = await getConfig('app_url', 'http://localhost:5173');
         const challengeStartDate = await getConfig('challenge_start_date', '2024-01-01T00:00');
-        res.json({ players, appUrl, challengeStartDate });
+        const payload = { players, appUrl, challengeStartDate };
+        publicConfigCache = { data: payload, expiry: now + PUBLIC_CONFIG_TTL_MS };
+        res.json(payload);
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -959,6 +1020,7 @@ app.post('/api/admin/config', authenticateToken, async (req, res) => {
     if (discord_channel_id !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'discord_channel_id'", [discord_channel_id]);
     if (app_url !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'app_url'", [app_url]);
     if (challenge_start_date !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'challenge_start_date'", [challenge_start_date]);
+    invalidatePublicConfigCache();
     res.json({ message: "Configuration sauvegardée (Redémarrez le serveur si vous avez changé le Token du Bot)" });
 });
 
@@ -972,6 +1034,7 @@ app.post('/api/admin/players', authenticateToken, async (req, res) => {
     const countRow = await db.get("SELECT COUNT(*) as count FROM players");
     const id = `p${countRow.count + 1}_${Date.now()}`;
     await db.run("INSERT INTO players (id, name, tag, region, color, discord_id) VALUES (?, ?, ?, ?, ?, ?)", [id, name, tag, region, color || '#ffffff', discord_id || '']);
+    invalidatePublicConfigCache();
     res.json({ message: "Joueur ajouté", id });
 });
 
@@ -982,6 +1045,7 @@ app.put('/api/admin/players/:id', authenticateToken, async (req, res) => {
             "UPDATE players SET name = ?, tag = ?, color = ?, discord_id = ? WHERE id = ?",
             [name, tag, color, discord_id || '', req.params.id]
         );
+        invalidatePublicConfigCache();
         res.json({ message: "Joueur mis à jour avec succès" });
     } catch (e) {
         res.status(500).json({ error: "Erreur lors de la mise à jour" });
@@ -990,6 +1054,7 @@ app.put('/api/admin/players/:id', authenticateToken, async (req, res) => {
 
 app.delete('/api/admin/players/:id', authenticateToken, async (req, res) => {
     await db.run("DELETE FROM players WHERE id = ?", [req.params.id]);
+    invalidatePublicConfigCache();
     res.json({ message: "Joueur supprimé" });
 });
 
@@ -1115,111 +1180,100 @@ app.delete('/api/admin/tournaments/:id', authenticateToken, async (req, res) => 
 });
 
 // ==========================================
-// BACKFILL RETROACTIF DES NOMS (kill events)
+// BACKFILL DES NOMS (correspondance PUUID -> pseudo)
+// Utilisé automatiquement après chaque sync pour résoudre les pseudos
+// que /v3/matches ne renvoie plus. Une route admin permet aussi le
+// rattrapage massif sur tout l'historique.
 // ==========================================
+
+const isMissingPseudo = (p) => !p.name?.trim() || p.name === p.character;
+
+const backfillNamesForMatches = async (matchIds, apiKeys) => {
+    const result = { fetched: 0, updated: 0, skipped: 0, errors: [] };
+    if (!apiKeys?.length || !matchIds?.length) return result;
+
+    for (const matchId of matchIds) {
+        const rows = await db.all("SELECT id, data FROM matches WHERE id LIKE ?", [`${matchId}_%`]);
+        if (!rows.length) { result.skipped++; continue; }
+
+        const group = rows.map(r => {
+            try { return { rowId: r.id, data: JSON.parse(r.data) }; }
+            catch { return null; }
+        }).filter(Boolean);
+
+        const needs = group.some(r => (r.data.allPlayers || []).some(isMissingPseudo));
+        if (!needs) { result.skipped++; continue; }
+
+        try {
+            const resp = await fetchWithRetry(`${API_BASE}/v2/match/${matchId}`, apiKeys, {}, 3);
+            if (!resp.ok) {
+                result.errors.push(`${matchId}: HTTP ${resp.status}`);
+                continue;
+            }
+            const json = await resp.json();
+            const m = json?.data;
+            if (!m) continue;
+            result.fetched++;
+
+            // Construit la table de correspondance PUUID -> "name#tag"
+            const nameMap = {};
+            (m.players?.all_players || []).forEach(p => {
+                if (p.puuid && p.name && p.name.trim() !== '') {
+                    nameMap[p.puuid] = `${p.name}#${p.tag}`;
+                }
+            });
+            (m.kills || m.kill_events || []).forEach(k => {
+                if (k.killer_puuid && k.killer_display_name && !nameMap[k.killer_puuid]) nameMap[k.killer_puuid] = k.killer_display_name;
+                if (k.victim_puuid && k.victim_display_name && !nameMap[k.victim_puuid]) nameMap[k.victim_puuid] = k.victim_display_name;
+            });
+
+            for (const row of group) {
+                let changed = false;
+                const updatedPlayers = (row.data.allPlayers || []).map(p => {
+                    if (isMissingPseudo(p) && p.puuid && nameMap[p.puuid]) {
+                        const parts = nameMap[p.puuid].split('#');
+                        changed = true;
+                        return { ...p, name: parts[0] || p.name, tag: parts[1] || p.tag };
+                    }
+                    return p;
+                });
+                if (changed) {
+                    row.data.allPlayers = updatedPlayers;
+                    await db.run("UPDATE matches SET data = ? WHERE id = ?", [JSON.stringify(row.data), row.rowId]);
+                    result.updated++;
+                }
+            }
+
+            await delay(250);
+        } catch (e) {
+            result.errors.push(`${matchId}: ${e.message}`);
+        }
+    }
+
+    return result;
+};
 
 app.post('/api/admin/backfill-names', authenticateToken, async (req, res) => {
     try {
         const apiKeys = await getApiKeys();
         if (apiKeys.length === 0) return res.status(500).json({ error: 'Aucune clé API configurée.' });
 
-        // Charge tous les enregistrements de matchs
         const allRows = await db.all("SELECT id, data FROM matches");
-
-        // Groupe les rows par vrai match ID (le champ id stocké est matchId_playerId)
-        const byMatchId = {};
+        const matchIds = new Set();
         for (const row of allRows) {
             try {
                 const data = JSON.parse(row.data);
-                const realId = data.id; // vrai identifiant Riot du match
-                if (!realId) continue;
-                if (!byMatchId[realId]) byMatchId[realId] = [];
-                byMatchId[realId].push({ rowId: row.id, data });
+                if (data.id && (data.allPlayers || []).some(isMissingPseudo)) {
+                    matchIds.add(data.id);
+                }
             } catch (e) { void e; }
         }
 
-        const uniqueIds = Object.keys(byMatchId);
-        let fetched = 0, updated = 0, skipped = 0;
-        const errors = [];
-
-        for (const matchId of uniqueIds) {
-            const group = byMatchId[matchId];
-
-            // On saute si tous les joueurs ont déjà un nom
-            const needsBackfill = group.some(r =>
-                (r.data.allPlayers || []).some(p => !p.name?.trim())
-            );
-            if (!needsBackfill) { skipped++; continue; }
-
-            console.log(`[DEBUG] Backfill du match : ${matchId}`);
-            try {
-                // L'API HenrikDev requiert /v2/match/{matchId} pour interroger un match spécifique
-                const url = `${API_BASE}/v2/match/${matchId}`;
-                const resp = await fetchWithRetry(url, apiKeys, {}, 3);
-                if (!resp.ok) { 
-                    console.log(`[DEBUG] ❌ Erreur HTTP ${resp.status} pour le match ${matchId}`);
-                    errors.push(`${matchId}: HTTP ${resp.status}`); 
-                    continue; 
-                }
-                const json = await resp.json();
-                const m = json.data;
-                if (!m) {
-                    console.log(`[DEBUG] ⚠️ Pas de donnees valides reçues pour le match ${matchId}`);
-                    continue;
-                }
-                fetched++;
-
-                const nameMap = {};
-                
-                // 1. On cherche d'abord directement dans la liste des joueurs du match
-                if (m.players && Array.isArray(m.players.all_players)) {
-                    m.players.all_players.forEach(p => {
-                        if (p.puuid && p.name && p.name.trim() !== '') {
-                            nameMap[p.puuid] = `${p.name}#${p.tag}`;
-                        }
-                    });
-                }
-
-                // 2. Fallback sur les kill events au cas où
-                const kills = m.kills || m.kill_events || [];
-                kills.forEach(k => {
-                    if (k.killer_puuid && k.killer_display_name && !nameMap[k.killer_puuid]) nameMap[k.killer_puuid] = k.killer_display_name;
-                    if (k.victim_puuid && k.victim_display_name && !nameMap[k.victim_puuid]) nameMap[k.victim_puuid] = k.victim_display_name;
-                });
-                
-                // Met à jour chaque enregistrement DB pour ce match
-                for (const row of group) {
-                    let changed = false;
-                    const updatedPlayers = (row.data.allPlayers || []).map(p => {
-                        if (!p.name?.trim()) {
-                            changed = true;
-                            if (p.puuid && nameMap[p.puuid]) {
-                                const parts = nameMap[p.puuid].split('#');
-                                return { ...p, name: parts[0] || p.name, tag: parts[1] || p.tag };
-                            } else {
-                                // ⚡ FIX : Si Riot censure vraiment le nom (ex: Deathmatch anonyme)
-                                // On utilise le nom de l'agent pour valider le joueur.
-                                return { ...p, name: p.character || 'Inconnu', tag: '' };
-                            }
-                        }
-                        return p;
-                    });
-                    if (changed) {
-                        row.data.allPlayers = updatedPlayers;
-                        await db.run("UPDATE matches SET data = ? WHERE id = ?",
-                            [JSON.stringify(row.data), row.rowId]);
-                        updated++;
-                    }
-                }
-
-                await new Promise(r => setTimeout(r, 250)); // respect rate limit
-            } catch (e) {
-                errors.push(`${matchId}: ${e.message}`);
-            }
-        }
-
-        console.log(`✅ Backfill noms : ${fetched} matchs re-fetchés, ${updated} enregistrements mis à jour, ${skipped} ignorés.`);
-        res.json({ fetched, updated, skipped, total: uniqueIds.length, errors: errors.slice(0, 20) });
+        const ids = [...matchIds];
+        const result = await backfillNamesForMatches(ids, apiKeys);
+        if (result.updated > 0) markDataChanged();
+        console.log(`✅ Backfill admin : ${result.fetched} matchs re-fetchés, ${result.updated} enregistrements mis à jour, ${result.skipped} ignorés.`);
+        res.json({ ...result, total: ids.length, errors: result.errors.slice(0, 20) });
     } catch (e) {
         console.error('❌ Backfill error:', e.message);
         res.status(500).json({ error: e.message });
@@ -1869,9 +1923,35 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
                 }
             }
             await db.exec('COMMIT');
+            if (totalAdded > 0) markDataChanged();
         }
-        
+
         console.log(`\n✅ Fin du scan complet. ${totalAdded} matchs traités/sauvegardés.`);
+
+        // Backfill automatique des pseudos manquants sur les matchs touchés par ce scan.
+        // /v3/matches renvoie souvent des name/tag vides — on rattrape via /v2/match/{id}.
+        const idsToBackfill = new Set();
+        for (const m of allNewMatches) {
+            if ((m.allPlayers || []).some(isMissingPseudo)) idsToBackfill.add(m.id);
+        }
+        if (idsToBackfill.size > 0) {
+            console.log(`🔧 Backfill auto sur ${idsToBackfill.size} match(s) avec pseudos manquants...`);
+            const r = await backfillNamesForMatches([...idsToBackfill], apiKeys);
+            console.log(`   -> ${r.fetched} re-fetchés, ${r.updated} mis à jour, ${r.skipped} ignorés.`);
+            if (r.updated > 0) markDataChanged();
+
+            // Recharge les matchs ranked qui viennent d'être backfillés pour que
+            // les notifications Discord utilisent les pseudos corrects.
+            for (let i = 0; i < newlyAddedRankedMatches.length; i++) {
+                const m = newlyAddedRankedMatches[i];
+                if (idsToBackfill.has(m.id)) {
+                    const fresh = await db.get("SELECT data FROM matches WHERE id = ?", [`${m.id}_${m.playerId}`]);
+                    if (fresh) {
+                        try { newlyAddedRankedMatches[i] = JSON.parse(fresh.data); } catch (e) { void e; }
+                    }
+                }
+            }
+        }
 
         if (newlyAddedRankedMatches.length > 0) {
             console.log(`📢 ${newlyAddedRankedMatches.length} nouveau(x) match(s) classé(s) détecté(s).`);
@@ -1924,8 +2004,21 @@ const generateDailyReport = async (isManual = false, forceDate = null) => {
 
 app.get('/history', async (req, res) => {
     try {
+        // Cache HTTP : si rien n'a bougé depuis la dernière sync,
+        // le navigateur garde sa copie locale et on renvoie 304.
+        const lastModified = new Date(lastDataChange).toUTCString();
+        res.setHeader('Last-Modified', lastModified);
+        res.setHeader('Cache-Control', 'private, max-age=10, must-revalidate');
+        const ifModSince = req.headers['if-modified-since'];
+        if (ifModSince) {
+            const ifModTime = Date.parse(ifModSince);
+            if (!isNaN(ifModTime) && ifModTime >= lastDataChange) {
+                return res.status(304).end();
+            }
+        }
+
         const { start, end, limit = 5000, offset = 0 } = req.query;
-        let query = 'SELECT id, data FROM matches'; // Ajout de 'id' pour le debug
+        let query = 'SELECT data FROM matches';
         let params = [];
         let conditions = [];
 
@@ -1941,25 +2034,21 @@ app.get('/history', async (req, res) => {
         if (conditions.length > 0) {
             query += ' WHERE ' + conditions.join(' AND ');
         }
-        
+
         query += ' ORDER BY date DESC';
-        query += ` LIMIT ${parseInt(limit)} OFFSET ${parseInt(offset)}`; 
+        query += ` LIMIT ${parseInt(limit)} OFFSET ${parseInt(offset)}`;
 
         const rows = await db.all(query, params);
-        
-        // ⚡ FIX : On gère les matchs corrompus un par un sans faire planter le serveur
-        const matches = rows.map(row => {
-            try {
-                return JSON.parse(row.data);
-            } catch (err) {
-                console.error(`❌ Erreur JSON.parse ignorée sur le match ID : ${row.id}`);
-                return null;
-            }
-        }).filter(Boolean); // On filtre/supprime les matchs null
 
-        res.json({ matches });
+        // Optim: row.data est déjà une string JSON valide. On évite le
+        // round-trip parse+stringify qui allouait ~10-20 MB pour 5000 matchs.
+        const jsonParts = [];
+        for (const r of rows) {
+            if (r.data) jsonParts.push(r.data);
+        }
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.send('{"matches":[' + jsonParts.join(',') + ']}');
     } catch (e) {
-        // ⚡ FIX : On affiche la VRAIE erreur dans la console du serveur !
         console.error("❌ ERREUR CRITIQUE SUR LA ROUTE /history :", e);
         res.status(500).json({ matches: [], error: e.message });
     }
