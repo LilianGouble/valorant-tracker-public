@@ -257,8 +257,8 @@ export const MatchDetailModal = ({ match, onClose, playersConfig }) => {
     const isTDM = match.type === 'tdm';
 
     const matchTimeMs = match.timestamp ? match.timestamp * 1000 : new Date(match.date).getTime();
-    const timeStr = new Date(matchTimeMs).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Paris' });
-    const dateStr = new Date(matchTimeMs).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/Paris' });
+    const timeStr = new Date(matchTimeMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const dateStr = new Date(matchTimeMs).toLocaleDateString([], { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
 
     return (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-2 sm:p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200" onClick={onClose}>

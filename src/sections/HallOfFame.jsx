@@ -97,7 +97,10 @@ export const HallOfFameAndShame = ({ matches, playersConfig }) => {
 
         if (viewMode === 'daily') {
             const dateStr = selectedDate.toLocaleDateString();
-            validMatches = validMatches.filter(m => new Date(m.date).toLocaleDateString() === dateStr);
+            validMatches = validMatches.filter(m => {
+                const matchTimeMs = m.timestamp ? m.timestamp * 1000 : new Date(m.date).getTime();
+                return new Date(matchTimeMs).toLocaleDateString() === dateStr;
+            });
         }
 
         const stats = {};

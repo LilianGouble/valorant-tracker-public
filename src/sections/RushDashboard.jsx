@@ -31,8 +31,8 @@ const getRankLabel = (value) => {
     return tier ? tier.label : value;
 };
 
-const formatMatchTime = (dateString) => {
-    return new Date(dateString).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+const formatMatchTime = (matchTimeMs) => {
+    return new Date(matchTimeMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 };
 
 const SafeAgentImage = ({ src, alt, size = "w-8 h-8", className = "" }) => {
@@ -104,8 +104,9 @@ const DailyGamesList = ({ matches, onSelectMatch, playersConfig }) => {
         });
 
         Object.values(uniqueMatchesMap).forEach(uniqueMatch => {
-            const dateObj = new Date(uniqueMatch.meta.date);
-            const dateKey = dateObj.toLocaleDateString('fr-FR');
+            const matchTimeMs = uniqueMatch.meta.timestamp ? uniqueMatch.meta.timestamp * 1000 : new Date(uniqueMatch.meta.date).getTime();
+            const dateObj = new Date(matchTimeMs);
+            const dateKey = dateObj.toLocaleDateString();
             if (!groupedByDate[dateKey]) groupedByDate[dateKey] = { dateObj: dateObj, matches: [] };
             groupedByDate[dateKey].matches.push(uniqueMatch);
         });
@@ -114,7 +115,11 @@ const DailyGamesList = ({ matches, onSelectMatch, playersConfig }) => {
             .sort(([, a], [, b]) => b.dateObj - a.dateObj)
             .map(([dateString, data]) => ({
                 dateString,
-                matches: data.matches.sort((a, b) => new Date(b.meta.date) - new Date(a.meta.date))
+                matches: data.matches.sort((a, b) => {
+                    const tA = a.meta.timestamp ? a.meta.timestamp * 1000 : new Date(a.meta.date).getTime();
+                    const tB = b.meta.timestamp ? b.meta.timestamp * 1000 : new Date(b.meta.date).getTime();
+                    return tB - tA;
+                })
             }));
     }, [matches]);
 
@@ -179,6 +184,7 @@ const DailyGamesList = ({ matches, onSelectMatch, playersConfig }) => {
                         displaySquad = players.map(p => ({ ...p, isGuest: false }));
                     }
 
+                const matchTimeMs = meta.timestamp ? meta.timestamp * 1000 : new Date(meta.date).getTime();
                     const partyColors = {};
                     let colorIndex = 0;
                     myPartyIds.forEach(pId => { partyColors[pId] = getPartyColor(pId, colorIndex++); });
@@ -199,7 +205,7 @@ const DailyGamesList = ({ matches, onSelectMatch, playersConfig }) => {
                                         <span className="text-gray-400 font-mono text-[10px] shrink-0">{meta.matchScore}</span>
                                     </div>
                                     <div className="flex lg:hidden items-center gap-1 text-gray-500 text-[10px] font-bold">
-                                        <Clock size={10} /> {formatMatchTime(meta.date)}
+                                    <Clock size={10} /> {formatMatchTime(matchTimeMs)}
                                     </div>
                                 </div>
 
@@ -210,7 +216,7 @@ const DailyGamesList = ({ matches, onSelectMatch, playersConfig }) => {
                                 </div>
 
                                 <div className="hidden lg:flex items-center gap-2 text-gray-600 group-hover:text-white transition-colors ml-auto shrink-0 pl-2">
-                                    <span className="text-[10px] font-bold"><Clock size={12} className="inline mr-1 mb-0.5" />{formatMatchTime(meta.date)}</span>
+                                <span className="text-[10px] font-bold"><Clock size={12} className="inline mr-1 mb-0.5" />{formatMatchTime(matchTimeMs)}</span>
                                     <ChevronRight size={18} />
                                 </div>
                             </div>
@@ -465,7 +471,10 @@ export const RushDashboard = ({ matches, filteredData, selectedPlayerId, players
 
     const MVPBanner = ({ matches }) => {
         const today = new Date().toLocaleDateString();
-        const todaysMatches = matches.filter(m => new Date(m.date).toLocaleDateString() === today && m.type === 'ranked');
+        const todaysMatches = matches.filter(m => {
+            const matchTimeMs = m.timestamp ? m.timestamp * 1000 : new Date(m.date).getTime();
+            return new Date(matchTimeMs).toLocaleDateString() === today && m.type === 'ranked';
+        });
         if (todaysMatches.length === 0) return null;
         const stats = {};
         todaysMatches.forEach(m => {
@@ -507,7 +516,10 @@ export const RushDashboard = ({ matches, filteredData, selectedPlayerId, players
         const handleNextDay = () => { const newDate = new Date(selectedDate); newDate.setDate(selectedDate.getDate() + 1); if (newDate <= new Date()) setSelectedDate(newDate); };
         const isToday = selectedDate.toLocaleDateString() === new Date().toLocaleDateString();
         const dateStr = selectedDate.toLocaleDateString();
-        const dailyMatches = matches.filter(m => new Date(m.date).toLocaleDateString() === dateStr && m.type === 'ranked');
+        const dailyMatches = matches.filter(m => {
+            const matchTimeMs = m.timestamp ? m.timestamp * 1000 : new Date(m.date).getTime();
+            return new Date(matchTimeMs).toLocaleDateString() === dateStr && m.type === 'ranked';
+        });
         const statsByPlayer = {};
         if (dailyMatches.length > 0) {
             dailyMatches.forEach(m => {

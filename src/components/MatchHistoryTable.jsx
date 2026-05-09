@@ -49,21 +49,8 @@ export const MatchHistoryTable = ({ matches, onSelectMatch, mode = 'full', playe
 
                     const kd = match.kd !== undefined ? match.kd : (deaths > 0 ? (kills / deaths).toFixed(2) : kills);
 
-                    let isMatchMVP = match.isMatchMVP;
-                    let isTeamMVP = match.isTeamMVP;
                     const isMatchMVP = match.isMatchMVP;
                     const isTeamMVP = match.isTeamMVP;
-
-                    if (isMatchMVP === undefined && match.allPlayers && match.score > 0) {
-                        const allScores = match.allPlayers.map(p => p.stats?.score || 0);
-                        const maxScore = Math.max(...allScores);
-                        isMatchMVP = match.score >= maxScore;
-                        if (!isMatchMVP && match.myTeam) {
-                            const teamScores = match.allPlayers.filter(p => p.team === match.myTeam).map(p => p.stats?.score || 0);
-                            const maxTeamScore = Math.max(...teamScores);
-                            isTeamMVP = match.score >= maxTeamScore;
-                        }
-                    }
 
                     const isWin = match.result === 'WIN';
                     const isDraw = match.result === 'DRAW';

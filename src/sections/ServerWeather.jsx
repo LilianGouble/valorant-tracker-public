@@ -23,7 +23,8 @@ export const ServerWeather = ({ matches, playersConfig }) => {
         const dailyRankedMatches = matches.filter(m => {
             if (m.type !== 'ranked') return false;
             if (!m.matchScore) return false;
-            return new Date(m.date).toLocaleDateString() === dateStr;
+            const matchTimeMs = m.timestamp ? m.timestamp * 1000 : new Date(m.date).getTime();
+            return new Date(matchTimeMs).toLocaleDateString() === dateStr;
         });
 
         const uniqueGames = {};

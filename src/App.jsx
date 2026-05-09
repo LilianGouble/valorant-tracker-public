@@ -346,101 +346,31 @@ function MainApp() {
           ) : (
             <Suspense fallback={<SkeletonLoader />}>
             <AnimatePresence mode="wait">
-              {activeTab === 'rush' && (
-                <motion.div key="rush" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <RushDashboard matches={globalFilteredMatches} filteredData={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} onSelectMatch={setSelectedMatch} />
-                </motion.div>
-              )}
-              {activeTab === 'wrapup' && (
-                <motion.div key="wrapup" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <SeasonWrapUp matches={globalFilteredMatches} playersConfig={playersConfig} />
-                </motion.div>
-              )}
-              {activeTab === 'skirmish' && (
-                <motion.div key="skirmish" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <SkirmishAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'deathmatch' && (
-                <motion.div key="dm" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <DeathmatchAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />
-                </motion.div>
-              )}
-              {activeTab === 'tdm' && (
-                <motion.div key="tdm" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <TDMChallenge matches={globalFilteredMatches} playersConfig={playersConfig} />
-                </motion.div>
-              )}
-              {activeTab === 'tournaments' && (
-                <motion.div key="tournaments" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <Tournaments />
-                </motion.div>
-              )}
-              {activeTab === 'leaderboard' && (
-                <motion.div key="lead" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <Leaderboard matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'agents' && (
-                <motion.div key="agents" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <AgentAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />
-                </motion.div>
-              )}
-              {activeTab === 'arsenal' && (
-                <motion.div key="arsenal" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <Arsenal matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'maps' && (
-                <motion.div key="maps" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <MapAnalysis matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'nemesis' && (
-                <motion.div key="nemesis" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <Nemesis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />
-                </motion.div>
-              )}
-              {activeTab === 'synergy' && (
-                <motion.div key="synergy" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <SynergyAnalysis matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'shame' && (
-                <motion.div key="shame" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <HallOfFameAndShame matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'versus' && (
-                <motion.div key="vs" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <VersusMode matches={globalFilteredMatches} players={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'weather' && (
-                <motion.div key="weather" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <ServerWeather matches={globalFilteredMatches} playersConfig={playersConfig} />
-                </motion.div>
-              )}
-              {activeTab === 'roles' && (
-                <motion.div key="roles" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <RoleAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'matrix' && (
-                <motion.div key="matrix" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <PlaystyleMatrix matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'eco' && (
-                <motion.div key="eco" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <EcoRating matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
-              {activeTab === 'spells' && (
-                <motion.div key="spells" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
-                  <Spellcaster matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
-                </motion.div>
-              )}
+              <motion.div key={activeTab} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
+                {
+                  {
+                    'rush': <RushDashboard matches={globalFilteredMatches} filteredData={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} onSelectMatch={setSelectedMatch} />,
+                    'wrapup': <SeasonWrapUp matches={globalFilteredMatches} playersConfig={playersConfig} />,
+                    'skirmish': <SkirmishAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'deathmatch': <DeathmatchAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />,
+                    'tdm': <TDMChallenge matches={globalFilteredMatches} playersConfig={playersConfig} />,
+                    'tournaments': <Tournaments />,
+                    'leaderboard': <Leaderboard matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'agents': <AgentAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />,
+                    'arsenal': <Arsenal matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'maps': <MapAnalysis matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'nemesis': <Nemesis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />,
+                    'synergy': <SynergyAnalysis matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'shame': <HallOfFameAndShame matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'versus': <VersusMode matches={globalFilteredMatches} players={playersConfig} challengeStartDate={null} />,
+                    'weather': <ServerWeather matches={globalFilteredMatches} playersConfig={playersConfig} />,
+                    'roles': <RoleAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'matrix': <PlaystyleMatrix matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'eco': <EcoRating matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />,
+                    'spells': <Spellcaster matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={null} />
+                  }[activeTab]
+                }
+              </motion.div>
             </AnimatePresence>
             </Suspense>
           )}

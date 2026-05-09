@@ -242,6 +242,21 @@ const MAP_SPLASHES = {
     abyss: "https://media.valorant-api.com/maps/224b0a95-48b9-f703-1e9d-1ca6761376f5/splash.png"
 };
 
+// Remplacez les valeurs ci-dessous par vos balises d'émojis Discord (format <:nom:ID> ou de simples émojis natifs)
+// Émojis natifs "universels" par défaut (ne nécessitent aucun import côté serveur).
+const RANK_EMOJIS = {
+    'UNRATED': '❔',
+    'IRON 1': '<:IR1:1501226611284906026>', 'IRON 2': 'I2', 'IRON 3': 'I3',
+    'BRONZE 1': 'B1', 'BRONZE 2': 'B2', 'BRONZE 3': 'B3',
+    'SILVER 1': 'S1', 'SILVER 2': 'S2', 'SILVER 3': 'S3',
+    'GOLD 1': 'G1', 'GOLD 2': 'G2', 'GOLD 3': 'G3',
+    'PLATINUM 1': '<:PL1:1501227322529808656>', 'PLATINUM 2': '<:PL2:1501227372152619160>', 'PLATINUM 3': '<:PL3:1501227471897366754>',
+    'DIAMOND 1': '<:DI1:1501227521117782016>', 'DIAMOND 2': '<:DI2:1501227562360377465>', 'DIAMOND 3': '<:DI3:1501227605393801216>',
+    'ASCENDANT 1': '<:AS1:1501227688738951328>', 'ASCENDANT 2': '<:AS2:1501227728555216957>', 'ASCENDANT 3': '<:AS3:1501227757525405807>',
+    'IMMORTAL 1': '<:IM1:1501226021385666760>', 'IMMORTAL 2': '<:IM2:1501226084732108991>', 'IMMORTAL 3': '<:IM3:1501226484592021685>',
+    'RADIANT': '<:RA:1501227811103572059>'
+};
+
 // ==========================================
 // BOT DISCORD : CRÉATION DU MESSAGE MATCH
 // ==========================================
@@ -280,7 +295,8 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
 
     const shortRank = (rankStr) => {
         if (!rankStr) return '';
-        const r = rankStr.toUpperCase();
+        const r = rankStr.toUpperCase().trim();
+        if (RANK_EMOJIS[r]) return RANK_EMOJIS[r];
         if (r.includes('IRON'))       return 'I'  + r.replace(/[^0-9]/g, '');
         if (r.includes('BRONZE'))     return 'B'  + r.replace(/[^0-9]/g, '');
         if (r.includes('SILVER'))     return 'S'  + r.replace(/[^0-9]/g, '');
@@ -294,7 +310,7 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
         return '';
     };
 
-    const MEDALS = ['🥇', '🥈', '🥉', '4.', '5.'];
+    const MEDALS = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
     const formatLine = (p, idx) => {
         const cfg     = findCfgByPuuid(allConfigPlayers, p.puuid);
         const tracked = cfg ? playersInMatch.find(t => t.playerId === cfg.id) : null;
@@ -302,7 +318,7 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
         const inParty = !cfg && p.party_id && trackedPartyIds.has(p.party_id);
         const name    = p.name?.trim() || p.character || '—';
 
-        const pos     = MEDALS[idx] ?? `${idx + 1}.`;
+        let pos       = MEDALS[idx] ?? String(idx + 1 + '.').padEnd(3, ' ');
         const nameStr = cfg ? `**${name}**` : (inParty ? `*${name}*` : name);
         const agent   = p.character || '?';
         const k = p.stats?.kills   || 0;
@@ -311,14 +327,22 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
         const acs = Math.round((p.stats?.score || 0) / rounds);
         const rank = shortRank(p.currenttier_patched);
 
-        const parts = [`${pos} ${nameStr}`, agent, `\`${k}/${d}/${a}\``, `${acs} ACS`];
+        const kdaStr = `\`${String(k).padStart(2, ' ')}/${String(d).padStart(2, ' ')}/${String(a).padStart(2, ' ')}\``;
+        const acsStr = `\`${String(acs).padStart(3, ' ')} ACS\``;
+
+        const parts = [];
         if (tracked?.rrChange !== undefined) {
             const sign = tracked.rrChange > 0 ? '+' : '';
             parts.push(`**${sign}${tracked.rrChange} RR**`);
         }
-        if (rank) parts.push(rank);
-        if (isMvp) parts.push('👑');
-        return parts.join(' · ');
+
+        const rankDisplay = rank ? `${rank} ` : '';
+        const teamIndicator = view === 'global' ? (p.team === 'Blue' ? '🟦 ' : (p.team === 'Red' ? '🟥 ' : '')) : '';
+        let line = `${pos} ${teamIndicator}${rankDisplay}${kdaStr} ${acsStr} · ${nameStr} (${agent})${isMvp ? ' 👑' : ''}`;
+        if (parts.length > 0) {
+            line += ` · ${parts.join(' · ')}`;
+        }
+        return line;
     };
 
     const formatTeam = (team) => team.map((p, i) => formatLine(p, i)).join('\n');
@@ -340,8 +364,9 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
     }
 
     const blueWin   = blueScore > redScore;
-    const blueLabel = `🟦 **ÉQUIPE BLEUE** — ${blueScore} rounds${blueWin ? ' ✅' : ''}`;
-    const redLabel  = `🟥 **ÉQUIPE ROUGE** — ${redScore} rounds${!blueWin && blueScore !== redScore ? ' ✅' : ''}`;
+    const globalLabel = `__🌐 **SCOREBOARD GLOBAL** — ${blueScore} à ${redScore}__`;
+    const blueLabel = `__🟦 **ÉQUIPE BLEUE** — ${blueScore} rounds${blueWin ? ' ✅' : ''}__`;
+    const redLabel  = `__🟥 **ÉQUIPE ROUGE** — ${redScore} rounds${!blueWin && blueScore !== redScore ? ' ✅' : ''}__`;
 
     // Récupération des joueurs trackés pour les mentionner
     const trackedConfigs = [];
@@ -352,16 +377,16 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
     const mentionsText = trackedConfigs.map(c => c.discord_id ? `<@${c.discord_id}>` : `**${c.name}**`).join(' · ');
     const mentionsPrefix = mentionsText ? `👥 ${mentionsText}\n\n` : '';
 
+    const headerDesc = `${mentionsPrefix}**Score : ${baseMatch.matchScore}** · Classé · ${rounds} rounds\n\n`;
+
     if (view === 'global') {
-        let desc = `${mentionsPrefix}**Score : ${baseMatch.matchScore}** · Classé · ${rounds} rounds\n\n`;
-        desc += `${blueLabel}\n${formatTeam(blueTeam)}\n\n`;
-        desc += `${redLabel}\n${formatTeam(redTeam)}`;
+        let desc = `${headerDesc}${globalLabel}\n${formatTeam(globalSorted)}`;
         if (desc.length > 4096) desc = desc.substring(0, 4090) + '\n...';
         embed.setDescription(desc);
     } else if (view === 'blue') {
-        embed.setDescription(`${mentionsPrefix}${blueLabel}\n${formatTeam(blueTeam)}`);
+        embed.setDescription(`${headerDesc}${blueLabel}\n${formatTeam(blueTeam)}`);
     } else if (view === 'red') {
-        embed.setDescription(`${mentionsPrefix}${redLabel}\n${formatTeam(redTeam)}`);
+        embed.setDescription(`${headerDesc}${redLabel}\n${formatTeam(redTeam)}`);
     }
 
     const row = new ActionRowBuilder().addComponents(
@@ -403,17 +428,21 @@ const buildClassementMessage = async (category, allConfigPlayers, startTs, start
     let title = ''; let color = 0xffd700; let mapFn;
 
     if (category === 'rr') {
-        title = '🏆 Classement — Rank Rating (RR)'; activePlayers.sort((a, b) => b.rankValue - a.rankValue || b.rrTotal - a.rrTotal); mapFn = p => `> **${p.rrTotal > 0 ? '+' : ''}${p.rrTotal} RR** • ${p.currentRank}`;
+        title = '🏆 Classement — Rank Rating (RR)'; activePlayers.sort((a, b) => b.rankValue - a.rankValue || b.rrTotal - a.rrTotal); mapFn = p => `${RANK_EMOJIS[p.currentRank?.toUpperCase()] || p.currentRank} \`${(p.rrTotal > 0 ? '+' : '') + String(p.rrTotal).padStart(3, ' ')} RR\` · **${p.name}**`;
     } else if (category === 'hs') {
-        title = '🎯 Classement — Headshot %'; color = 0xef4444; activePlayers.sort((a, b) => b.hsPct - a.hsPct); mapFn = p => `> **${p.hsPct}% HS** • ${p.games} parties`;
+        title = '🎯 Classement — Headshot %'; color = 0xef4444; activePlayers.sort((a, b) => b.hsPct - a.hsPct); mapFn = p => `🎯 \`${String(p.hsPct).padStart(3, ' ')}% HS\` · **${p.name}** (${p.games} parties)`;
     } else if (category === 'winrate') {
-        title = '📈 Classement — Winrate'; color = 0x10b981; activePlayers.sort((a, b) => b.winrate - a.winrate || b.games - a.games); mapFn = p => `> **${p.winrate}% Winrate** • ${p.wins}W - ${p.games - p.wins}L`;
+        title = '📈 Classement — Winrate'; color = 0x10b981; activePlayers.sort((a, b) => b.winrate - a.winrate || b.games - a.games); mapFn = p => `🏆 \`${String(p.winrate).padStart(3, ' ')}% WR\` · **${p.name}** (${p.wins}W - ${p.games - p.wins}L)`;
     } else if (category === 'games') {
-        title = '🕹️ Classement — Parties Jouées'; color = 0x3b82f6; activePlayers.sort((a, b) => b.games - a.games); mapFn = p => `> **${p.games} parties** • Joueur très actif`;
+        title = '🕹️ Classement — Parties Jouées'; color = 0x3b82f6; activePlayers.sort((a, b) => b.games - a.games); mapFn = p => `🕹️ \`${String(p.games).padStart(3, ' ')} GAMES\` · **${p.name}**`;
     }
 
     const medals = ['🥇', '🥈', '🥉'];
-    const lines = activePlayers.map((p, i) => `${medals[i] || `**${i + 1}.**`} **${p.name}**\n${mapFn(p)}`).join('\n\n');
+    const lines = activePlayers.map((p, i) => {
+        let pos = medals[i] ?? `${i + 1}.`;
+        if (i > 2) pos = String(pos).padEnd(3, ' ');
+        return `${pos} ${mapFn(p)}`;
+    }).join('\n');
 
     const embed = new EmbedBuilder()
         .setTitle(title)
@@ -474,7 +503,9 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
             trackedPartyId = me?.party_id || null;
         }
 
-        uniqueGames[m.id].players.push({ name: playerName, agent: m.agent || "?", rr: `${rrSign}${m.rrChange}`, kd: kd, result: m.result, acs: acs, hs: hsPct, partyId: trackedPartyId });
+        const currentRank = m.currentRank || 'Inconnu';
+        const rankEmoji = RANK_EMOJIS[currentRank.toUpperCase().trim()] || currentRank;
+        uniqueGames[m.id].players.push({ name: playerName, agent: m.agent || "?", rr: `${rrSign}${m.rrChange}`, kd: kd, result: m.result, acs: acs, hs: hsPct, partyId: trackedPartyId, rank: rankEmoji });
 
         if (playerStats[m.playerId]) {
             const p = playerStats[m.playerId];
@@ -523,10 +554,10 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
         embed.addFields({ name: `${weatherEmoji} Bilan de l'Escouade`, value: `**Météo :** ${weatherTitle}\n**Winrate :** ${globalWinrate}% (${totalWins}W - ${totalUniqueGames - totalWins}L)\n**Rentabilité :** ${totalRRDay > 0 ? '+' : ''}${totalRRDay} RR globaux`, inline: false });
 
         let fameText = "";
-        if (mvp && mvp.rrChange > 0) fameText += `👑 **MVP :** ${mvp.name} (*+${mvp.rrChange} RR*)\n`;
-        if (butcher && butcher.name !== mvp?.name) fameText += `🔪 **Boucher :** ${butcher.name} (*${(butcher.deaths > 0 ? butcher.kills/butcher.deaths : butcher.kills).toFixed(2)} K/D*)\n`;
-        if (sniper && sniper.shots > 0) fameText += `🎯 **Sniper :** ${sniper.name} (*${Math.round((sniper.headshots/sniper.shots)*100)}% HS*)\n`;
-        if (loser && loser.rrChange < 0) fameText += `🤡 **Poids Mort :** ${loser.name} (*${loser.rrChange} RR*)\n`;
+        if (mvp && mvp.rrChange > 0) fameText += `👑 \`${('+' + mvp.rrChange).padStart(4, ' ')} RR\` · **MVP :** ${mvp.name}\n`;
+        if (butcher && butcher.name !== mvp?.name) fameText += `🔪 \`${String((butcher.deaths > 0 ? butcher.kills/butcher.deaths : butcher.kills).toFixed(2)).padStart(4, ' ')} K/D\` · **Boucher :** ${butcher.name}\n`;
+        if (sniper && sniper.shots > 0) fameText += `🎯 \`${String(Math.round((sniper.headshots/sniper.shots)*100)).padStart(3, ' ')}% HS\` · **Sniper :** ${sniper.name}\n`;
+        if (loser && loser.rrChange < 0) fameText += `🤡 \`${String(loser.rrChange).padStart(4, ' ')} RR\` · **Poids Mort :** ${loser.name}\n`;
 
         embed.addFields({ name: "🏆 Tableau d'Honneur", value: fameText || "Pas de trophées marquants aujourd'hui.", inline: false });
         embed.setDescription(`*Cliquez sur le bouton ci-dessous pour voir le détail des parties de la journée.*`);
@@ -547,7 +578,9 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
             g.players.forEach(p => {
                 const rrNum = parseInt(p.rr) || 0;
                 const rrStr = rrNum > 0 ? `**+${rrNum} RR**` : (rrNum < 0 ? `**${rrNum} RR**` : `${rrNum} RR`);
-                gamesLog += `> **${p.name}** · ${p.agent} — ${rrStr} · \`${p.kd}\` K/D · ${p.acs} ACS · ${p.hs}% HS\n`;
+                const padKd = String(p.kd).padStart(4, ' ');
+                const padAcs = String(p.acs).padStart(3, ' ');
+            gamesLog += `> ${p.rank} \`${padKd} K/D\` \`${padAcs} ACS\` · **${p.name}** (${p.agent}) — ${rrStr} · ${p.hs}% HS\n`;
 
                 if (p.partyId && !partiesShown.has(p.partyId)) {
                     partiesShown.add(p.partyId);
@@ -726,6 +759,7 @@ discordClient.on('interactionCreate', async interaction => {
             const avgAcs = Math.round(acsSum / rows.length);
             const sign = rrTotal > 0 ? '+' : '';
             const color = parseInt((target.color || '#ff4655').replace('#', ''), 16) || 0xff4655;
+            const currentRankEmoji = RANK_EMOJIS[currentRank.toUpperCase()] || currentRank;
             
             const chartConfig = {
                 type: 'line',
@@ -755,7 +789,7 @@ discordClient.on('interactionCreate', async interaction => {
             const embed = new EmbedBuilder()
                 .setTitle(`📊 ${target.name} — Stats Ranked`)
                 .setColor(color)
-                .setDescription(`*${rows.length} derniers matchs • ${currentRank}*`)
+                .setDescription(`*${rows.length} derniers matchs • ${currentRankEmoji}*`)
                 .addFields(
                     { name: '🏆 W/L', value: `**${wins}W** — ${rows.length - wins}L\n${winrate}% WR`, inline: true },
                     { name: '⚔️ K/D/A', value: `**${kd}** K/D\n${Math.round(kills/rows.length)}/${Math.round(deaths/rows.length)}/${Math.round(assists/rows.length)} moy.`, inline: true },
@@ -805,7 +839,9 @@ discordClient.on('interactionCreate', async interaction => {
             if (weapons.length > 0) favWeapon = ` 🔫 ${weapons[0][0]}`;
         }
         
-        desc += `${emoji} **${(m.map || '?').toUpperCase()}** (${m.matchScore || '? - ?'})\n> \`${(m.agent || '?').padEnd(9)}\` : **${sign}${m.rrChange || 0} RR** | ${m.kills}/${m.deaths}/${m.assists} (*${m.kd} K/D*) | ${m.acs || 0} ACS${favWeapon}\n\n`;
+        const kda = `${m.kills}/${m.deaths}/${m.assists}`;
+        const rankStr = m.currentRank ? (RANK_EMOJIS[m.currentRank.toUpperCase().trim()] || m.currentRank) : '';
+        desc += `${emoji} **${(m.map || '?').toUpperCase()}** (${m.matchScore || '? - ?'})\n> ${rankStr ? rankStr + ' ' : ''}\`${kda.padStart(8, ' ')} | ${String(m.acs || 0).padStart(3, ' ')} ACS\` · **${sign}${m.rrChange || 0} RR** · ${m.agent || '?'}${favWeapon}\n\n`;
             });
             
             embed.setDescription(desc);
@@ -838,7 +874,7 @@ discordClient.on('interactionCreate', async interaction => {
     const customId = interaction.customId;
 
     if (customId.startsWith('match_')) {
-        await interaction.deferUpdate();
+        try { await interaction.deferUpdate(); } catch (e) { return; }
         const parts = customId.split('_');
         const view = parts[1];
         const matchId = parts.slice(2).join('_');
@@ -851,7 +887,7 @@ discordClient.on('interactionCreate', async interaction => {
         }
     }
     else if (customId.startsWith('class_')) {
-        await interaction.deferUpdate();
+        try { await interaction.deferUpdate(); } catch (e) { return; }
         const category = customId.split('_')[1];
         const challengeStart = await getConfig('challenge_start_date', '2024-01-01T00:00');
         const startTs = new Date(challengeStart).getTime();
@@ -861,7 +897,7 @@ discordClient.on('interactionCreate', async interaction => {
         await interaction.editReply(messagePayload);
     }
     else if (customId.startsWith('report_')) {
-        await interaction.deferUpdate();
+        try { await interaction.deferUpdate(); } catch (e) { return; }
         const parts = customId.split('_');
         const view = parts[1];
         const dateStr = parts.slice(2).join('_');
