@@ -25,3 +25,7 @@ server/database.sqlite-journal
 # Fichiers système
 .DS_Store
 Thumbs.db
+
+# Fichiers temporaires de la base de données
+*.sqlite-shm
+*.sqlite-wal
