@@ -3,8 +3,8 @@ import {
     LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer
 } from 'recharts';
 import {
-    Crown, Zap, Trophy, Calendar, ChevronLeft, ChevronRight, List, Activity,
-    Clock, Flame, Snowflake, Skull, User, Link2
+    Crown, Zap, Trophy, Calendar, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight,
+    List, Activity, Clock, Flame, Snowflake, Skull, User, Link2, RotateCcw, CalendarDays
 } from 'lucide-react';
 import { Card, MatchDetailModal } from '../components/UI';
 import { RANK_TIERS, getRankIcon } from '../config/constants';
@@ -34,6 +34,18 @@ const getRankLabel = (value) => {
 const formatMatchTime = (matchTimeMs) => {
     return new Date(matchTimeMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 };
+
+const dateKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+const dateFromKey = (k) => {
+    const [y, m, d] = k.split('-').map(Number);
+    return new Date(y, m - 1, d);
+};
+
+const FR_DAYS = ['Dimanche', 'Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi'];
+const FR_MONTHS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+const formatLongDate = (d) => `${FR_DAYS[d.getDay()]} ${d.getDate()} ${FR_MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+const formatShortDate = (d) => `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
 
 const SafeAgentImage = ({ src, alt, size = "w-8 h-8", className = "" }) => {
     if (!src) return (
@@ -91,69 +103,38 @@ const PlayerMatchBadge = ({ stats, partyColor, isGuest, playersConfig }) => {
 };
 
 // --- LISTE DES MATCHS ---
-const DailyGamesList = ({ matches, onSelectMatch, playersConfig }) => {
-    const [currentDateIndex, setCurrentDateIndex] = useState(0);
-
-    const matchesByDate = useMemo(() => {
-        const groupedByDate = {};
-        const uniqueMatchesMap = {};
-
-        matches.forEach(m => {
-            if (!uniqueMatchesMap[m.id]) uniqueMatchesMap[m.id] = { meta: m, players: [] };
-            uniqueMatchesMap[m.id].players.push(m);
+const DailyGamesList = ({ dailyMatches, onSelectMatch, playersConfig }) => {
+    const games = useMemo(() => {
+        const uniqueMap = {};
+        dailyMatches.forEach(m => {
+            if (!uniqueMap[m.id]) uniqueMap[m.id] = { meta: m, players: [] };
+            uniqueMap[m.id].players.push(m);
         });
-
-        Object.values(uniqueMatchesMap).forEach(uniqueMatch => {
-            const matchTimeMs = uniqueMatch.meta.timestamp ? uniqueMatch.meta.timestamp * 1000 : new Date(uniqueMatch.meta.date).getTime();
-            const dateObj = new Date(matchTimeMs);
-            const dateKey = dateObj.toLocaleDateString();
-            if (!groupedByDate[dateKey]) groupedByDate[dateKey] = { dateObj: dateObj, matches: [] };
-            groupedByDate[dateKey].matches.push(uniqueMatch);
+        return Object.values(uniqueMap).sort((a, b) => {
+            const tA = a.meta.timestamp ? a.meta.timestamp * 1000 : new Date(a.meta.date).getTime();
+            const tB = b.meta.timestamp ? b.meta.timestamp * 1000 : new Date(b.meta.date).getTime();
+            return tB - tA;
         });
-
-        return Object.entries(groupedByDate)
-            .sort(([, a], [, b]) => b.dateObj - a.dateObj)
-            .map(([dateString, data]) => ({
-                dateString,
-                matches: data.matches.sort((a, b) => {
-                    const tA = a.meta.timestamp ? a.meta.timestamp * 1000 : new Date(a.meta.date).getTime();
-                    const tB = b.meta.timestamp ? b.meta.timestamp * 1000 : new Date(b.meta.date).getTime();
-                    return tB - tA;
-                })
-            }));
-    }, [matches]);
-
-    const activeDateGroup = matchesByDate[currentDateIndex];
-    const handlePrevDate = () => { if (currentDateIndex < matchesByDate.length - 1) setCurrentDateIndex(currentDateIndex + 1); };
-    const handleNextDate = () => { if (currentDateIndex > 0) setCurrentDateIndex(currentDateIndex - 1); };
+    }, [dailyMatches]);
 
     const getPartyColor = (partyId, index) => {
         const colors = ['#3b82f6', '#8b5cf6', '#d946ef', '#f59e0b', '#10b981'];
         return colors[index % colors.length];
     };
 
-    if (!activeDateGroup) {
+    if (games.length === 0) {
         return (
             <div className="flex flex-col items-center justify-center h-40 bg-[#0f1923]/30 rounded-xl border border-white/5 border-dashed text-gray-500">
                 <Skull size={32} className="mb-2 opacity-20" />
-                <p className="text-sm">Aucune archive trouvée.</p>
+                <p className="text-sm">Aucune partie ce jour-là.</p>
             </div>
         );
     }
 
     return (
         <div className="bg-[#1c252e] rounded-xl border border-white/10 overflow-hidden shadow-xl min-w-0 w-full max-w-full">
-            <div className="flex items-center justify-between bg-[#0f1923] p-3 border-b border-white/5 z-10 relative">
-                <button onClick={handlePrevDate} disabled={currentDateIndex >= matchesByDate.length - 1} className="p-2 hover:bg-white/10 rounded-lg text-gray-400 disabled:opacity-20 transition-colors"><ChevronLeft size={20} /></button>
-                <div className="flex flex-col items-center">
-                    <span className="text-[10px] font-black text-gray-500 tracking-widest uppercase">ARCHIVES DU</span>
-                    <span className="text-sm sm:text-base font-black text-white italic tracking-tighter uppercase">{activeDateGroup.dateString}</span>
-                </div>
-                <button onClick={handleNextDate} disabled={currentDateIndex === 0} className="p-2 hover:bg-white/10 rounded-lg text-gray-400 disabled:opacity-20 transition-colors"><ChevronRight size={20} /></button>
-            </div>
-
             <div className="flex flex-col divide-y divide-white/5 max-h-[500px] overflow-y-auto overflow-x-hidden custom-scrollbar w-full">
-                {activeDateGroup.matches.map((game) => {
+                {games.map((game) => {
                     const { meta, players } = game;
                     const isWin = meta.result === 'WIN';
                     const myPartyIds = new Set(players.map(p => p.partyId).filter(Boolean));
@@ -417,11 +398,11 @@ const PlayerRushCard = ({ player, matches, onSelectMatch, playersConfig }) => {
 };
 
 // --- DASHBOARD GLOBAL ---
-export const RushDashboard = ({ matches, filteredData, selectedPlayerId, playersConfig, challengeStartDate }) => {
+export const RushDashboard = ({ matches, selectedPlayerId, playersConfig, challengeStartDate }) => {
     const [selectedMatch, setSelectedMatch] = useState(null);
 
     const rushStats = useMemo(() => {
-        const rankedMatches = filteredData.filter(m => m.type === 'ranked');
+        const rankedMatches = matches.filter(m => m.type === 'ranked');
         const progressionData = [];
         const gamesPerPlayer = playersConfig.map(p => rankedMatches.filter(m => m.playerId === p.id).length);
         const maxGames = gamesPerPlayer.length > 0 ? Math.max(...gamesPerPlayer) : 0;
@@ -460,7 +441,7 @@ export const RushDashboard = ({ matches, filteredData, selectedPlayerId, players
         });
 
         return { progressionData, timeGraphData, displayedMatches: rankedMatches };
-    }, [filteredData, playersConfig]);
+    }, [matches, playersConfig]);
 
     const playersToShow = selectedPlayerId === 'all' ? playersConfig : playersConfig.filter(p => p.id === selectedPlayerId);
     const matchesForWidgets = useMemo(() => {
@@ -469,15 +450,101 @@ export const RushDashboard = ({ matches, filteredData, selectedPlayerId, players
         return data.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
     }, [matches, selectedPlayerId]);
 
-    const MVPBanner = ({ matches }) => {
-        const today = new Date().toLocaleDateString();
-        const todaysMatches = matches.filter(m => {
-            const matchTimeMs = m.timestamp ? m.timestamp * 1000 : new Date(m.date).getTime();
-            return new Date(matchTimeMs).toLocaleDateString() === today && m.type === 'ranked';
+    const [selectedDate, setSelectedDate] = useState(() => new Date());
+
+    const matchesByDateKey = useMemo(() => {
+        const map = {};
+        matchesForWidgets.forEach(m => {
+            const t = m.timestamp ? m.timestamp * 1000 : new Date(m.date).getTime();
+            const k = dateKey(new Date(t));
+            if (!map[k]) map[k] = [];
+            map[k].push(m);
         });
-        if (todaysMatches.length === 0) return null;
+        return map;
+    }, [matchesForWidgets]);
+
+    const playedDateKeysDesc = useMemo(
+        () => Object.keys(matchesByDateKey).sort((a, b) => b.localeCompare(a)),
+        [matchesByDateKey]
+    );
+
+    const todayKey = dateKey(new Date());
+    const selectedKey = dateKey(selectedDate);
+    const isToday = selectedKey === todayKey;
+    const dailyMatches = matchesByDateKey[selectedKey] || [];
+    const lastPlayedKey = playedDateKeysDesc[0];
+    const hasPrevPlayed = playedDateKeysDesc.some(k => k < selectedKey);
+    const hasNextPlayed = playedDateKeysDesc.some(k => k > selectedKey);
+
+    const handlePrevDay = () => {
+        const d = new Date(selectedDate);
+        d.setDate(d.getDate() - 1);
+        setSelectedDate(d);
+    };
+    const handleNextDay = () => {
+        if (isToday) return;
+        const d = new Date(selectedDate);
+        d.setDate(d.getDate() + 1);
+        setSelectedDate(d);
+    };
+    const handlePrevPlayedDay = () => {
+        const k = playedDateKeysDesc.find(x => x < selectedKey);
+        if (k) setSelectedDate(dateFromKey(k));
+    };
+    const handleNextPlayedDay = () => {
+        const newer = playedDateKeysDesc.filter(x => x > selectedKey);
+        const k = newer[newer.length - 1]; // smallest key greater than selectedKey
+        if (k) setSelectedDate(dateFromKey(k));
+    };
+    const handleToday = () => setSelectedDate(new Date());
+    const handleLastPlayed = () => { if (lastPlayedKey) setSelectedDate(dateFromKey(lastPlayedKey)); };
+
+    const DayNavigator = () => (
+        <div className="bg-gradient-to-r from-blue-900/40 to-[#0f1923] border border-white/5 border-l-4 border-l-blue-500 rounded-xl p-3 sm:p-4 shadow-lg">
+            <div className="flex items-center justify-between gap-1 sm:gap-2">
+                <button onClick={handlePrevPlayedDay} disabled={!hasPrevPlayed} title="Jour précédent avec parties" className="p-1.5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition-colors disabled:opacity-20 disabled:cursor-not-allowed">
+                    <ChevronsLeft size={18} />
+                </button>
+                <button onClick={handlePrevDay} title="Jour précédent" className="p-1.5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition-colors">
+                    <ChevronLeft size={20} />
+                </button>
+                <div className="flex flex-col items-center text-center px-1 sm:px-2 min-w-0 flex-grow">
+                    <span className="text-[9px] sm:text-[10px] font-black text-blue-300/80 tracking-widest uppercase flex items-center gap-1">
+                        <CalendarDays size={11} /> {isToday ? "AUJOURD'HUI" : 'JOURNÉE'}
+                    </span>
+                    <span className="text-xs sm:text-base font-black text-white italic tracking-tighter uppercase truncate w-full">
+                        <span className="hidden sm:inline">{formatLongDate(selectedDate)}</span>
+                        <span className="sm:hidden">{formatShortDate(selectedDate)}</span>
+                    </span>
+                </div>
+                <button onClick={handleNextDay} disabled={isToday} title="Jour suivant" className="p-1.5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition-colors disabled:opacity-20 disabled:cursor-not-allowed">
+                    <ChevronRight size={20} />
+                </button>
+                <button onClick={handleNextPlayedDay} disabled={!hasNextPlayed} title="Jour suivant avec parties" className="p-1.5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition-colors disabled:opacity-20 disabled:cursor-not-allowed">
+                    <ChevronsRight size={18} />
+                </button>
+            </div>
+            {(!isToday || (lastPlayedKey && lastPlayedKey !== selectedKey)) && (
+                <div className="flex items-center justify-center gap-2 mt-2 pt-2 border-t border-white/5">
+                    {!isToday && (
+                        <button onClick={handleToday} className="text-[10px] sm:text-xs font-bold px-3 py-1 bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 rounded-full transition-colors flex items-center gap-1">
+                            <RotateCcw size={11} /> AUJOURD'HUI
+                        </button>
+                    )}
+                    {lastPlayedKey && lastPlayedKey !== selectedKey && (
+                        <button onClick={handleLastPlayed} className="text-[10px] sm:text-xs font-bold px-3 py-1 bg-white/5 hover:bg-white/10 text-gray-300 rounded-full transition-colors">
+                            Dernière partie
+                        </button>
+                    )}
+                </div>
+            )}
+        </div>
+    );
+
+    const MVPBanner = () => {
+        if (dailyMatches.length === 0) return null;
         const stats = {};
-        todaysMatches.forEach(m => {
+        dailyMatches.forEach(m => {
             if (!stats[m.playerId]) stats[m.playerId] = { id: m.playerId, rr: 0, kills: 0, deaths: 0 };
             stats[m.playerId].rr += m.rrChange;
             stats[m.playerId].kills += m.kills;
@@ -489,8 +556,13 @@ export const RushDashboard = ({ matches, filteredData, selectedPlayerId, players
         const player = playersConfig.find(p => p.id === mvpId);
         if (!player) return null;
 
+        const dayLabel = isToday ? 'MVP DU JOUR' : `MVP DU ${formatShortDate(selectedDate)}`;
+        const sentence = isToday
+            ? <>Une performance monstrueuse avec <span className="text-green-400 font-bold">+{mvpStats.rr} RR</span> aujourd'hui !</>
+            : <>Une performance monstrueuse avec <span className="text-green-400 font-bold">+{mvpStats.rr} RR</span> ce jour-là !</>;
+
         return (
-            <div className="mb-6 relative overflow-hidden rounded-xl bg-gradient-to-r from-yellow-600/20 via-yellow-500/10 to-transparent border border-yellow-500/30 shadow-[0_0_20px_rgba(234,179,8,0.1)] p-4 sm:p-6 flex flex-col sm:flex-row items-start sm:items-center justify-between animate-in slide-in-from-top duration-700 min-w-0">
+            <div className="relative overflow-hidden rounded-xl bg-gradient-to-r from-yellow-600/20 via-yellow-500/10 to-transparent border border-yellow-500/30 shadow-[0_0_20px_rgba(234,179,8,0.1)] p-4 sm:p-6 flex flex-col sm:flex-row items-start sm:items-center justify-between animate-in slide-in-from-top duration-700 min-w-0">
                 <div className="relative z-10 flex items-center gap-3 sm:gap-4 w-full min-w-0">
                     <div className="relative shrink-0">
                         <div className="absolute -inset-1 bg-yellow-500/50 rounded-full blur-lg animate-pulse"></div>
@@ -499,9 +571,9 @@ export const RushDashboard = ({ matches, filteredData, selectedPlayerId, players
                         </div>
                     </div>
                     <div className="flex flex-col min-w-0">
-                        <h4 className="text-yellow-500 font-black tracking-widest text-[9px] sm:text-[10px] uppercase mb-0.5 flex items-center gap-1.5"><Zap size={10} /> MVP DU JOUR</h4>
+                        <h4 className="text-yellow-500 font-black tracking-widest text-[9px] sm:text-[10px] uppercase mb-0.5 flex items-center gap-1.5"><Zap size={10} /> {dayLabel}</h4>
                         <h2 className="text-lg sm:text-xl font-black text-white italic tracking-tighter uppercase drop-shadow-sm leading-none truncate">{player.name}</h2>
-                        <p className="text-[10px] sm:text-xs text-gray-300 font-medium mt-1 truncate">Une performance monstrueuse avec <span className="text-green-400 font-bold">+{mvpStats.rr} RR</span> aujourd'hui !</p>
+                        <p className="text-[10px] sm:text-xs text-gray-300 font-medium mt-1 truncate">{sentence}</p>
                     </div>
                 </div>
                 <div className="absolute right-0 top-0 h-full w-1/3 bg-gradient-to-l from-yellow-500/10 to-transparent pointer-events-none"></div>
@@ -510,34 +582,23 @@ export const RushDashboard = ({ matches, filteredData, selectedPlayerId, players
         );
     };
 
-    const DailyReportWidget = ({ matches }) => {
-        const [selectedDate, setSelectedDate] = useState(new Date());
-        const handlePrevDay = () => { const newDate = new Date(selectedDate); newDate.setDate(selectedDate.getDate() - 1); setSelectedDate(newDate); };
-        const handleNextDay = () => { const newDate = new Date(selectedDate); newDate.setDate(selectedDate.getDate() + 1); if (newDate <= new Date()) setSelectedDate(newDate); };
-        const isToday = selectedDate.toLocaleDateString() === new Date().toLocaleDateString();
-        const dateStr = selectedDate.toLocaleDateString();
-        const dailyMatches = matches.filter(m => {
-            const matchTimeMs = m.timestamp ? m.timestamp * 1000 : new Date(m.date).getTime();
-            return new Date(matchTimeMs).toLocaleDateString() === dateStr && m.type === 'ranked';
-        });
+    const DailyReportWidget = () => {
         const statsByPlayer = {};
-        if (dailyMatches.length > 0) {
-            dailyMatches.forEach(m => {
-                if (!statsByPlayer[m.playerId]) { statsByPlayer[m.playerId] = { wins: 0, losses: 0, rr: 0, name: playersConfig.find(p => p.id === m.playerId)?.name || '' }; }
-                if (m.result === 'WIN') statsByPlayer[m.playerId].wins++; else statsByPlayer[m.playerId].losses++;
-                statsByPlayer[m.playerId].rr += m.rrChange;
-            });
-        }
+        dailyMatches.forEach(m => {
+            if (!statsByPlayer[m.playerId]) {
+                statsByPlayer[m.playerId] = { wins: 0, losses: 0, rr: 0, name: playersConfig.find(p => p.id === m.playerId)?.name || '' };
+            }
+            if (m.result === 'WIN') statsByPlayer[m.playerId].wins++; else statsByPlayer[m.playerId].losses++;
+            statsByPlayer[m.playerId].rr += m.rrChange;
+        });
         return (
-            <Card className="p-4 bg-gradient-to-r from-blue-900/40 to-[#0f1923] border-l-4 border-l-blue-500 mb-6 min-w-0">
-                <div className="flex justify-between items-center mb-4 border-b border-white/5 pb-2">
-                    <h3 className="font-black text-gray-200 flex items-center gap-2 tracking-wide text-xs sm:text-sm"><Calendar size={16} className="text-blue-400" /> RAPPORT <span className="hidden sm:inline">JOURNALIER</span> : <span className="text-white">{dateStr}</span></h3>
-                    <div className="flex items-center gap-1 bg-black/20 rounded p-1">
-                        <button onClick={handlePrevDay} className="p-1 hover:bg-white/10 rounded text-gray-400 hover:text-white transition-colors"><ChevronLeft size={16} /></button>
-                        <button onClick={handleNextDay} disabled={isToday} className={`p-1 rounded text-gray-400 transition-colors ${isToday ? 'opacity-30 cursor-not-allowed' : 'hover:bg-white/10 hover:text-white'}`}><ChevronRight size={16} /></button>
-                    </div>
-                </div>
-                {dailyMatches.length === 0 ? (<div className="text-center py-6 text-gray-500 italic text-xs sm:text-sm">Aucune session Ranked enregistrée pour cette date.</div>) : (
+            <Card className="p-4 bg-gradient-to-r from-blue-900/40 to-[#0f1923] border-l-4 border-l-blue-500 min-w-0">
+                <h3 className="font-black text-gray-200 flex items-center gap-2 tracking-wide text-xs sm:text-sm border-b border-white/5 pb-2 mb-3">
+                    <Calendar size={16} className="text-blue-400" /> RAPPORT JOURNALIER
+                </h3>
+                {dailyMatches.length === 0 ? (
+                    <div className="text-center py-6 text-gray-500 italic text-xs sm:text-sm">Aucune session Ranked ce jour-là.</div>
+                ) : (
                     <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2 sm:gap-3">
                         {Object.values(statsByPlayer).map((stat, idx) => (
                             <div key={idx} className="flex justify-between items-center bg-[#0f1923] p-2 sm:p-3 rounded border border-white/5 hover:border-white/10 transition-colors min-w-0">
@@ -590,16 +651,19 @@ export const RushDashboard = ({ matches, filteredData, selectedPlayerId, players
         <div className="space-y-6 sm:space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 w-full min-w-0">
             {selectedMatch && <MatchDetailModal match={selectedMatch} playersConfig={playersConfig} onClose={() => setSelectedMatch(null)} />}
 
-            <MVPBanner matches={matchesForWidgets} />
-            <DailyReportWidget matches={matchesForWidgets} />
+            <MVPBanner />
+
+            <DayNavigator />
+
+            <DailyReportWidget />
 
             <div className="mb-8 sm:mb-10 w-full min-w-0">
                 <div className="flex items-center justify-between border-b-2 border-white/10 pb-2 mb-4 sm:mb-6">
                     <h2 className="text-lg sm:text-2xl font-black text-white italic tracking-tighter uppercase flex items-center gap-2 sm:gap-3">
-                        <List className="text-blue-400 w-5 h-5 sm:w-6 sm:h-6" /> JOURNAL DE BORD <span className="hidden sm:inline">(PAR JOUR)</span>
+                        <List className="text-blue-400 w-5 h-5 sm:w-6 sm:h-6" /> JOURNAL DE BORD
                     </h2>
                 </div>
-                <DailyGamesList matches={matchesForWidgets} onSelectMatch={setSelectedMatch} playersConfig={playersConfig} />
+                <DailyGamesList dailyMatches={dailyMatches} onSelectMatch={setSelectedMatch} playersConfig={playersConfig} />
             </div>
 
             {selectedPlayerId === 'all' && (

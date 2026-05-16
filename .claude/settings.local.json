@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx eslint *)",
+      "Bash(npx vite *)",
+      "WebFetch(domain:docs.henrikdev.xyz)",
+      "WebFetch(domain:api.henrikdev.xyz)",
+      "WebFetch(domain:github.com)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/Henrik-3/unofficial-valorant-api/main/openapi.json\")",
+      "Bash(curl -s \"https://api.henrikdev.xyz/docs/openapi.json\" -o /tmp/henrik.json -w \"%{http_code}\\\\n\")",
+      "Bash(curl -s \"https://api.henrikdev.xyz/docs/swagger.json\" -o /tmp/henrik2.json -w \"%{http_code}\\\\n\")",
+      "Bash(curl -sI \"https://api.henrikdev.xyz/docs\")",
+      "Bash(curl -sL \"https://api.henrikdev.xyz/docs/\" -o /tmp/docs.html -w \"%{http_code}\\\\n\")",
+      "Read(//tmp/**)",
+      "Bash(curl -sL \"https://api.henrikdev.xyz/docs/swagger-initializer.js\")",
+      "Bash(curl -sL \"https://api.henrikdev.xyz/openapi.json\" -o /tmp/openapi.json -w \"%{http_code}\\\\n\")",
+      "Bash(python -c ' *)",
+      "Bash(node -e ' *)",
+      "Bash(curl -sL \"https://api.henrikdev.xyz/openapi.json\" -o openapi_henrik.json -w \"%{http_code}\\\\n\")",
+      "Bash(rm openapi_henrik.json /tmp/docs.html /tmp/openapi.json /tmp/henrik.json /tmp/henrik2.json 2>/dev/null; ls openapi_henrik.json 2>&1)",
+      "Bash(node --check server/server.js)",
+      "Bash(node --input-type=module --eval \"import './server/server.js'\")"
+    ],
+    "additionalDirectories": [
+      "\\tmp"
+    ]
+  }
+}
