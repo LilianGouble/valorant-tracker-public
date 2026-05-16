@@ -336,7 +336,7 @@ export const AdminPanel = () => {
                     <form onSubmit={handlePasswordChange} className="space-y-4">
                         <div>
                             <label className="text-xs text-gray-400 font-bold uppercase block mb-1">Nouveau mot de passe</label>
-                            <input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)} minLength={6} className="w-full bg-[#0f1923] text-white p-3 rounded border border-white/10 outline-none focus:border-red-500" required />
+                            <input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)} minLength={10} placeholder="10 caractères minimum" className="w-full bg-[#0f1923] text-white p-3 rounded border border-white/10 outline-none focus:border-red-500" required />
                         </div>
                         <button type="submit" className="w-full bg-emerald-500 hover:bg-emerald-600 text-white font-black py-3 rounded uppercase tracking-wider transition-colors">
                             Valider et continuer

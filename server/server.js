@@ -22,20 +22,43 @@ const PORT = 3001;
 const DB_FILE = path.join(__dirname, 'database.sqlite');
 const API_BASE = "https://api.henrikdev.xyz/valorant";
 
-app.use(cors());
+// CORS : liste blanche dynamique (localhost dev + app_url configuré).
+// Rechargée au démarrage et après chaque édition admin (refreshAllowedOrigins).
+let allowedOrigins = [];
+const LOCALHOST_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+app.use(cors({
+    origin: (origin, callback) => {
+        // Pas d'origin (same-origin, curl, server-to-server) → autorisé
+        if (!origin) return callback(null, true);
+        if (LOCALHOST_RE.test(origin)) return callback(null, true);
+        if (allowedOrigins.includes(origin)) return callback(null, true);
+        callback(new Error('CORS: origin non autorisée'));
+    }
+}));
 // gzip pour toutes les réponses > 1KB ; gain énorme sur /history (JSON volumineux)
 app.use(compression({ level: 6, threshold: 1024 }));
-app.use(bodyParser.json({ limit: '10mb' }));
+// 2mb suffit largement (payload Riot ~50KB, ajouts admin ~quelques KB).
+app.use(bodyParser.json({ limit: '2mb' }));
 
 let db;
 
+const refreshAllowedOrigins = async () => {
+    try {
+        const appUrl = await getConfig('app_url', '');
+        if (appUrl) {
+            const clean = appUrl.replace(/\/$/, '');
+            allowedOrigins = [clean];
+        } else {
+            allowedOrigins = [];
+        }
+    } catch (e) { void e; allowedOrigins = []; }
+};
+
 // --- INITIALISATION DU CLIENT DISCORD ---
+// Seul l'intent Guilds est nécessaire pour les slash commands + interactions.
+// MessageContent retiré (commandes préfixées !stats/!ping supprimées).
 const discordClient = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent 
-    ]
+    intents: [GatewayIntentBits.Guilds]
 });
 
 // --- INITIALISATION DE LA BASE DE DONNÉES ---
@@ -175,7 +198,9 @@ const discordClient = new Client({
     await db.run("INSERT OR IGNORE INTO config (key, value) VALUES ('challenge_start_date', '2024-01-01T00:00')");
 
     console.log("✅ Connecté à la base SQLite & Initialisation terminée.");
-    
+
+    await refreshAllowedOrigins();
+
     const botToken = await getConfig('discord_bot_token');
     if (botToken && botToken.trim() !== '') {
         discordClient.login(botToken).then(() => {
@@ -194,8 +219,39 @@ const getConfig = async (key, defaultVal = '') => {
     const row = await db.get("SELECT value FROM config WHERE key = ?", [key]);
     return row ? row.value : defaultVal;
 };
-const getPlayers = async () => await db.all("SELECT * FROM players");
+const getPlayers = async () => await db.all("SELECT id, name, tag, region, color, puuid, discord_id FROM players");
 const getApiKeys = async () => (await db.all("SELECT key FROM api_keys")).map(r => r.key);
+
+// Rate-limit en mémoire pour /api/auth/login : 5 tentatives par 15 min par IP.
+const loginAttempts = new Map();
+const LOGIN_MAX_ATTEMPTS = 5;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const checkLoginRateLimit = (ip) => {
+    const now = Date.now();
+    const entry = loginAttempts.get(ip);
+    if (!entry || now - entry.firstAttempt > LOGIN_WINDOW_MS) {
+        loginAttempts.set(ip, { count: 1, firstAttempt: now });
+        return { allowed: true };
+    }
+    entry.count++;
+    if (entry.count > LOGIN_MAX_ATTEMPTS) {
+        return { allowed: false, retryAfter: Math.ceil((LOGIN_WINDOW_MS - (now - entry.firstAttempt)) / 1000) };
+    }
+    return { allowed: true };
+};
+const resetLoginAttempts = (ip) => loginAttempts.delete(ip);
+
+// Validations communes
+const HEX_COLOR_RE = /^#[0-9A-Fa-f]{6}$/;
+const REGION_VALUES = new Set(['eu', 'na', 'ap', 'kr', 'latam', 'br']);
+const validatePlayerInput = ({ name, tag, region, color, discord_id }) => {
+    if (typeof name !== 'string' || name.trim().length < 1 || name.length > 32) return "Pseudo invalide (1 à 32 caractères)";
+    if (typeof tag !== 'string' || tag.trim().length < 1 || tag.length > 8) return "Tag invalide (1 à 8 caractères)";
+    if (region !== undefined && region !== '' && !REGION_VALUES.has(String(region).toLowerCase())) return "Région invalide (eu/na/ap/kr/latam/br)";
+    if (color !== undefined && color !== '' && !HEX_COLOR_RE.test(color)) return "Couleur invalide (format #RRGGBB)";
+    if (discord_id !== undefined && discord_id !== '' && !/^\d{15,25}$/.test(String(discord_id))) return "Discord ID invalide (15-25 chiffres)";
+    return null;
+};
 
 // Caches en mémoire (faible empreinte) pour éviter de retaper la DB
 // sur chaque requête publique. Invalidés par les writes admin et par les syncs.
@@ -552,10 +608,10 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
     allConfigPlayers.forEach(p => {
         playerStats[p.id] = {
             id: p.id, name: p.name,
-            wins: 0, losses: 0, rrChange: 0,
+            wins: 0, losses: 0, rrChange: 0, rrLost: 0,
             kills: 0, deaths: 0, assists: 0, headshots: 0, shots: 0,
             acsSum: 0, games: 0, agents: {},
-            bestACS: 0, bestKills: 0, bestRR: -Infinity, worstRR: Infinity,
+            bestACS: 0, bestKills: 0, worstACS: Infinity,
             bestGame: null, worstGame: null
         };
     });
@@ -568,7 +624,7 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
         }
         const pConfig = allConfigPlayers.find(p => p.id === m.playerId);
         const playerName = pConfig ? pConfig.name : "Inconnu";
-        const kd = m.deaths > 0 ? (m.kills / m.deaths).toFixed(2) : m.kills;
+        const kd = (m.kills / Math.max(1, m.deaths)).toFixed(2);
         const acs = m.acs || Math.round((m.score || 0) / (m.roundsPlayed || 1));
         const hsPct = m.totalShots > 0 ? Math.round((m.headshots / m.totalShots) * 100) : 0;
         const rrSign = m.rrChange > 0 ? '+' : '';
@@ -591,14 +647,15 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
             ps.games++;
             if (m.result === 'WIN') ps.wins++; else ps.losses++;
             ps.rrChange += m.rrChange;
+            if (m.rrChange < 0) ps.rrLost += Math.abs(m.rrChange);
             ps.kills += m.kills; ps.deaths += m.deaths; ps.assists += (m.assists || 0);
             ps.headshots += (m.headshots || 0); ps.shots += (m.totalShots || 0);
             ps.acsSum += acs;
             if (m.agent) ps.agents[m.agent] = (ps.agents[m.agent] || 0) + 1;
             if (acs > ps.bestACS) { ps.bestACS = acs; ps.bestGame = { map: m.map, acs, kills: m.kills, deaths: m.deaths, rr: m.rrChange }; }
             if (m.kills > ps.bestKills) ps.bestKills = m.kills;
-            if (m.rrChange > ps.bestRR) ps.bestRR = m.rrChange;
-            if (m.rrChange < ps.worstRR) { ps.worstRR = m.rrChange; ps.worstGame = { map: m.map, acs, kills: m.kills, deaths: m.deaths, rr: m.rrChange }; }
+            // Pire match = perf individuelle la plus faible (ACS), pas le résultat collectif (RR)
+            if (acs > 0 && acs < ps.worstACS) { ps.worstACS = acs; ps.worstGame = { map: m.map, acs, kills: m.kills, deaths: m.deaths, rr: m.rrChange }; }
         }
     });
 
@@ -615,16 +672,21 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
     else if (globalWinrate >= 25) { weatherEmoji = "🌧️"; weatherTitle = "Averses"; color = 0x3b82f6; }
     else { weatherEmoji = "⛈️"; weatherTitle = "Tempête"; color = 0xef4444; }
 
-    const mvp    = [...activePlayers].sort((a, b) => b.rrChange - a.rrChange)[0];
-    const butcher = [...activePlayers].sort((a, b) => {
-        const kdA = a.deaths > 0 ? a.kills/a.deaths : a.kills;
-        const kdB = b.deaths > 0 ? b.kills/b.deaths : b.kills;
-        return kdB - kdA;
-    })[0];
-    const loser  = [...activePlayers].sort((a, b) => a.rrChange - b.rrChange)[0];
-    const sniper = [...activePlayers].sort((a, b) => {
-        return (b.shots > 0 ? b.headshots/b.shots : 0) - (a.shots > 0 ? a.headshots/a.shots : 0);
-    })[0];
+    // K/D safe : on traite 0 mort comme 1 pour éviter qu'un 5/0 batte un 30/10
+    const safeKD = (k, d) => k / Math.max(1, d);
+    const SHOTS_MIN = 50; // seuil minimum pour les classements HS%
+
+    // GLOIRE
+    const mvp     = [...activePlayers].sort((a, b) => b.rrChange - a.rrChange)[0];
+    const butcher = [...activePlayers].sort((a, b) => safeKD(b.kills, b.deaths) - safeKD(a.kills, a.deaths))[0];
+    const sniper  = [...activePlayers].filter(p => p.shots >= SHOTS_MIN).sort((a, b) => (b.headshots/b.shots) - (a.headshots/a.shots))[0];
+    const topFragger = [...activePlayers].sort((a, b) => b.kills - a.kills)[0];
+
+    // HONTE
+    const loser        = [...activePlayers].sort((a, b) => a.rrChange - b.rrChange)[0];
+    const donor        = [...activePlayers].sort((a, b) => b.rrLost - a.rrLost)[0];
+    const stormtrooper = [...activePlayers].filter(p => p.shots >= SHOTS_MIN).sort((a, b) => (a.headshots/a.shots) - (b.headshots/b.shots))[0];
+    const tourist      = [...activePlayers].sort((a, b) => (a.games > 0 ? a.acsSum/a.games : 0) - (b.games > 0 ? b.acsSum/b.games : 0))[0];
 
     const embed = new EmbedBuilder()
         .setTitle(`📊 RAPPORT QUOTIDIEN • ${targetDateStr}`)
@@ -640,15 +702,28 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
             value: `**Météo :** ${weatherTitle}\n**Winrate :** ${globalWinrate}% (${totalWins}V — ${totalUniqueGames - totalWins}D)\n**Rentabilité :** ${totalRRDay >= 0 ? '+' : ''}${totalRRDay} RR collectifs\n**Parties :** ${totalUniqueGames} uniques · ${activePlayers.length} joueur(s) actif(s)`,
             inline: false
         });
+        // GLOIRE
         let fameText = "";
         if (mvp && mvp.rrChange > 0) fameText += `👑 \`${('+' + mvp.rrChange).padStart(4, ' ')} RR\` · **MVP :** ${mvp.name}\n`;
-        if (butcher && butcher.name !== mvp?.name) {
-            const kdVal = butcher.deaths > 0 ? (butcher.kills/butcher.deaths).toFixed(2) : butcher.kills;
-            fameText += `🔪 \`${String(kdVal).padStart(4, ' ')} K/D\` · **Boucher :** ${butcher.name}\n`;
+        if (butcher) {
+            const kdVal = safeKD(butcher.kills, butcher.deaths).toFixed(2);
+            fameText += `🔪 \`${kdVal.padStart(5, ' ')} K/D\` · **Boucher :** ${butcher.name}\n`;
         }
-        if (sniper && sniper.shots > 0) fameText += `🎯 \`${String(Math.round((sniper.headshots/sniper.shots)*100)).padStart(3, ' ')}% HS\` · **Sniper :** ${sniper.name}\n`;
-        if (loser && loser.rrChange < 0) fameText += `🤡 \`${String(loser.rrChange).padStart(4, ' ')} RR\` · **Poids Mort :** ${loser.name}\n`;
-        embed.addFields({ name: "🏆 Tableau d'Honneur", value: fameText || "Aucun trophée marquant.", inline: false });
+        if (sniper) fameText += `🎯 \`${String(Math.round((sniper.headshots/sniper.shots)*100)).padStart(3, ' ')}% HS\` · **Sniper :** ${sniper.name}\n`;
+        if (topFragger && topFragger.kills > 0) fameText += `👊 \`${String(topFragger.kills).padStart(3, ' ')} kills\` · **Top Fraggeur :** ${topFragger.name}\n`;
+
+        // HONTE
+        let shameText = "";
+        if (donor && donor.rrLost > 0) shameText += `💸 \`-${String(donor.rrLost).padStart(3, ' ')} RR\` · **Donateur :** ${donor.name}\n`;
+        if (stormtrooper) shameText += `🤖 \`${String(Math.round((stormtrooper.headshots/stormtrooper.shots)*100)).padStart(3, ' ')}% HS\` · **Stormtrooper :** ${stormtrooper.name}\n`;
+        if (tourist) {
+            const acsAvg = tourist.games > 0 ? Math.round(tourist.acsSum/tourist.games) : 0;
+            shameText += `🚶 \`${String(acsAvg).padStart(3, ' ')} ACS\` · **Touriste :** ${tourist.name}\n`;
+        }
+        if (loser && loser.rrChange < 0) shameText += `🤡 \`${String(loser.rrChange).padStart(4, ' ')} RR\` · **Poids Mort :** ${loser.name}\n`;
+
+        embed.addFields({ name: "🏆 Tableau d'Honneur", value: fameText || "*Aucun trophée marquant.*", inline: false });
+        embed.addFields({ name: "💩 Tableau de Honte", value: shameText || "*Personne à blâmer aujourd'hui.*", inline: false });
         embed.setDescription(`*Naviguez entre les onglets pour explorer les détails.*`);
 
     // ───── ONGLET 2 : JOURNAL ─────
@@ -681,8 +756,11 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
     } else if (view === 'players') {
         const sorted = [...activePlayers].sort((a, b) => b.rrChange - a.rrChange);
         let desc = "";
+        if (topFragger && topFragger.kills > 0) {
+            desc += `👊 **Top Fraggeur du jour :** ${topFragger.name} — **${topFragger.kills} kills** sur ${topFragger.games} game${topFragger.games > 1 ? 's' : ''}\n\n`;
+        }
         sorted.forEach((p, i) => {
-            const kd = p.deaths > 0 ? (p.kills / p.deaths).toFixed(2) : p.kills;
+            const kd = safeKD(p.kills, p.deaths).toFixed(2);
             const hsPct = p.shots > 0 ? Math.round((p.headshots / p.shots) * 100) : 0;
             const avgAcs = p.games > 0 ? Math.round(p.acsSum / p.games) : 0;
             const rrSign = p.rrChange >= 0 ? '+' : '';
@@ -703,7 +781,8 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
         let worstPerfPlayer = null, worstPerfGame = null;
         activePlayers.forEach(p => {
             if (p.bestGame && p.bestACS > (bestPerfGame?.acs ?? 0)) { bestPerfPlayer = p.name; bestPerfGame = p.bestGame; }
-            if (p.worstGame && p.worstRR < (worstPerfGame?.rr ?? Infinity)) { worstPerfPlayer = p.name; worstPerfGame = p.worstGame; }
+            // Pire match : la perf individuelle la plus faible (ACS), pas le résultat collectif (RR)
+            if (p.worstGame && p.worstACS < (worstPerfGame?.acs ?? Infinity)) { worstPerfPlayer = p.name; worstPerfGame = p.worstGame; }
             if (p.bestKills > mostKillsVal) { mostKillsVal = p.bestKills; mostKillsPlayer = p.name; }
         });
 
@@ -719,19 +798,21 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
 
         const totalKills = activePlayers.reduce((s, p) => s + p.kills, 0);
         const totalDeaths = activePlayers.reduce((s, p) => s + p.deaths, 0);
-        const globalKD = totalDeaths > 0 ? (totalKills / totalDeaths).toFixed(2) : totalKills;
+        const globalKD = safeKD(totalKills, totalDeaths).toFixed(2);
 
         let desc = "";
         if (bestPerfPlayer && bestPerfGame) {
-            desc += `🏆 **Perf du jour — ${bestPerfPlayer}** sur **${(bestPerfGame.map || '?').toUpperCase()}**\n`;
-            desc += `> ${bestPerfGame.kills}/${bestPerfGame.deaths} · **${bestPerfGame.acs} ACS** · ${bestPerfGame.rr >= 0 ? '+' : ''}${bestPerfGame.rr} RR\n\n`;
+            const kdBest = safeKD(bestPerfGame.kills, bestPerfGame.deaths).toFixed(2);
+            desc += `🏆 **Meilleur match (1 game) — ${bestPerfPlayer}** sur **${(bestPerfGame.map || '?').toUpperCase()}**\n`;
+            desc += `> ${bestPerfGame.kills}/${bestPerfGame.deaths} (${kdBest} K/D) · **${bestPerfGame.acs} ACS** · ${bestPerfGame.rr >= 0 ? '+' : ''}${bestPerfGame.rr} RR\n\n`;
         }
         if (mostKillsPlayer) {
-            desc += `🔫 **Record de kills — ${mostKillsPlayer}** · ${mostKillsVal} frags en une partie\n\n`;
+            desc += `🔫 **Record de kills (1 game) — ${mostKillsPlayer}** · ${mostKillsVal} frags\n\n`;
         }
         if (worstPerfPlayer && worstPerfGame) {
-            desc += `💀 **Pire partie — ${worstPerfPlayer}** sur **${(worstPerfGame.map || '?').toUpperCase()}**\n`;
-            desc += `> ${worstPerfGame.kills}/${worstPerfGame.deaths} · ${worstPerfGame.acs} ACS · **${worstPerfGame.rr} RR**\n\n`;
+            const kdWorst = safeKD(worstPerfGame.kills, worstPerfGame.deaths).toFixed(2);
+            desc += `💀 **Pire match (1 game) — ${worstPerfPlayer}** sur **${(worstPerfGame.map || '?').toUpperCase()}**\n`;
+            desc += `> ${worstPerfGame.kills}/${worstPerfGame.deaths} (${kdWorst} K/D) · **${worstPerfGame.acs} ACS** · ${worstPerfGame.rr >= 0 ? '+' : ''}${worstPerfGame.rr} RR\n\n`;
         }
         if (bestMap) desc += `🗺️ **Meilleure carte — ${bestMap.map?.toUpperCase()}** · ${bestMap.wins}V ${bestMap.total - bestMap.wins}D (${bestMap.wr}%)\n`;
         if (worstMap && worstMap.map !== bestMap?.map) desc += `💔 **Pire carte — ${worstMap.map?.toUpperCase()}** · ${worstMap.wins}V ${worstMap.total - worstMap.wins}D (${worstMap.wr}%)\n`;
@@ -851,56 +932,6 @@ discordClient.once('clientReady', async () => {
         console.log('✅ Slash commands Discord enregistrées.');
     } catch (e) {
         console.error('❌ Slash commands — erreur enregistrement :', e.message);
-    }
-});
-
-discordClient.on('messageCreate', async (message) => {
-    if (message.author.bot) return;
-
-    const prefix = '!';
-    if (!message.content.startsWith(prefix)) return;
-
-    const args = message.content.slice(prefix.length).trim().split(/ +/);
-    const command = args.shift().toLowerCase();
-
-    if (command === 'ping') {
-        message.reply('🏓 **Pong !** Le KSL Tracker est en ligne et opérationnel.');
-    }
-
-    if (command === 'stats') {
-        const playerName = args.join(' ');
-        if (!playerName) return message.reply("❌ Précise un joueur ! Exemple : `!stats Tenz`");
-
-        const players = await getPlayers();
-        const target = players.find(p => p.name.toLowerCase() === playerName.toLowerCase());
-        if (!target) return message.reply(`❌ Joueur **${playerName}** introuvable dans la liste du tracker.`);
-
-        const rows = await db.all("SELECT data FROM matches WHERE player_id = ? AND type = 'ranked' ORDER BY date DESC LIMIT 20", [target.id]);
-        if (rows.length === 0) return message.reply(`⚠️ Aucun match classé trouvé pour **${target.name}**.`);
-
-        let wins = 0, kills = 0, deaths = 0, rr = 0;
-        rows.forEach(r => {
-            const m = JSON.parse(r.data);
-            if (m.result === 'WIN') wins++;
-            kills += (m.kills || 0);
-            deaths += (m.deaths || 0);
-            rr += (m.rrChange || 0);
-        });
-
-        const kd = deaths > 0 ? (kills / deaths).toFixed(2) : kills;
-        const winrate = Math.round((wins / rows.length) * 100);
-
-        const embed = new EmbedBuilder()
-            .setTitle(`📊 Stats récentes (Ranked) : ${target.name}`)
-            .setColor(parseInt(target.color.replace('#', ''), 16) || 0xff4655)
-            .setDescription(`Basé sur les **${rows.length} derniers matchs** classés.`)
-            .addFields(
-                { name: 'Victoires', value: `${wins}W - ${rows.length - wins}L (${winrate}%)`, inline: true },
-                { name: 'K/D Global', value: `${kd}`, inline: true },
-                { name: 'RR Généré', value: `${rr > 0 ? '+' : ''}${rr} RR`, inline: true }
-            );
-
-        message.reply({ embeds: [embed] });
     }
 });
 
@@ -1154,13 +1185,24 @@ const sendDiscordMessage = async (channelId, payload) => {
 // ==========================================
 
 app.post('/api/auth/login', async (req, res) => {
+    const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+    const rl = checkLoginRateLimit(ip);
+    if (!rl.allowed) {
+        return res.status(429).json({ error: `Trop de tentatives. Réessaie dans ${rl.retryAfter}s.` });
+    }
+
     const { username, password } = req.body;
+    if (typeof username !== 'string' || typeof password !== 'string') {
+        return res.status(400).json({ error: "Identifiants incorrects" });
+    }
     const user = await db.get("SELECT * FROM users WHERE username = ?", [username]);
 
     if (!user) return res.status(400).json({ error: "Identifiants incorrects" });
 
     const validPass = await bcrypt.compare(password, user.password_hash);
     if (!validPass) return res.status(400).json({ error: "Identifiants incorrects" });
+
+    resetLoginAttempts(ip);
 
     const secret = await getConfig('jwt_secret');
     const token = jwt.sign({ id: user.id, username: user.username }, secret, { expiresIn: '24h' });
@@ -1173,8 +1215,11 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
     const { newPassword } = req.body;
-    if (!newPassword || newPassword.length < 6) {
-        return res.status(400).json({ error: "Le mot de passe doit faire au moins 6 caractères" });
+    if (typeof newPassword !== 'string' || newPassword.length < 10) {
+        return res.status(400).json({ error: "Le mot de passe doit faire au moins 10 caractères" });
+    }
+    if (newPassword.length > 128) {
+        return res.status(400).json({ error: "Mot de passe trop long (max 128)" });
     }
     const hash = await bcrypt.hash(newPassword, 10);
     await db.run("UPDATE users SET password_hash = ?, needs_password_change = 0 WHERE id = ?", [hash, req.user.id]);
@@ -1199,20 +1244,49 @@ app.get('/api/public/config', async (req, res) => {
 });
 
 app.get('/api/admin/config', authenticateToken, async (req, res) => {
-    const discord_bot_token = await getConfig('discord_bot_token');
+    const discord_bot_token_raw = await getConfig('discord_bot_token');
+    // Masquage : on ne renvoie jamais le token complet, juste un indicateur "configuré"
+    // + les 4 derniers caractères pour debug. Le client envoie une valeur vide pour ne pas changer le token.
+    const discord_bot_token = discord_bot_token_raw
+        ? `••••••••${discord_bot_token_raw.slice(-4)}`
+        : '';
+    const discord_bot_token_set = !!discord_bot_token_raw;
     const discord_channel_id = await getConfig('discord_channel_id');
     const app_url = await getConfig('app_url');
     const challenge_start_date = await getConfig('challenge_start_date');
-    res.json({ discord_bot_token, discord_channel_id, app_url, challenge_start_date });
+    res.json({ discord_bot_token, discord_bot_token_set, discord_channel_id, app_url, challenge_start_date });
 });
 
 app.post('/api/admin/config', authenticateToken, async (req, res) => {
     const { discord_bot_token, discord_channel_id, app_url, challenge_start_date } = req.body;
-    if (discord_bot_token !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'discord_bot_token'", [discord_bot_token]);
-    if (discord_channel_id !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'discord_channel_id'", [discord_channel_id]);
-    if (app_url !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'app_url'", [app_url]);
-    if (challenge_start_date !== undefined) await db.run("UPDATE config SET value = ? WHERE key = 'challenge_start_date'", [challenge_start_date]);
+    // Si le client renvoie le placeholder masqué ou vide → on ne touche pas au token existant
+    if (discord_bot_token !== undefined && discord_bot_token !== '' && !discord_bot_token.startsWith('••')) {
+        if (typeof discord_bot_token !== 'string' || discord_bot_token.length > 200) {
+            return res.status(400).json({ error: "Token Discord invalide" });
+        }
+        await db.run("UPDATE config SET value = ? WHERE key = 'discord_bot_token'", [discord_bot_token]);
+    }
+    if (discord_channel_id !== undefined) {
+        if (discord_channel_id !== '' && !/^\d{15,25}$/.test(String(discord_channel_id))) {
+            return res.status(400).json({ error: "Channel ID Discord invalide (15-25 chiffres)" });
+        }
+        await db.run("UPDATE config SET value = ? WHERE key = 'discord_channel_id'", [discord_channel_id]);
+    }
+    if (app_url !== undefined) {
+        if (app_url !== '' && !/^https?:\/\/[^\s]+$/.test(String(app_url))) {
+            return res.status(400).json({ error: "App URL invalide (doit commencer par http(s)://)" });
+        }
+        await db.run("UPDATE config SET value = ? WHERE key = 'app_url'", [app_url]);
+    }
+    if (challenge_start_date !== undefined) {
+        if (challenge_start_date !== '' && isNaN(new Date(challenge_start_date).getTime())) {
+            return res.status(400).json({ error: "Date de challenge invalide" });
+        }
+        await db.run("UPDATE config SET value = ? WHERE key = 'challenge_start_date'", [challenge_start_date]);
+    }
     invalidatePublicConfigCache();
+    invalidateDiscordCache();
+    await refreshAllowedOrigins();
     res.json({ message: "Configuration sauvegardée (Redémarrez le serveur si vous avez changé le Token du Bot)" });
 });
 
@@ -1223,21 +1297,28 @@ app.get('/api/admin/players', authenticateToken, async (req, res) => {
 
 app.post('/api/admin/players', authenticateToken, async (req, res) => {
     const { name, tag, region, color, discord_id } = req.body;
+    const err = validatePlayerInput({ name, tag, region, color, discord_id });
+    if (err) return res.status(400).json({ error: err });
     const countRow = await db.get("SELECT COUNT(*) as count FROM players");
     const id = `p${countRow.count + 1}_${Date.now()}`;
-    await db.run("INSERT INTO players (id, name, tag, region, color, discord_id) VALUES (?, ?, ?, ?, ?, ?)", [id, name, tag, region, color || '#ffffff', discord_id || '']);
+    await db.run("INSERT INTO players (id, name, tag, region, color, discord_id) VALUES (?, ?, ?, ?, ?, ?)",
+        [id, name.trim(), tag.trim(), (region || 'eu').toLowerCase(), color || '#ffffff', discord_id || '']);
     invalidatePublicConfigCache();
+    invalidateDiscordCache();
     res.json({ message: "Joueur ajouté", id });
 });
 
 app.put('/api/admin/players/:id', authenticateToken, async (req, res) => {
     const { name, tag, color, discord_id } = req.body;
+    const err = validatePlayerInput({ name, tag, color, discord_id });
+    if (err) return res.status(400).json({ error: err });
     try {
         await db.run(
             "UPDATE players SET name = ?, tag = ?, color = ?, discord_id = ? WHERE id = ?",
-            [name, tag, color, discord_id || '', req.params.id]
+            [name.trim(), tag.trim(), color, discord_id || '', req.params.id]
         );
         invalidatePublicConfigCache();
+        invalidateDiscordCache();
         res.json({ message: "Joueur mis à jour avec succès" });
     } catch (e) {
         res.status(500).json({ error: "Erreur lors de la mise à jour" });
@@ -1247,6 +1328,7 @@ app.put('/api/admin/players/:id', authenticateToken, async (req, res) => {
 app.delete('/api/admin/players/:id', authenticateToken, async (req, res) => {
     await db.run("DELETE FROM players WHERE id = ?", [req.params.id]);
     invalidatePublicConfigCache();
+    invalidateDiscordCache();
     res.json({ message: "Joueur supprimé" });
 });
 
@@ -1257,8 +1339,12 @@ app.get('/api/admin/keys', authenticateToken, async (req, res) => {
 
 app.post('/api/admin/keys', authenticateToken, async (req, res) => {
     const { key } = req.body;
+    // Format HenrikDev : "HDEV-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" ou simplement une chaîne raisonnable
+    if (typeof key !== 'string' || key.trim().length < 8 || key.length > 200) {
+        return res.status(400).json({ error: "Clé API invalide (8 à 200 caractères)" });
+    }
     try {
-        await db.run("INSERT INTO api_keys (key) VALUES (?)", [key]);
+        await db.run("INSERT INTO api_keys (key) VALUES (?)", [key.trim()]);
         res.json({ message: "Clé ajoutée" });
     } catch (e) {
         res.status(400).json({ error: "Cette clé existe déjà" });
@@ -1290,9 +1376,24 @@ app.get('/api/admin/tournaments', authenticateToken, async (req, res) => {
 
 app.post('/api/admin/tournaments', authenticateToken, async (req, res) => {
     const { name, date, players } = req.body;
+    if (typeof name !== 'string' || name.trim().length < 1 || name.length > 64) {
+        return res.status(400).json({ error: "Nom de tournoi invalide (1 à 64 caractères)" });
+    }
+    if (!Array.isArray(players) || players.length < 2 || players.length > 64) {
+        return res.status(400).json({ error: "Liste de joueurs invalide (2 à 64 participants)" });
+    }
     const id = `tourney_${Date.now()}`;
-    
-    const shuffled = [...players].sort(() => 0.5 - Math.random());
+
+    // Fisher-Yates : shuffle uniforme (vs sort(() => 0.5 - Math.random()) qui est biaisé)
+    const fisherYates = (arr) => {
+        const a = [...arr];
+        for (let i = a.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [a[i], a[j]] = [a[j], a[i]];
+        }
+        return a;
+    };
+    const shuffled = fisherYates(players);
     const nextPowerOf2 = Math.pow(2, Math.ceil(Math.log2(shuffled.length)));
     const numByes = nextPowerOf2 - shuffled.length;
     
@@ -1309,8 +1410,8 @@ app.post('/api/admin/tournaments', authenticateToken, async (req, res) => {
         playerIdx += 2;
     }
     
-    round1.sort(() => 0.5 - Math.random());
-    rounds.push(round1);
+    const round1Shuffled = fisherYates(round1);
+    rounds.push(round1Shuffled);
 
     let currentMatches = round1.length;
     while (currentMatches > 1) {
