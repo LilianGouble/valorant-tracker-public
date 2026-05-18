@@ -36,7 +36,15 @@ app.use(cors({
     }
 }));
 // gzip pour toutes les réponses > 1KB ; gain énorme sur /history (JSON volumineux)
-app.use(compression({ level: 6, threshold: 1024 }));
+// SSE exclu : sinon la compression buffer les events et casse le push temps réel.
+app.use(compression({
+    level: 6,
+    threshold: 1024,
+    filter: (req, res) => {
+        if (req.path === '/api/events') return false;
+        return compression.filter(req, res);
+    }
+}));
 // 2mb suffit largement (payload Riot ~50KB, ajouts admin ~quelques KB).
 app.use(bodyParser.json({ limit: '2mb' }));
 
@@ -260,7 +268,21 @@ let publicConfigCache = { data: null, expiry: 0 };
 let lastDataChange = Date.now();
 
 const invalidatePublicConfigCache = () => { publicConfigCache.expiry = 0; };
-const markDataChanged = () => { lastDataChange = Math.floor(Date.now() / 1000) * 1000; };
+
+// SSE — push temps réel vers les clients connectés
+const sseClients = new Set();
+const broadcastEvent = (type, data = {}) => {
+    if (sseClients.size === 0) return;
+    const msg = `data: ${JSON.stringify({ type, ...data, ts: Date.now() })}\n\n`;
+    for (const client of sseClients) {
+        try { client.write(msg); } catch { sseClients.delete(client); }
+    }
+};
+
+const markDataChanged = () => {
+    lastDataChange = Math.floor(Date.now() / 1000) * 1000;
+    broadcastEvent('matches_updated');
+};
 
 // Cache pour le bot Discord : joueurs + app_url lus à chaque interaction.
 // TTL 60s — invalide aussi lors des changements admin.
@@ -899,6 +921,306 @@ const buildDailyReportMessage = async (dateStr, view, allConfigPlayers, appUrl) 
 };
 
 // ==========================================
+// BOT DISCORD : BUILDERS /vs /map /recap
+// ==========================================
+
+const buildVsMessage = async (playerId1, playerId2, allConfigPlayers) => {
+    const p1 = allConfigPlayers.find(p => p.id === playerId1);
+    const p2 = allConfigPlayers.find(p => p.id === playerId2);
+    if (!p1 || !p2) return { content: '❌ Joueur introuvable.' };
+    if (p1.id === p2.id) return { content: '❌ Choisis deux joueurs différents.' };
+
+    const challengeStart = await getConfig('challenge_start_date', '2024-01-01T00:00');
+    const startTs = new Date(challengeStart).getTime();
+
+    const allRows = await db.all(
+        "SELECT player_id, data FROM matches WHERE player_id IN (?, ?) AND date >= ? AND type = 'ranked' ORDER BY date DESC",
+        [p1.id, p2.id, startTs]
+    );
+
+    const stat = (rows) => {
+        let wins = 0, kills = 0, deaths = 0, hs = 0, shots = 0, acsSum = 0, rrTotal = 0;
+        let rank = 'Non classé';
+        rows.forEach(r => {
+            const m = JSON.parse(r.data);
+            if (m.result === 'WIN') wins++;
+            kills += m.kills || 0; deaths += m.deaths || 0;
+            hs += m.headshots || 0; shots += m.totalShots || 0;
+            acsSum += m.acs || 0;
+            rrTotal += m.rrChange || 0;
+        });
+        if (rows.length > 0) rank = JSON.parse(rows[0].data).currentRank || 'Inconnu';
+        return {
+            games: rows.length, wins, losses: rows.length - wins,
+            winrate: rows.length > 0 ? Math.round(wins/rows.length*100) : 0,
+            kd: kills / Math.max(1, deaths),
+            hsPct: shots > 0 ? Math.round(hs/shots*100) : 0,
+            avgAcs: rows.length > 0 ? Math.round(acsSum/rows.length) : 0,
+            rrTotal, rank
+        };
+    };
+
+    const rows1 = allRows.filter(r => r.player_id === p1.id);
+    const rows2 = allRows.filter(r => r.player_id === p2.id);
+    const s1 = stat(rows1);
+    const s2 = stat(rows2);
+
+    // Parties jouées ensemble (party_id en commun)
+    const togetherMatches = new Set();
+    let wTogether = 0, lTogether = 0;
+    rows1.forEach(r => {
+        const m = JSON.parse(r.data);
+        if (!m.partyId) return;
+        const matched = rows2.find(r2 => {
+            const m2 = JSON.parse(r2.data);
+            return m2.id === m.id && m2.partyId === m.partyId;
+        });
+        if (matched) {
+            togetherMatches.add(m.id);
+            if (m.result === 'WIN') wTogether++; else lTogether++;
+        }
+    });
+
+    const winner = (v1, v2, higherIsBetter = true) => {
+        if (Math.abs(v1 - v2) < 0.001) return ['', ''];
+        const p1Wins = higherIsBetter ? v1 > v2 : v1 < v2;
+        return p1Wins ? ['👑', ''] : ['', '👑'];
+    };
+
+    const [wW1, wW2] = winner(s1.winrate, s2.winrate);
+    const [kdW1, kdW2] = winner(s1.kd, s2.kd);
+    const [hsW1, hsW2] = winner(s1.hsPct, s2.hsPct);
+    const [acsW1, acsW2] = winner(s1.avgAcs, s2.avgAcs);
+    const [rrW1, rrW2] = winner(s1.rrTotal, s2.rrTotal);
+
+    const rankE1 = RANK_EMOJIS[(s1.rank || '').toUpperCase()] || s1.rank;
+    const rankE2 = RANK_EMOJIS[(s2.rank || '').toUpperCase()] || s2.rank;
+
+    const embed = new EmbedBuilder()
+        .setTitle(`⚔️ ${p1.name}  vs  ${p2.name}`)
+        .setColor(0xff4655)
+        .setFooter({ text: `Période : depuis le ${new Date(challengeStart).toLocaleDateString('fr-FR')}` })
+        .setTimestamp()
+        .addFields(
+            { name: `${rankE1} ${p1.name}`, value: `\`${s1.games}\` parties\n\`${s1.winrate}%\` WR ${wW1}\n\`${s1.kd.toFixed(2)}\` K/D ${kdW1}\n\`${s1.hsPct}%\` HS ${hsW1}\n\`${s1.avgAcs}\` ACS ${acsW1}\n\`${s1.rrTotal >= 0 ? '+' : ''}${s1.rrTotal}\` RR ${rrW1}`, inline: true },
+            { name: `${rankE2} ${p2.name}`, value: `\`${s2.games}\` parties\n\`${s2.winrate}%\` WR ${wW2}\n\`${s2.kd.toFixed(2)}\` K/D ${kdW2}\n\`${s2.hsPct}%\` HS ${hsW2}\n\`${s2.avgAcs}\` ACS ${acsW2}\n\`${s2.rrTotal >= 0 ? '+' : ''}${s2.rrTotal}\` RR ${rrW2}`, inline: true }
+        );
+
+    if (togetherMatches.size > 0) {
+        embed.addFields({
+            name: '🤝 Ensemble',
+            value: `**${togetherMatches.size}** parties en escouade · **${wTogether}V ${lTogether}D** (${Math.round(wTogether/(wTogether+lTogether)*100)}% WR)`,
+            inline: false
+        });
+    }
+
+    return { embeds: [embed] };
+};
+
+const buildMapMessage = async (mapValue, allConfigPlayers) => {
+    const challengeStart = await getConfig('challenge_start_date', '2024-01-01T00:00');
+    const startTs = new Date(challengeStart).getTime();
+    const trackedIds = allConfigPlayers.map(p => p.id);
+    if (trackedIds.length === 0) return { content: '❌ Aucun joueur configuré.' };
+
+    const placeholders = trackedIds.map(() => '?').join(',');
+    const rows = await db.all(
+        `SELECT data FROM matches WHERE type = 'ranked' AND date >= ? AND LOWER(map) = ? AND player_id IN (${placeholders}) ORDER BY date DESC`,
+        [startTs, mapValue, ...trackedIds]
+    );
+
+    if (rows.length === 0) return { content: `🗺️ Aucune partie classée jouée sur **${mapValue.toUpperCase()}** depuis le début du challenge.` };
+
+    const matches = rows.map(r => JSON.parse(r.data));
+    const uniqueMatchIds = new Set(matches.map(m => m.id));
+    const uniqueGames = [...uniqueMatchIds].map(id => matches.find(m => m.id === id));
+    const wins = uniqueGames.filter(g => g.result === 'WIN').length;
+    const losses = uniqueGames.length - wins;
+    const winrate = Math.round(wins / uniqueGames.length * 100);
+
+    // Stats par joueur sur cette map
+    const playerOnMap = {};
+    matches.forEach(m => {
+        const cfg = allConfigPlayers.find(p => p.id === m.playerId);
+        if (!cfg) return;
+        if (!playerOnMap[cfg.id]) {
+            playerOnMap[cfg.id] = { name: cfg.name, games: 0, kills: 0, deaths: 0, wins: 0, agents: {}, acsSum: 0 };
+        }
+        const ps = playerOnMap[cfg.id];
+        ps.games++;
+        if (m.result === 'WIN') ps.wins++;
+        ps.kills += m.kills || 0;
+        ps.deaths += m.deaths || 0;
+        ps.acsSum += m.acs || 0;
+        if (m.agent) ps.agents[m.agent] = (ps.agents[m.agent] || 0) + 1;
+    });
+
+    // MVP de la carte = meilleur K/D moyen (min 2 games)
+    const eligible = Object.values(playerOnMap).filter(p => p.games >= 2);
+    const mapMVP = eligible.length > 0
+        ? eligible.sort((a, b) => (b.kills/Math.max(1,b.deaths)) - (a.kills/Math.max(1,a.deaths)))[0]
+        : null;
+
+    // Agents les plus joués sur cette map (toutes parties confondues)
+    const allAgents = {};
+    matches.forEach(m => { if (m.agent) allAgents[m.agent] = (allAgents[m.agent] || 0) + 1; });
+    const topAgents = Object.entries(allAgents).sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+    let color = 0x9ca3af;
+    if (winrate >= 60) color = 0x10b981;
+    else if (winrate >= 45) color = 0xfacc15;
+    else if (winrate >= 25) color = 0x3b82f6;
+    else color = 0xef4444;
+
+    const embed = new EmbedBuilder()
+        .setTitle(`🗺️ ${mapValue.toUpperCase()} — Stats du Groupe`)
+        .setColor(color)
+        .setFooter({ text: `Période : depuis le ${new Date(challengeStart).toLocaleDateString('fr-FR')}` })
+        .setTimestamp();
+
+    if (MAP_SPLASHES[mapValue]) embed.setThumbnail(MAP_SPLASHES[mapValue]);
+
+    embed.addFields({
+        name: '📊 Bilan',
+        value: `**${uniqueGames.length}** parties · **${wins}V ${losses}D** · **${winrate}% WR**`,
+        inline: false
+    });
+
+    if (mapMVP) {
+        const kd = (mapMVP.kills / Math.max(1, mapMVP.deaths)).toFixed(2);
+        const avgAcs = Math.round(mapMVP.acsSum / mapMVP.games);
+        embed.addFields({
+            name: '👑 MVP de la carte',
+            value: `**${mapMVP.name}** · \`${kd}\` K/D · \`${avgAcs}\` ACS · ${mapMVP.games} parties`,
+            inline: false
+        });
+    }
+
+    if (topAgents.length > 0) {
+        const agentList = topAgents.map(([name, count]) => `\`${name}\` ×${count}`).join(' · ');
+        embed.addFields({ name: '🤘 Agents les plus joués', value: agentList, inline: false });
+    }
+
+    // Top 3 joueurs (par games sur la map)
+    const topPlayers = Object.values(playerOnMap).sort((a, b) => b.games - a.games).slice(0, 5);
+    if (topPlayers.length > 0) {
+        const list = topPlayers.map(p => {
+            const wr = Math.round(p.wins / p.games * 100);
+            const kd = (p.kills / Math.max(1, p.deaths)).toFixed(2);
+            return `**${p.name}** · ${p.games}p · ${wr}% WR · ${kd} K/D`;
+        }).join('\n');
+        embed.addFields({ name: '🧍 Joueurs', value: list, inline: false });
+    }
+
+    return { embeds: [embed] };
+};
+
+const buildRecapMessage = async (period, allConfigPlayers) => {
+    let startTs, label, periodTitle;
+    const now = Date.now();
+    if (period === 'week') {
+        startTs = now - 7 * 24 * 60 * 60 * 1000;
+        label = '7 derniers jours';
+        periodTitle = 'SEMAINE';
+    } else if (period === 'month') {
+        startTs = now - 30 * 24 * 60 * 60 * 1000;
+        label = '30 derniers jours';
+        periodTitle = 'MOIS';
+    } else {
+        const challengeStart = await getConfig('challenge_start_date', '2024-01-01T00:00');
+        startTs = new Date(challengeStart).getTime();
+        label = `depuis le ${new Date(challengeStart).toLocaleDateString('fr-FR')}`;
+        periodTitle = 'CHALLENGE';
+    }
+
+    const trackedIds = allConfigPlayers.map(p => p.id);
+    if (trackedIds.length === 0) return { content: '❌ Aucun joueur configuré.' };
+
+    const placeholders = trackedIds.map(() => '?').join(',');
+    const rows = await db.all(
+        `SELECT player_id, data FROM matches WHERE type = 'ranked' AND date >= ? AND player_id IN (${placeholders}) ORDER BY date DESC`,
+        [startTs, ...trackedIds]
+    );
+
+    if (rows.length === 0) return { content: `🚫 Aucune partie classée sur cette période (${label}).` };
+
+    const matches = rows.map(r => ({ ...JSON.parse(r.data), _pid: r.player_id }));
+    const uniqueGameIds = new Set(matches.map(m => m.id));
+
+    const playerStats = {};
+    allConfigPlayers.forEach(p => {
+        playerStats[p.id] = { name: p.name, games: 0, wins: 0, kills: 0, deaths: 0, hs: 0, shots: 0, rr: 0, rrLost: 0, acsSum: 0 };
+    });
+
+    let totalWins = 0;
+    const winsCounted = new Set();
+    matches.forEach(m => {
+        if (!winsCounted.has(m.id)) {
+            if (m.result === 'WIN') totalWins++;
+            winsCounted.add(m.id);
+        }
+        const ps = playerStats[m._pid];
+        if (!ps) return;
+        ps.games++;
+        if (m.result === 'WIN') ps.wins++;
+        ps.kills += m.kills || 0;
+        ps.deaths += m.deaths || 0;
+        ps.hs += m.headshots || 0;
+        ps.shots += m.totalShots || 0;
+        ps.acsSum += m.acs || 0;
+        ps.rr += m.rrChange || 0;
+        if ((m.rrChange || 0) < 0) ps.rrLost += Math.abs(m.rrChange);
+    });
+
+    const totalGames = uniqueGameIds.size;
+    const globalWR = Math.round(totalWins / totalGames * 100);
+    const active = Object.values(playerStats).filter(p => p.games > 0);
+    const totalRR = active.reduce((s, p) => s + p.rr, 0);
+
+    const sortedByRR = [...active].sort((a, b) => b.rr - a.rr);
+    const mvp = sortedByRR[0];
+    const flop = sortedByRR[sortedByRR.length - 1];
+    const topFragger = [...active].sort((a, b) => b.kills - a.kills)[0];
+    const bestKD = [...active].sort((a, b) => (b.kills/Math.max(1,b.deaths)) - (a.kills/Math.max(1,a.deaths)))[0];
+    const sniper = [...active].filter(p => p.shots >= 50).sort((a, b) => (b.hs/b.shots) - (a.hs/a.shots))[0];
+
+    let color = 0x9ca3af;
+    if (globalWR >= 60) color = 0x10b981;
+    else if (globalWR >= 45) color = 0xfacc15;
+    else if (globalWR >= 25) color = 0x3b82f6;
+    else color = 0xef4444;
+
+    const embed = new EmbedBuilder()
+        .setTitle(`📊 RECAP ${periodTitle}`)
+        .setColor(color)
+        .setFooter({ text: `Période : ${label}` })
+        .setTimestamp()
+        .addFields({
+            name: '📈 Bilan global',
+            value: `**${totalGames}** parties · **${totalWins}V ${totalGames - totalWins}D** · **${globalWR}% WR**\nRR collectif : **${totalRR >= 0 ? '+' : ''}${totalRR}** sur l'escouade`,
+            inline: false
+        });
+
+    let fame = "";
+    if (mvp && mvp.rr > 0) fame += `👑 **MVP :** ${mvp.name} (${mvp.rr >= 0 ? '+' : ''}${mvp.rr} RR)\n`;
+    if (bestKD) fame += `🔪 **Boucher :** ${bestKD.name} (${(bestKD.kills/Math.max(1,bestKD.deaths)).toFixed(2)} K/D)\n`;
+    if (sniper) fame += `🎯 **Sniper :** ${sniper.name} (${Math.round(sniper.hs/sniper.shots*100)}% HS)\n`;
+    if (topFragger) fame += `👊 **Top Fraggeur :** ${topFragger.name} (${topFragger.kills} kills)\n`;
+    if (flop && flop.rr < 0) fame += `🤡 **Poids Mort :** ${flop.name} (${flop.rr} RR)\n`;
+    embed.addFields({ name: '🏆 Tableau d\'Honneur', value: fame || "*Aucun trophée marquant.*", inline: false });
+
+    // Classement par RR
+    const ranking = sortedByRR.slice(0, 10).map((p, i) => {
+        const medal = ['🥇','🥈','🥉'][i] ?? `${i+1}.`;
+        const wr = Math.round(p.wins/p.games*100);
+        return `${medal} **${p.name}** — \`${p.rr >= 0 ? '+' : ''}${p.rr} RR\` · ${p.games}p · ${wr}% WR`;
+    }).join('\n');
+    embed.addFields({ name: '📈 Classement par RR', value: ranking || '*Vide*', inline: false });
+
+    return { embeds: [embed] };
+};
+
+// ==========================================
 // BOT DISCORD : ÉCOUTEURS D'ÉVÉNEMENTS
 // ==========================================
 // ==========================================
@@ -910,12 +1232,31 @@ discordClient.once('clientReady', async () => {
 
     const playerOption = { type: 3, name: 'joueur', description: 'Joueur KSL (Optionnel si compte lié)', required: false };
     const linkOption = { type: 3, name: 'joueur', description: 'Ton pseudo KSL', required: true };
-    
+    const vsOption1 = { type: 3, name: 'joueur1', description: 'Premier joueur', required: true };
+    const vsOption2 = { type: 3, name: 'joueur2', description: 'Deuxième joueur', required: true };
+
     // Sécurité : Discord bloque le démarrage si les choix sont vides
     if (choices.length > 0) {
         playerOption.choices = choices;
         linkOption.choices = choices;
+        vsOption1.choices = choices;
+        vsOption2.choices = choices;
     }
+
+    const MAP_CHOICES = [
+        { name: 'Ascent', value: 'ascent' }, { name: 'Bind', value: 'bind' },
+        { name: 'Breeze', value: 'breeze' }, { name: 'Fracture', value: 'fracture' },
+        { name: 'Haven', value: 'haven' }, { name: 'Icebox', value: 'icebox' },
+        { name: 'Lotus', value: 'lotus' }, { name: 'Pearl', value: 'pearl' },
+        { name: 'Split', value: 'split' }, { name: 'Sunset', value: 'sunset' },
+        { name: 'Abyss', value: 'abyss' }
+    ];
+
+    const PERIOD_CHOICES = [
+        { name: 'Semaine (7 derniers jours)', value: 'week' },
+        { name: 'Mois (30 derniers jours)', value: 'month' },
+        { name: 'Depuis le début du challenge', value: 'challenge' }
+    ];
 
     const commands = [
         { name: 'classement', description: '🏆 Classements KSL (RR, Winrate, HS%, Parties)' },
@@ -924,6 +1265,9 @@ discordClient.once('clientReady', async () => {
         { name: 'link', description: '🔗 Lier ton compte Discord à ton profil tracker', options: [linkOption] },
         { name: 'rapport', description: '📋 Génère le rapport journalier maintenant' },
         { name: 'crosshair', description: '🎯 Affiche l\'image d\'un viseur', options: [{ type: 3, name: 'code', description: 'Le code d\'export du viseur (ex: 0;s;1;P;c;5...)', required: true }] },
+        { name: 'vs', description: '⚔️ Comparaison entre deux joueurs KSL', options: [vsOption1, vsOption2] },
+        { name: 'map', description: '🗺️ Stats du groupe sur une carte', options: [{ type: 3, name: 'carte', description: 'Nom de la carte', required: true, choices: MAP_CHOICES }] },
+        { name: 'recap', description: '📊 Récapitulatif sur une période (semaine/mois/challenge)', options: [{ type: 3, name: 'periode', description: 'Période à analyser', required: true, choices: PERIOD_CHOICES }] },
     ];
 
     try {
@@ -1112,16 +1456,39 @@ discordClient.on('interactionCreate', async interaction => {
             const code = interaction.options.getString('code');
             // L'API HenrikDev gère la génération de l'image
             const crosshairUrl = `https://api.henrikdev.xyz/valorant/v1/crosshair/generate?id=${encodeURIComponent(code)}`;
-            
+
             const embed = new EmbedBuilder()
                 .setTitle(`🎯 Aperçu du Viseur`)
                 .setDescription(`Code: \`${code}\``)
                 .setImage(crosshairUrl)
                 .setColor(0xff4655)
                 .setFooter({ text: 'Généré via HenrikDev API' });
-                
+
             await interaction.editReply({ embeds: [embed] });
         }
+
+        else if (commandName === 'vs') {
+            await interaction.deferReply();
+            const id1 = interaction.options.getString('joueur1');
+            const id2 = interaction.options.getString('joueur2');
+            const payload = await buildVsMessage(id1, id2, allConfigPlayers);
+            await interaction.editReply(payload);
+        }
+
+        else if (commandName === 'map') {
+            await interaction.deferReply();
+            const carte = interaction.options.getString('carte');
+            const payload = await buildMapMessage(carte, allConfigPlayers);
+            await interaction.editReply(payload);
+        }
+
+        else if (commandName === 'recap') {
+            await interaction.deferReply();
+            const periode = interaction.options.getString('periode');
+            const payload = await buildRecapMessage(periode, allConfigPlayers);
+            await interaction.editReply(payload);
+        }
+
         return;
     }
 
@@ -2571,6 +2938,31 @@ app.get('/history', async (req, res) => {
         console.error("❌ ERREUR CRITIQUE SUR LA ROUTE /history :", e);
         res.status(500).json({ matches: [], error: e.message });
     }
+});
+
+// SSE : flux d'événements temps réel.
+// Le front s'abonne via `new EventSource('/api/events')` et reçoit `matches_updated`
+// dès qu'une sync ajoute des matchs. Évite d'avoir à recharger manuellement.
+app.get('/api/events', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // désactive le buffering nginx si présent
+    res.flushHeaders();
+
+    res.write(`data: ${JSON.stringify({ type: 'connected', ts: Date.now() })}\n\n`);
+    sseClients.add(res);
+
+    // Heartbeat toutes les 25s pour empêcher les proxies de timeout la connexion
+    const heartbeat = setInterval(() => {
+        try { res.write(`: heartbeat\n\n`); }
+        catch { clearInterval(heartbeat); sseClients.delete(res); }
+    }, 25000);
+
+    req.on('close', () => {
+        clearInterval(heartbeat);
+        sseClients.delete(res);
+    });
 });
 
 app.post('/sync', async (req, res) => {

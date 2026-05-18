@@ -206,6 +206,22 @@ function MainApp() {
     fetchHistory();
   }, [fetchHistory]);
 
+  // SSE : refetch automatique dès qu'un nouveau match est sync côté serveur
+  useEffect(() => {
+    if (!isConfigLoaded) return;
+    const es = new EventSource(`${LOCAL_SERVER_URL}/api/events`);
+    es.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'matches_updated' && !isFetchingRef.current) {
+          fetchHistory();
+        }
+      } catch { /* ignore non-JSON heartbeats */ }
+    };
+    es.onerror = () => { /* EventSource gère la reconnexion automatiquement */ };
+    return () => es.close();
+  }, [isConfigLoaded, fetchHistory]);
+
   const forceRefreshFromRiot = useCallback(async () => {
     if (isFetchingRef.current) return;
     isFetchingRef.current = true;

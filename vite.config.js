@@ -3,6 +3,13 @@ import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig({
+  // Sur Windows, Hyper-V/WSL réserve parfois certaines plages de ports en IPv6,
+  // ce qui provoque "EACCES ::1:5173". On force l'IPv4 et on autorise un fallback.
+  server: {
+    host: '127.0.0.1',
+    port: 5173,
+    strictPort: false,
+  },
   plugins: [
     react(),
     VitePWA({

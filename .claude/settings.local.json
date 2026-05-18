@@ -19,7 +19,8 @@
       "Bash(curl -sL \"https://api.henrikdev.xyz/openapi.json\" -o openapi_henrik.json -w \"%{http_code}\\\\n\")",
       "Bash(rm openapi_henrik.json /tmp/docs.html /tmp/openapi.json /tmp/henrik.json /tmp/henrik2.json 2>/dev/null; ls openapi_henrik.json 2>&1)",
       "Bash(node --check server/server.js)",
-      "Bash(node --input-type=module --eval \"import './server/server.js'\")"
+      "Bash(node --input-type=module --eval \"import './server/server.js'\")",
+      "Bash(git check-ignore *)"
     ],
     "additionalDirectories": [
       "\\tmp"
