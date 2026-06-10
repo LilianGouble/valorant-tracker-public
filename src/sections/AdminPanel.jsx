@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Shield, Key, Users, Settings, LogOut, Check, Trash2, Plus, Info, Trophy, X, ChevronLeft, Edit3, MessageSquare } from 'lucide-react';
+import { Shield, Key, Users, Settings, LogOut, Check, Trash2, Plus, Info, Trophy, X, ChevronLeft, Edit3, MessageSquare, Database, AlertTriangle, Map as MapIcon, Filter, RefreshCw, BarChart3 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { LOCAL_SERVER_URL } from '../config/constants';
 
@@ -33,6 +33,13 @@ export const AdminPanel = () => {
     const [editingMatch, setEditingMatch] = useState(null); // { roundIndex, matchIndex, player1, player2, winner, score }
 
     const [msg, setMsg] = useState({ text: '', type: '' });
+
+    // --- GESTION DES DONNÉES ---
+    const [dataOverview, setDataOverview] = useState(null);
+    const [dataLoading, setDataLoading] = useState(false);
+    const [deleteModal, setDeleteModal] = useState(null); // { kind, label, payload, count }
+    const [confirmText, setConfirmText] = useState('');
+    const [playerToDelete, setPlayerToDelete] = useState(null); // { id, name, tag, matchCount }
 
     const showMsg = (text, type = 'success') => {
         setMsg({ text, type });
@@ -134,13 +141,98 @@ export const AdminPanel = () => {
         }
     };
 
-    const deletePlayer = async (id) => {
-        if (!window.confirm("Supprimer ce joueur ?")) return;
+    // Ouvre la modale de suppression de joueur (avec choix purge/conservation des données)
+    const deletePlayer = async (p) => {
+        let matchCount = 0;
         try {
-            await fetch(`${LOCAL_SERVER_URL}/api/admin/players/${id}`, { method: 'DELETE', headers: authHeaders });
+            const res = await fetch(`${LOCAL_SERVER_URL}/api/admin/data/overview`, { headers: authHeaders });
+            if (res.ok) {
+                const ov = await res.json();
+                matchCount = ov.byPlayer.find(bp => bp.playerId === p.id)?.count || 0;
+            }
+        } catch { /* le compteur est juste indicatif */ }
+        setPlayerToDelete({ id: p.id, name: p.name, tag: p.tag, matchCount });
+    };
+
+    const confirmDeletePlayer = async (purge) => {
+        if (!playerToDelete) return;
+        try {
+            const url = `${LOCAL_SERVER_URL}/api/admin/players/${playerToDelete.id}${purge ? '?purge=true' : ''}`;
+            const res = await fetch(url, { method: 'DELETE', headers: authHeaders });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Erreur');
+            showMsg(data.message || 'Joueur supprimé');
+            setPlayerToDelete(null);
             fetchData();
+            if (activeTab === 'data') loadDataOverview();
         } catch (err) {
-            console.error(err);
+            showMsg(err.message, 'error');
+        }
+    };
+
+    // --- GESTION DES DONNÉES ---
+    const loadDataOverview = useCallback(async () => {
+        if (!token) return;
+        setDataLoading(true);
+        try {
+            const res = await fetch(`${LOCAL_SERVER_URL}/api/admin/data/overview`, { headers: authHeaders });
+            if (res.status === 401 || res.status === 403) return handleLogout();
+            if (res.ok) setDataOverview(await res.json());
+        } catch (err) {
+            console.error('Erreur overview:', err);
+        } finally {
+            setDataLoading(false);
+        }
+    }, [token, authHeaders, handleLogout]);
+
+    useEffect(() => {
+        if (activeTab === 'data') loadDataOverview();
+    }, [activeTab, loadDataOverview]);
+
+    // Prépare une suppression filtrée : fait d'abord un dry-run pour connaître le nombre impacté.
+    const prepareDeleteMatches = async (filter, label) => {
+        try {
+            const res = await fetch(`${LOCAL_SERVER_URL}/api/admin/data/delete-matches`, {
+                method: 'POST', headers: authHeaders,
+                body: JSON.stringify({ ...filter, dryRun: true })
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Erreur');
+            if (data.affected === 0) { showMsg('Aucune donnée ne correspond à ce filtre', 'error'); return; }
+            setDeleteModal({ kind: 'filter', label, payload: filter, count: data.affected });
+        } catch (err) {
+            showMsg(err.message, 'error');
+        }
+    };
+
+    const executeDeleteModal = async () => {
+        if (!deleteModal) return;
+        try {
+            let res, data;
+            if (deleteModal.kind === 'filter') {
+                res = await fetch(`${LOCAL_SERVER_URL}/api/admin/data/delete-matches`, {
+                    method: 'POST', headers: authHeaders,
+                    body: JSON.stringify({ ...deleteModal.payload, dryRun: false })
+                });
+            } else if (deleteModal.kind === 'orphans') {
+                res = await fetch(`${LOCAL_SERVER_URL}/api/admin/data/purge-orphans`, {
+                    method: 'POST', headers: authHeaders
+                });
+            } else if (deleteModal.kind === 'all') {
+                if (confirmText !== 'SUPPRIMER TOUT') { showMsg('Texte de confirmation incorrect', 'error'); return; }
+                res = await fetch(`${LOCAL_SERVER_URL}/api/admin/data/purge-all`, {
+                    method: 'POST', headers: authHeaders,
+                    body: JSON.stringify({ confirm: 'SUPPRIMER TOUT' })
+                });
+            }
+            data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Erreur');
+            showMsg(`${data.deleted} enregistrement(s) supprimé(s)`);
+            setDeleteModal(null);
+            setConfirmText('');
+            loadDataOverview();
+        } catch (err) {
+            showMsg(err.message, 'error');
         }
     };
 
@@ -350,6 +442,79 @@ export const AdminPanel = () => {
     return (
         <div className="min-h-screen bg-[#0f1923] text-gray-100 font-sans flex flex-col md:flex-row relative">
 
+            {/* MODALE DE SUPPRESSION DE JOUEUR (avec choix purge/conservation) */}
+            {playerToDelete && (
+                <div className="fixed inset-0 bg-black/80 z-[110] flex items-center justify-center p-4 backdrop-blur-sm">
+                    <div className="bg-[#1c252e] p-6 rounded-2xl border border-red-500/30 shadow-2xl w-full max-w-md">
+                        <div className="flex items-center gap-3 mb-4 text-red-400">
+                            <AlertTriangle size={24} />
+                            <h3 className="text-xl font-black text-white uppercase italic tracking-tighter">Supprimer {playerToDelete.name}</h3>
+                        </div>
+                        <p className="text-sm text-gray-400 mb-4">
+                            Ce joueur possède <strong className="text-white">{playerToDelete.matchCount}</strong> match(s) enregistré(s).
+                            Que faire de ces données ?
+                        </p>
+                        <div className="space-y-3">
+                            <button
+                                onClick={() => confirmDeletePlayer(false)}
+                                className="w-full text-left p-4 bg-[#0f1923] hover:bg-white/5 border border-white/10 hover:border-blue-500/40 rounded-xl transition-colors"
+                            >
+                                <div className="font-bold text-blue-300">Conserver les données</div>
+                                <div className="text-xs text-gray-500 mt-0.5">Le joueur est retiré, mais ses matchs restent en base (deviennent orphelins).</div>
+                            </button>
+                            <button
+                                onClick={() => confirmDeletePlayer(true)}
+                                className="w-full text-left p-4 bg-red-500/5 hover:bg-red-500/15 border border-red-500/20 hover:border-red-500/50 rounded-xl transition-colors"
+                            >
+                                <div className="font-bold text-red-300">Purger tout ({playerToDelete.matchCount} matchs)</div>
+                                <div className="text-xs text-gray-500 mt-0.5">Supprime le joueur ET tous ses matchs. Irréversible.</div>
+                            </button>
+                        </div>
+                        <button onClick={() => setPlayerToDelete(null)} className="w-full mt-4 py-2 text-gray-500 hover:text-white text-sm font-bold transition-colors">
+                            Annuler
+                        </button>
+                    </div>
+                </div>
+            )}
+
+            {/* MODALE DE CONFIRMATION DE SUPPRESSION DE DONNÉES */}
+            {deleteModal && (
+                <div className="fixed inset-0 bg-black/80 z-[110] flex items-center justify-center p-4 backdrop-blur-sm">
+                    <div className="bg-[#1c252e] p-6 rounded-2xl border border-red-500/30 shadow-2xl w-full max-w-md">
+                        <div className="flex items-center gap-3 mb-4 text-red-400">
+                            <AlertTriangle size={24} />
+                            <h3 className="text-xl font-black text-white uppercase italic tracking-tighter">Confirmer la suppression</h3>
+                        </div>
+                        <p className="text-sm text-gray-400 mb-4">
+                            Vous êtes sur le point de supprimer <strong className="text-red-300">{deleteModal.count}</strong> enregistrement(s)
+                            {' '}correspondant à : <strong className="text-white">{deleteModal.label}</strong>. Cette action est <strong className="text-red-300">irréversible</strong>.
+                        </p>
+                        {deleteModal.kind === 'all' && (
+                            <div className="mb-4">
+                                <label className="text-xs text-gray-400 font-bold uppercase block mb-1">Tapez « SUPPRIMER TOUT » pour confirmer</label>
+                                <input
+                                    type="text" value={confirmText} onChange={e => setConfirmText(e.target.value)}
+                                    className="w-full bg-[#0f1923] text-white p-3 rounded border border-red-500/30 outline-none focus:border-red-500 font-mono text-sm"
+                                    placeholder="SUPPRIMER TOUT"
+                                />
+                            </div>
+                        )}
+                        <div className="flex gap-3 mt-2">
+                            <button onClick={() => { setDeleteModal(null); setConfirmText(''); }} className="flex-1 py-3 bg-white/5 hover:bg-white/10 text-gray-300 font-bold rounded-xl transition-colors">
+                                Annuler
+                            </button>
+                            <button
+                                onClick={executeDeleteModal}
+                                disabled={deleteModal.kind === 'all' && confirmText !== 'SUPPRIMER TOUT'}
+                                className="flex-1 py-3 bg-red-500 hover:bg-red-600 disabled:opacity-40 disabled:cursor-not-allowed text-white font-black uppercase tracking-wider rounded-xl transition-colors"
+                            >
+                                Supprimer
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* MODALE D'ÉDITION DE MATCH */}
             {editingMatch && (
                 <div className="fixed inset-0 bg-black/80 z-[100] flex items-center justify-center p-4 backdrop-blur-sm">
@@ -405,6 +570,9 @@ export const AdminPanel = () => {
                     </button>
                     <button onClick={() => { setActiveTab('tournaments'); setEditingTourney(null); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-bold transition-colors ${activeTab === 'tournaments' ? 'bg-white/10 text-white' : 'text-gray-400 hover:text-white'}`}>
                         <Trophy size={18} /> Gérer les Tournois
+                    </button>
+                    <button onClick={() => { setActiveTab('data'); setEditingTourney(null); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-bold transition-colors ${activeTab === 'data' ? 'bg-white/10 text-white' : 'text-gray-400 hover:text-white'}`}>
+                        <Database size={18} /> Gestion des Données
                     </button>
                     <button onClick={() => { setActiveTab('keys'); setEditingTourney(null); }} className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-bold transition-colors ${activeTab === 'keys' ? 'bg-white/10 text-white' : 'text-gray-400 hover:text-white'}`}>
                         <Key size={18} /> Clés API Riot
@@ -501,7 +669,7 @@ export const AdminPanel = () => {
                                                 <button onClick={() => startEditPlayer(p)} className="p-2 text-blue-400 hover:bg-blue-400/10 rounded transition-colors" title="Modifier pseudo/couleur">
                                                     <Edit3 size={18} />
                                                 </button>
-                                                <button onClick={() => deletePlayer(p.id)} className="p-2 text-gray-500 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors">
+                                                <button onClick={() => deletePlayer(p)} className="p-2 text-gray-500 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors">
                                                     <Trash2 size={18} />
                                                 </button>
                                             </>
@@ -641,6 +809,18 @@ export const AdminPanel = () => {
                     </div>
                 )}
 
+                {/* ONGLET GESTION DES DONNÉES */}
+                {activeTab === 'data' && (
+                    <DataManagement
+                        overview={dataOverview}
+                        loading={dataLoading}
+                        onReload={loadDataOverview}
+                        onDeleteFilter={prepareDeleteMatches}
+                        onPurgeOrphans={() => setDeleteModal({ kind: 'orphans', label: 'données orphelines', count: dataOverview?.orphanCount || 0 })}
+                        onPurgeAll={() => { setConfirmText(''); setDeleteModal({ kind: 'all', label: 'TOUT l\'historique', count: dataOverview?.total || 0 }); }}
+                    />
+                )}
+
                 {/* ONGLET CLÉS API */}
                 {activeTab === 'keys' && (
                     <div className="space-y-6">
@@ -761,6 +941,260 @@ export const AdminPanel = () => {
                     </div>
                 )}
             </main>
+        </div>
+    );
+};
+
+// ==========================================
+// COMPOSANT : GESTION DES DONNÉES
+// ==========================================
+const StatCard = ({ label, value, accent = 'text-white', sub }) => (
+    <div className="bg-[#1c252e] border border-white/5 rounded-xl p-4">
+        <div className="text-[10px] font-black uppercase tracking-widest text-gray-500 mb-1">{label}</div>
+        <div className={`text-2xl font-black ${accent}`}>{value}</div>
+        {sub && <div className="text-[10px] text-gray-500 mt-0.5">{sub}</div>}
+    </div>
+);
+
+const fmtDate = (ms) => {
+    if (!ms) return '—';
+    return new Date(Number(ms)).toLocaleDateString('fr-FR', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+const DataManagement = ({ overview, loading, onReload, onDeleteFilter, onPurgeOrphans, onPurgeAll }) => {
+    const [agentSearch, setAgentSearch] = useState('');
+    const [filterType, setFilterType] = useState('');
+    const [filterResult, setFilterResult] = useState('');
+    const [filterPlayer, setFilterPlayer] = useState('');
+    const [filterBefore, setFilterBefore] = useState('');
+
+    if (loading && !overview) {
+        return <div className="flex items-center gap-3 text-gray-400 p-8"><RefreshCw className="animate-spin" size={18} /> Chargement des données...</div>;
+    }
+    if (!overview) {
+        return (
+            <div className="p-8 text-center">
+                <button onClick={onReload} className="px-6 py-3 bg-white/5 hover:bg-white/10 rounded-xl font-bold text-gray-300">Charger les données</button>
+            </div>
+        );
+    }
+
+    const filteredAgents = overview.byAgent.filter(a =>
+        a.agent.toLowerCase().includes(agentSearch.toLowerCase())
+    );
+
+    const buildCustomFilter = () => {
+        const f = {};
+        const labels = [];
+        if (filterType)   { f.type = filterType;     labels.push(`type=${filterType}`); }
+        if (filterResult) { f.result = filterResult; labels.push(`résultat=${filterResult}`); }
+        if (filterPlayer) {
+            f.playerId = filterPlayer;
+            const pc = overview.players.find(p => p.id === filterPlayer);
+            labels.push(`joueur=${pc ? pc.name : filterPlayer}`);
+        }
+        if (filterBefore) {
+            f.before = new Date(filterBefore).getTime();
+            labels.push(`avant ${new Date(filterBefore).toLocaleDateString('fr-FR')}`);
+        }
+        return { filter: f, label: labels.join(' · ') || 'tous les matchs' };
+    };
+
+    const hasCustomFilter = filterType || filterResult || filterPlayer || filterBefore;
+
+    return (
+        <div className="space-y-8">
+            <div className="flex items-center justify-between">
+                <div>
+                    <h2 className="text-2xl font-black text-white uppercase tracking-tight flex items-center gap-2">
+                        <Database size={24} className="text-[#ff4655]" /> Gestion des Données
+                    </h2>
+                    <p className="text-gray-400 text-sm mt-1">Visualisez et faites le tri dans l'ensemble des matchs stockés.</p>
+                </div>
+                <button onClick={onReload} className="flex items-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-sm font-bold text-gray-300 transition-colors">
+                    <RefreshCw size={16} className={loading ? 'animate-spin' : ''} /> Rafraîchir
+                </button>
+            </div>
+
+            {/* CARTES DE STATISTIQUES */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <StatCard label="Enregistrements" value={overview.total.toLocaleString('fr-FR')} accent="text-white" />
+                <StatCard label="Joueurs trackés" value={overview.players.length} accent="text-blue-400" />
+                <StatCard label="Données orphelines" value={overview.orphanCount} accent={overview.orphanCount > 0 ? 'text-amber-400' : 'text-gray-500'} sub={overview.orphanCount > 0 ? 'À nettoyer' : 'Aucune'} />
+                <StatCard label="Période" value={fmtDate(overview.dateRange.min)} accent="text-gray-300" sub={`→ ${fmtDate(overview.dateRange.max)}`} />
+            </div>
+
+            {/* RÉPARTITION PAR TYPE */}
+            <div>
+                <h3 className="text-xs font-black uppercase tracking-widest text-gray-500 mb-3 flex items-center gap-2"><BarChart3 size={14} /> Répartition par mode</h3>
+                <div className="flex flex-wrap gap-2">
+                    {overview.byType.map(t => (
+                        <div key={t.type} className="group relative flex items-center gap-2 bg-[#1c252e] border border-white/5 rounded-lg pl-3 pr-1.5 py-1.5">
+                            <span className="text-sm font-bold text-white uppercase">{t.type}</span>
+                            <span className="text-xs font-mono text-gray-400">{t.count}</span>
+                            <button
+                                onClick={() => onDeleteFilter({ type: t.type }, `tous les matchs « ${t.type} »`)}
+                                className="p-1 text-gray-600 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors" title={`Supprimer tous les ${t.type}`}>
+                                <Trash2 size={14} />
+                            </button>
+                        </div>
+                    ))}
+                </div>
+            </div>
+
+            {/* SUPPRESSION FILTRÉE PERSONNALISÉE */}
+            <div className="bg-[#1c252e] border border-white/5 rounded-xl p-5">
+                <h3 className="font-bold text-white mb-1 flex items-center gap-2"><Filter size={16} /> Suppression ciblée</h3>
+                <p className="text-xs text-gray-500 mb-4">Combinez plusieurs critères. Un récapitulatif du nombre de matchs impactés s'affiche avant validation.</p>
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4">
+                    <div>
+                        <label className="text-[10px] text-gray-500 uppercase font-bold block mb-1">Mode</label>
+                        <select value={filterType} onChange={e => setFilterType(e.target.value)} className="w-full bg-[#0f1923] text-white p-2 rounded border border-white/10 outline-none text-sm">
+                            <option value="">Tous</option>
+                            {overview.byType.map(t => <option key={t.type} value={t.type}>{t.type}</option>)}
+                        </select>
+                    </div>
+                    <div>
+                        <label className="text-[10px] text-gray-500 uppercase font-bold block mb-1">Résultat</label>
+                        <select value={filterResult} onChange={e => setFilterResult(e.target.value)} className="w-full bg-[#0f1923] text-white p-2 rounded border border-white/10 outline-none text-sm">
+                            <option value="">Tous</option>
+                            <option value="WIN">Victoire</option>
+                            <option value="LOSS">Défaite</option>
+                            <option value="DRAW">Égalité</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label className="text-[10px] text-gray-500 uppercase font-bold block mb-1">Joueur</label>
+                        <select value={filterPlayer} onChange={e => setFilterPlayer(e.target.value)} className="w-full bg-[#0f1923] text-white p-2 rounded border border-white/10 outline-none text-sm">
+                            <option value="">Tous</option>
+                            {overview.players.map(p => <option key={p.id} value={p.id}>{p.name} #{p.tag}</option>)}
+                        </select>
+                    </div>
+                    <div>
+                        <label className="text-[10px] text-gray-500 uppercase font-bold block mb-1">Antérieur au</label>
+                        <input type="date" value={filterBefore} onChange={e => setFilterBefore(e.target.value)} className="w-full bg-[#0f1923] text-white p-2 rounded border border-white/10 outline-none text-sm" />
+                    </div>
+                </div>
+                <button
+                    disabled={!hasCustomFilter}
+                    onClick={() => { const { filter, label } = buildCustomFilter(); onDeleteFilter(filter, label); }}
+                    className="flex items-center gap-2 px-4 py-2 bg-red-500/15 hover:bg-red-500/25 disabled:opacity-30 disabled:cursor-not-allowed text-red-300 font-bold rounded-lg text-sm transition-colors">
+                    <Trash2 size={15} /> Supprimer selon ces critères
+                </button>
+            </div>
+
+            {/* DONNÉES PAR JOUEUR */}
+            <div>
+                <h3 className="text-xs font-black uppercase tracking-widest text-gray-500 mb-3 flex items-center gap-2"><Users size={14} /> Données par joueur</h3>
+                <div className="bg-[#1c252e] border border-white/5 rounded-xl overflow-hidden">
+                    {overview.byPlayer.map(p => (
+                        <div key={p.playerId} className="flex items-center justify-between p-3 border-b border-white/5 last:border-0 hover:bg-white/5 transition-colors">
+                            <div className="flex items-center gap-3 min-w-0">
+                                <div className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: p.color || '#555' }}></div>
+                                <div className="min-w-0">
+                                    <div className="font-bold text-white text-sm truncate">
+                                        {p.name ? <>{p.name} <span className="text-gray-500 text-xs">#{p.tag}</span></> : <span className="text-amber-400">⚠ {p.playerId} (orphelin)</span>}
+                                    </div>
+                                    <div className="text-[10px] text-gray-500">Dernière activité : {fmtDate(p.lastDate)}</div>
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-3 shrink-0">
+                                <span className="text-sm font-mono font-bold text-gray-300">{p.count}</span>
+                                <button
+                                    onClick={() => onDeleteFilter({ playerId: p.playerId }, `tous les matchs de ${p.name || p.playerId}`)}
+                                    className="p-2 text-gray-600 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors" title="Supprimer les matchs de ce joueur">
+                                    <Trash2 size={16} />
+                                </button>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </div>
+
+            {/* DONNÉES PAR AGENT */}
+            <div>
+                <div className="flex items-center justify-between mb-3">
+                    <h3 className="text-xs font-black uppercase tracking-widest text-gray-500 flex items-center gap-2"><Shield size={14} /> Données par agent ({filteredAgents.length})</h3>
+                    <input type="text" placeholder="Filtrer un agent..." value={agentSearch} onChange={e => setAgentSearch(e.target.value)} className="bg-[#0f1923] text-white px-3 py-1.5 rounded-lg border border-white/10 outline-none text-xs w-44" />
+                </div>
+                <div className="bg-[#1c252e] border border-white/5 rounded-xl overflow-hidden max-h-[400px] overflow-y-auto custom-scrollbar">
+                    {filteredAgents.map(a => {
+                        const wr = a.count > 0 ? Math.round((a.wins / a.count) * 100) : 0;
+                        return (
+                            <div key={a.agent} className="flex items-center justify-between p-3 border-b border-white/5 last:border-0 hover:bg-white/5 transition-colors">
+                                <div className="flex items-center gap-3 min-w-0 flex-grow">
+                                    <span className="font-bold text-white text-sm w-28 truncate">{a.agent}</span>
+                                    <div className="flex-grow max-w-[200px] hidden md:block">
+                                        <div className="h-1.5 bg-white/5 rounded-full overflow-hidden">
+                                            <div className={`h-full ${wr >= 50 ? 'bg-emerald-500' : 'bg-red-500'}`} style={{ width: `${wr}%` }}></div>
+                                        </div>
+                                    </div>
+                                    <span className={`text-[10px] font-bold ${wr >= 50 ? 'text-emerald-400' : 'text-red-400'} w-10`}>{wr}% WR</span>
+                                </div>
+                                <div className="flex items-center gap-4 shrink-0">
+                                    <span className="text-[10px] text-gray-500 font-mono hidden sm:inline">{a.avgAcs} ACS</span>
+                                    <span className="text-sm font-mono font-bold text-gray-300 w-10 text-right">{a.count}</span>
+                                    <button
+                                        onClick={() => onDeleteFilter({ agent: a.agent }, `tous les matchs avec l'agent « ${a.agent} »`)}
+                                        className="p-2 text-gray-600 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors" title={`Supprimer les données de ${a.agent}`}>
+                                        <Trash2 size={16} />
+                                    </button>
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            </div>
+
+            {/* DONNÉES PAR MAP */}
+            <div>
+                <h3 className="text-xs font-black uppercase tracking-widest text-gray-500 mb-3 flex items-center gap-2"><MapIcon size={14} /> Données par map</h3>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {overview.byMap.map(m => {
+                        const wr = m.count > 0 ? Math.round((m.wins / m.count) * 100) : 0;
+                        return (
+                            <div key={m.map} className="flex items-center justify-between bg-[#1c252e] border border-white/5 rounded-lg p-3 hover:bg-white/5 transition-colors">
+                                <div>
+                                    <div className="font-bold text-white text-sm">{m.map}</div>
+                                    <div className={`text-[10px] font-bold ${wr >= 50 ? 'text-emerald-400' : 'text-red-400'}`}>{wr}% WR · {m.count} matchs</div>
+                                </div>
+                                <button
+                                    onClick={() => onDeleteFilter({ map: m.map }, `tous les matchs sur « ${m.map} »`)}
+                                    className="p-2 text-gray-600 hover:text-red-400 hover:bg-red-400/10 rounded transition-colors" title={`Supprimer les données de ${m.map}`}>
+                                    <Trash2 size={16} />
+                                </button>
+                            </div>
+                        );
+                    })}
+                </div>
+            </div>
+
+            {/* ZONE DANGEREUSE */}
+            <div className="border border-red-500/20 rounded-xl p-5 bg-red-500/5">
+                <h3 className="font-black text-red-400 uppercase mb-4 flex items-center gap-2"><AlertTriangle size={18} /> Zone dangereuse</h3>
+                <div className="space-y-3">
+                    {overview.orphanCount > 0 && (
+                        <div className="flex items-center justify-between flex-wrap gap-3">
+                            <div>
+                                <div className="font-bold text-white text-sm">Nettoyer les données orphelines</div>
+                                <div className="text-xs text-gray-500">{overview.orphanCount} match(s) appartenant à des joueurs supprimés.</div>
+                            </div>
+                            <button onClick={onPurgeOrphans} className="px-4 py-2 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 font-bold rounded-lg text-sm transition-colors whitespace-nowrap">
+                                Purger les orphelins
+                            </button>
+                        </div>
+                    )}
+                    <div className="flex items-center justify-between flex-wrap gap-3 pt-3 border-t border-red-500/10">
+                        <div>
+                            <div className="font-bold text-white text-sm">Réinitialiser tout l'historique</div>
+                            <div className="text-xs text-gray-500">Supprime les {overview.total.toLocaleString('fr-FR')} matchs. Joueurs, clés et config conservés.</div>
+                        </div>
+                        <button onClick={onPurgeAll} className="px-4 py-2 bg-red-500/15 hover:bg-red-500/30 text-red-300 font-black uppercase tracking-wider rounded-lg text-sm transition-colors whitespace-nowrap">
+                            Tout supprimer
+                        </button>
+                    </div>
+                </div>
+            </div>
         </div>
     );
 };

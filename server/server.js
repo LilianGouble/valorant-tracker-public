@@ -1693,10 +1693,163 @@ app.put('/api/admin/players/:id', authenticateToken, async (req, res) => {
 });
 
 app.delete('/api/admin/players/:id', authenticateToken, async (req, res) => {
+    const purge = req.query.purge === 'true' || req.query.purge === '1';
+    let purgedMatches = 0;
+    if (purge) {
+        const r = await db.run("DELETE FROM matches WHERE player_id = ?", [req.params.id]);
+        purgedMatches = r.changes || 0;
+    }
     await db.run("DELETE FROM players WHERE id = ?", [req.params.id]);
     invalidatePublicConfigCache();
     invalidateDiscordCache();
-    res.json({ message: "Joueur supprimé" });
+    res.json({
+        message: purge
+            ? `Joueur supprimé + ${purgedMatches} match(s) purgé(s)`
+            : "Joueur supprimé (données conservées)",
+        purgedMatches
+    });
+});
+
+// ==========================================
+// GESTION DES DONNÉES (Data Management)
+// ==========================================
+
+// Vue d'ensemble : compteurs globaux, répartition par type, par joueur, par agent, données orphelines.
+app.get('/api/admin/data/overview', authenticateToken, async (req, res) => {
+    try {
+        const players = await getPlayers();
+        const playerIds = new Set(players.map(p => p.id));
+
+        const totalRow = await db.get("SELECT COUNT(*) AS c, MIN(date) AS minD, MAX(date) AS maxD FROM matches");
+
+        const byType = await db.all(
+            "SELECT COALESCE(type, 'inconnu') AS type, COUNT(*) AS count FROM matches GROUP BY type ORDER BY count DESC"
+        );
+
+        // Par joueur tracké : nombre de matchs + dernière activité
+        const byPlayerRows = await db.all(
+            "SELECT player_id, COUNT(*) AS count, MAX(date) AS lastDate FROM matches GROUP BY player_id"
+        );
+        const byPlayer = byPlayerRows.map(r => {
+            const cfg = players.find(p => p.id === r.player_id);
+            return {
+                playerId: r.player_id,
+                name: cfg ? cfg.name : null,
+                tag: cfg ? cfg.tag : null,
+                color: cfg ? cfg.color : null,
+                count: r.count,
+                lastDate: r.lastDate,
+                orphan: !playerIds.has(r.player_id)
+            };
+        }).sort((a, b) => b.count - a.count);
+
+        // Par agent (sur la perspective du joueur tracké, colonne indexée)
+        const byAgent = await db.all(
+            "SELECT COALESCE(NULLIF(agent, ''), 'Inconnu') AS agent, COUNT(*) AS count, " +
+            "SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) AS wins, " +
+            "AVG(acs) AS avgAcs FROM matches GROUP BY agent ORDER BY count DESC"
+        );
+
+        // Par map
+        const byMap = await db.all(
+            "SELECT COALESCE(NULLIF(map, ''), 'Inconnue') AS map, COUNT(*) AS count, " +
+            "SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) AS wins FROM matches GROUP BY map ORDER BY count DESC"
+        );
+
+        const orphanCount = byPlayer.filter(p => p.orphan).reduce((acc, p) => acc + p.count, 0);
+
+        res.json({
+            total: totalRow.c || 0,
+            dateRange: { min: totalRow.minD, max: totalRow.maxD },
+            byType,
+            byPlayer,
+            byAgent: byAgent.map(a => ({
+                agent: a.agent, count: a.count, wins: a.wins || 0,
+                avgAcs: Math.round(a.avgAcs || 0)
+            })),
+            byMap: byMap.map(m => ({ map: m.map, count: m.count, wins: m.wins || 0 })),
+            orphanCount,
+            players: players.map(p => ({ id: p.id, name: p.name, tag: p.tag, color: p.color }))
+        });
+    } catch (e) {
+        console.error("❌ data/overview:", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Suppression ciblée de matchs selon des filtres combinables.
+// Body: { type, agent, map, result, playerId, before (ms), after (ms), dryRun }
+app.post('/api/admin/data/delete-matches', authenticateToken, async (req, res) => {
+    try {
+        const { type, agent, map, result, playerId, before, after, dryRun } = req.body || {};
+
+        const where = [];
+        const params = [];
+        if (type)     { where.push("type = ?");            params.push(type); }
+        if (agent)    { where.push("LOWER(agent) = ?");    params.push(String(agent).toLowerCase()); }
+        if (map)      { where.push("LOWER(map) = ?");      params.push(String(map).toLowerCase()); }
+        if (result)   { where.push("result = ?");          params.push(result); }
+        if (playerId) { where.push("player_id = ?");       params.push(playerId); }
+        if (before)   { where.push("date < ?");            params.push(Number(before)); }
+        if (after)    { where.push("date > ?");            params.push(Number(after)); }
+
+        // Sécurité : on refuse une suppression sans aucun filtre (utiliser /purge-all pour ça).
+        if (where.length === 0) {
+            return res.status(400).json({ error: "Au moins un filtre est requis pour une suppression ciblée." });
+        }
+
+        const whereClause = "WHERE " + where.join(" AND ");
+        const countRow = await db.get(`SELECT COUNT(*) AS c FROM matches ${whereClause}`, params);
+        const affected = countRow.c || 0;
+
+        if (dryRun) {
+            return res.json({ dryRun: true, affected });
+        }
+
+        const r = await db.run(`DELETE FROM matches ${whereClause}`, params);
+        invalidatePublicConfigCache();
+        res.json({ deleted: r.changes || 0 });
+    } catch (e) {
+        console.error("❌ data/delete-matches:", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Suppression des données orphelines (matchs dont le player_id n'est plus un joueur configuré).
+app.post('/api/admin/data/purge-orphans', authenticateToken, async (req, res) => {
+    try {
+        const players = await getPlayers();
+        const ids = players.map(p => p.id);
+        let deleted = 0;
+        if (ids.length === 0) {
+            const r = await db.run("DELETE FROM matches");
+            deleted = r.changes || 0;
+        } else {
+            const placeholders = ids.map(() => '?').join(',');
+            const r = await db.run(`DELETE FROM matches WHERE player_id NOT IN (${placeholders})`, ids);
+            deleted = r.changes || 0;
+        }
+        invalidatePublicConfigCache();
+        res.json({ deleted });
+    } catch (e) {
+        console.error("❌ data/purge-orphans:", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Reset complet de l'historique des matchs (joueurs/clés/config conservés). Garde-fou par mot-clé.
+app.post('/api/admin/data/purge-all', authenticateToken, async (req, res) => {
+    try {
+        if (req.body?.confirm !== 'SUPPRIMER TOUT') {
+            return res.status(400).json({ error: "Confirmation invalide. Tapez exactement : SUPPRIMER TOUT" });
+        }
+        const r = await db.run("DELETE FROM matches");
+        invalidatePublicConfigCache();
+        res.json({ deleted: r.changes || 0 });
+    } catch (e) {
+        console.error("❌ data/purge-all:", e.message);
+        res.status(500).json({ error: e.message });
+    }
 });
 
 app.get('/api/admin/keys', authenticateToken, async (req, res) => {
