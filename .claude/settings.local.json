@@ -21,7 +21,8 @@
       "Bash(node --check server/server.js)",
       "Bash(node --input-type=module --eval \"import './server/server.js'\")",
       "Bash(git check-ignore *)",
-      "Bash(node --check server.js)"
+      "Bash(node --check server.js)",
+      "Bash(node -e \"const l=require\\('lucide-react'\\); console.log\\('IdCard:', !!l.IdCard, '| TrendingDown:', !!l.TrendingDown, '| MapPin:', !!l.MapPin, '| Lock:', !!l.Lock\\)\")"
     ],
     "additionalDirectories": [
       "\\tmp"

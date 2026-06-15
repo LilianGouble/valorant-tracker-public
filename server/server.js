@@ -3041,6 +3041,103 @@ const generateDailyReport = async (isManual = false, forceDate = null) => {
 // ROUTES PUBLIQUES (FRONTEND CLASSIQUE)
 // ==========================================
 
+// ==========================================
+// SOIRÉE EN DIRECT (Live session)
+// ==========================================
+// Lit uniquement la DB (zéro coût API). Renvoie l'état de session de chaque
+// joueur : actif ce soir, RR du jour, dernière partie il y a X min, "probablement
+// en game" (heuristique), série en cours. Le polling MMR réel se fait via le cron.
+app.get('/api/live/session', async (req, res) => {
+    try {
+        const players = await getPlayers();
+        const now = Date.now();
+
+        // Fenêtre "session" : depuis 16h heure de Paris aujourd'hui (ou hier si on est
+        // tôt le matin), pour capturer une soirée qui déborde après minuit.
+        const paris = new Date(now);
+        const startOfWindow = new Date(paris);
+        startOfWindow.setHours(16, 0, 0, 0);
+        // Si on est entre minuit et 6h, la soirée est celle d'hier soir.
+        if (paris.getHours() < 6) startOfWindow.setDate(startOfWindow.getDate() - 1);
+        const windowStart = startOfWindow.getTime();
+
+        const sessions = [];
+        for (const p of players) {
+            const rows = await db.all(
+                "SELECT data FROM matches WHERE player_id = ? AND type = 'ranked' AND date >= ? ORDER BY date DESC",
+                [p.id, windowStart]
+            );
+            const games = rows.map(r => { try { return JSON.parse(r.data); } catch { return null; } }).filter(Boolean);
+
+            // Dernier match connu (même hors fenêtre) pour le rang/RR courant.
+            const lastRow = await db.get(
+                "SELECT data FROM matches WHERE player_id = ? AND type = 'ranked' ORDER BY date DESC LIMIT 1",
+                [p.id]
+            );
+            const lastMatch = lastRow ? (() => { try { return JSON.parse(lastRow.data); } catch { return null; } })() : null;
+
+            const sessionRR = games.reduce((s, m) => s + (m.rrChange || 0), 0);
+            const wins = games.filter(m => m.result === 'WIN').length;
+            const losses = games.filter(m => m.result === 'LOSS').length;
+
+            // Heure du dernier match (toutes sessions confondues)
+            const lastTs = lastMatch ? (lastMatch.timestamp ? lastMatch.timestamp * 1000 : new Date(lastMatch.date).getTime()) : null;
+            const minSinceLast = lastTs ? Math.floor((now - lastTs) / 60000) : null;
+
+            // Série en cours (sur la session)
+            let streak = 0, streakType = null;
+            for (const m of games) {
+                const r = m.result === 'WIN' ? 'W' : (m.result === 'LOSS' ? 'L' : null);
+                if (!r) continue;
+                if (streakType === null) { streakType = r; streak = 1; }
+                else if (r === streakType) streak++;
+                else break;
+            }
+
+            // Heuristique "probablement en game" : a joué dans la fenêtre, dernière partie
+            // il y a 20-55 min (durée typique d'une ranked en cours), et c'est le soir.
+            const playedTonight = games.length > 0;
+            const likelyInGame = playedTonight && minSinceLast !== null && minSinceLast >= 20 && minSinceLast <= 55;
+            // "Actif" : a joué il y a moins de 90 min.
+            const active = minSinceLast !== null && minSinceLast <= 90 && playedTonight;
+
+            sessions.push({
+                id: p.id, name: p.name, tag: p.tag, color: p.color,
+                rank: lastMatch?.currentRank || null,
+                rr: lastMatch?.currentRR ?? null,
+                rankValue: lastMatch?.rankValue ?? 0,
+                sessionRR, wins, losses, gamesTonight: games.length,
+                minSinceLast, lastTs,
+                streak, streakType,
+                active, likelyInGame, playedTonight,
+            });
+        }
+
+        // Tri : en game d'abord, puis actifs, puis par RR de session décroissant.
+        sessions.sort((a, b) => {
+            if (a.likelyInGame !== b.likelyInGame) return a.likelyInGame ? -1 : 1;
+            if (a.active !== b.active) return a.active ? -1 : 1;
+            return b.sessionRR - a.sessionRR;
+        });
+
+        const collective = sessions.reduce((acc, s) => {
+            acc.rr += s.sessionRR; acc.wins += s.wins; acc.losses += s.losses; acc.games += s.gamesTonight;
+            return acc;
+        }, { rr: 0, wins: 0, losses: 0, games: 0 });
+
+        res.json({
+            windowStart,
+            now,
+            collective,
+            activeCount: sessions.filter(s => s.active).length,
+            sessions,
+        });
+    } catch (e) {
+        console.error("❌ /api/live/session:", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.get('/history', async (req, res) => {
     try {
         // Cache HTTP : si rien n'a bougé depuis la dernière sync,
@@ -3193,8 +3290,34 @@ app.get('/trigger-report', async (req, res) => {
     }
 });
 
-// Tâches CRON (Toutes les 5 minutes pour être plus rapide, et tous les jours à 01h00 Paris)
-cron.schedule('*/5 * * * *', () => { syncAllPlayers('all'); });
+// --- POLLING MALIN ---
+// On synchronise plus souvent quand les gens jouent (soir + week-end) et plus
+// lentement la journée, pour rester réactif tout en économisant le quota API.
+// Le cron tourne toutes les minutes mais ne déclenche une sync que si le rythme
+// courant (2/5/15 min selon l'heure) est atteint.
+const getPollingIntervalMin = () => {
+    const paris = new Date(new Date().toLocaleString('en-US', { timeZone: 'Europe/Paris' }));
+    const h = paris.getHours();
+    const day = paris.getDay(); // 0 = dimanche, 6 = samedi
+    const isWeekend = day === 0 || day === 6;
+    const isEvening = h >= 18 || h < 1;          // 18h → 01h : prime time
+    const isDaytimeActive = h >= 10 && h < 18;   // journée
+
+    if (isEvening) return 2;                       // soirée : ultra réactif
+    if (isWeekend && isDaytimeActive) return 3;    // week-end après-midi
+    if (isDaytimeActive) return 5;                 // semaine en journée
+    return 15;                                     // nuit profonde / heures creuses
+};
+
+let lastSyncAt = 0;
+cron.schedule('* * * * *', () => {
+    const intervalMs = getPollingIntervalMin() * 60 * 1000;
+    if (Date.now() - lastSyncAt >= intervalMs) {
+        lastSyncAt = Date.now();
+        syncAllPlayers('all').catch(e => console.error("Sync auto:", e.message));
+    }
+});
+
 cron.schedule('0 1 * * *', () => { generateDailyReport(false); }, { timezone: "Europe/Paris" });
 
 app.listen(PORT, '0.0.0.0', () => {

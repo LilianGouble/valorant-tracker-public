@@ -39,6 +39,38 @@ export const Badge = ({ children, className = "bg-gray-700 text-gray-300" }) => 
     </span>
 );
 
+// --- PRIMITIVES VISUELLES PARTAGÉES (look unifié sur tout le site) ---
+
+// En-tête de section standardisé : grosse typo italique + icône accentuée + action optionnelle.
+export const SectionHeader = ({ icon: Icon, title, subtitle, accent = '#ff4655', action }) => (
+    <div className="flex items-end justify-between gap-4 mb-5 sm:mb-6 border-b border-white/10 pb-3">
+        <div className="flex items-center gap-3 min-w-0">
+            {Icon && (
+                <div className="p-2.5 rounded-xl shrink-0" style={{ backgroundColor: accent + '1f', color: accent, boxShadow: `0 0 18px ${accent}33` }}>
+                    <Icon size={22} />
+                </div>
+            )}
+            <div className="min-w-0">
+                <h2 className="text-xl sm:text-2xl font-black text-white italic tracking-tighter uppercase leading-none truncate">{title}</h2>
+                {subtitle && <p className="text-[11px] sm:text-xs text-gray-500 font-bold mt-1 truncate">{subtitle}</p>}
+            </div>
+        </div>
+        {action && <div className="shrink-0">{action}</div>}
+    </div>
+);
+
+// Petite tuile de statistique (label + valeur + icône). Réutilisée profil, accueil, etc.
+export const StatPill = ({ label, value, accent = 'text-white', icon: Icon, sub }) => (
+    <div className="bg-black/30 border border-white/5 rounded-xl p-3 flex items-center gap-3">
+        {Icon && <Icon size={18} className="text-gray-500 shrink-0" />}
+        <div className="min-w-0">
+            <div className="text-[9px] font-black uppercase tracking-widest text-gray-500 leading-none">{label}</div>
+            <div className={`text-lg font-black leading-tight ${accent}`}>{value}</div>
+            {sub && <div className="text-[9px] text-gray-500 font-bold mt-0.5">{sub}</div>}
+        </div>
+    </div>
+);
+
 export const StatPodium = ({ title, icon: Icon, data, suffix = "" }) => {
     if (!data || data.length === 0) return null;
     const [first, second, third] = data;

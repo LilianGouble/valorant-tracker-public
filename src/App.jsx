@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspens
 import {
   Crosshair, Swords, Trophy, Award, Cloud, BrainCircuit, Server,
   RefreshCw, AlertTriangle, Users, BarChart2, Handshake, Menu, User,
-  X as CloseIcon, Target, Map as MapIcon, Skull, Send, Banknote, Zap, Settings, Calendar
+  X as CloseIcon, Target, Map as MapIcon, Skull, Send, Banknote, Zap, Settings, Calendar, IdCard, Radio
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Routes, Route, Navigate, useNavigate, useParams } from 'react-router-dom';
@@ -34,6 +34,8 @@ const AdminPanel = namedLazy(() => import('./sections/AdminPanel.jsx'), 'AdminPa
 const SkirmishAnalysis = namedLazy(() => import('./sections/SkirmishAnalysis.jsx'), 'SkirmishAnalysis');
 const Tournaments = namedLazy(() => import('./sections/Tournaments.jsx'), 'Tournaments');
 const SeasonWrapUp = namedLazy(() => import('./sections/SeasonWrapUp.jsx'), 'SeasonWrapUp');
+const PlayerProfile = namedLazy(() => import('./sections/PlayerProfile.jsx'), 'PlayerProfile');
+const LiveNight = namedLazy(() => import('./sections/LiveNight.jsx'), 'LiveNight');
 
 // Modale lourde, chargée seulement au clic sur un match
 const MatchDetailModal = namedLazy(() => import('./components/UI'), 'MatchDetailModal');
@@ -283,7 +285,9 @@ function MainApp() {
         </div>
 
         <div className="flex-grow py-6 px-3 space-y-1.5 overflow-y-auto custom-scrollbar">
+          <SidebarItem id="live" label="SOIRÉE EN DIRECT" icon={Radio} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
           <SidebarItem id="rush" label="RUSH IMMORTAL" icon={Trophy} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
+          <SidebarItem id="profil" label="PROFIL JOUEUR" icon={IdCard} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
           <SidebarItem id="wrapup" label="BILAN DE SAISON" icon={Calendar} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
           <div className="my-4 border-t border-white/5 mx-2"></div>
           <SidebarItem id="skirmish" label="SKIRMISH 2V2" icon={Users} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
@@ -371,7 +375,9 @@ function MainApp() {
               <motion.div key={activeTab} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.2 }}>
                 {
                   {
+                    'live': <LiveNight />,
                     'rush': <RushDashboard matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={challengeStartDate} onSelectMatch={setSelectedMatch} />,
+                    'profil': <PlayerProfile matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} onSelectPlayer={(pid) => navigate(`/${pid}/profil`)} />,
                     'wrapup': <SeasonWrapUp matches={globalFilteredMatches} playersConfig={playersConfig} />,
                     'skirmish': <SkirmishAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={challengeStartDate} />,
                     'deathmatch': <DeathmatchAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />,

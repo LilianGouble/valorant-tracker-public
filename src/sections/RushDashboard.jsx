@@ -10,6 +10,7 @@ import { Card, MatchDetailModal } from '../components/UI';
 import { RANK_TIERS, getRankIcon } from '../config/constants';
 import { MatchHistoryTable } from '../components/MatchHistoryTable';
 import { calculateKD, calculateWinrate } from '../utils/calculations';
+import { computeBadges, TIERS } from '../utils/achievements';
 
 const SQUAD_COLORS = {
     solo: '#3b82f6', duo: '#10b981', trio: '#f59e0b', quad: '#f97316', five: '#ef4444'
@@ -443,6 +444,83 @@ export const RushDashboard = ({ matches, selectedPlayerId, playersConfig, challe
         return { progressionData, timeGraphData, displayedMatches: rankedMatches };
     }, [matches, playersConfig]);
 
+    // --- DONNÉES DU HERO (synthèse de session en haut de l'accueil) ---
+    const heroStats = useMemo(() => {
+        const ranked = matches.filter(m => m.type === 'ranked');
+        const scoped = selectedPlayerId === 'all' ? ranked : ranked.filter(m => m.playerId === selectedPlayerId);
+        if (scoped.length === 0) return null;
+
+        // Session = parties du jour le plus récemment joué (dans le scope courant)
+        const byDay = {};
+        scoped.forEach(m => {
+            const t = m.timestamp ? m.timestamp * 1000 : new Date(m.date).getTime();
+            const k = dateKey(new Date(t));
+            (byDay[k] = byDay[k] || []).push(m);
+        });
+        const lastKey = Object.keys(byDay).sort((a, b) => b.localeCompare(a))[0];
+        const session = byDay[lastKey] || [];
+
+        const sumRR = (arr) => arr.reduce((s, m) => s + (m.rrChange || 0), 0);
+        const wins = session.filter(m => m.result === 'WIN').length;
+        const losses = session.filter(m => m.result === 'LOSS').length;
+
+        // Échelle de rangs de l'escouade (dernier rang connu par joueur)
+        const ladder = playersConfig.map(p => {
+            const pm = ranked.filter(m => m.playerId === p.id && m.rankValue)
+                .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+            const last = pm[0];
+            return last ? {
+                id: p.id, name: p.name, color: p.color,
+                rankValue: last.rankValue, rankName: last.currentRank, rr: last.currentRR,
+            } : null;
+        }).filter(Boolean).sort((a, b) => b.rankValue - a.rankValue);
+
+        // MVP de session (meilleur RR cumulé sur le jour)
+        const rrByPlayer = {};
+        session.forEach(m => { rrByPlayer[m.playerId] = (rrByPlayer[m.playerId] || 0) + (m.rrChange || 0); });
+        let mvp = null;
+        Object.entries(rrByPlayer).forEach(([pid, rr]) => {
+            if (!mvp || rr > mvp.rr) {
+                const cfg = playersConfig.find(p => p.id === pid);
+                if (cfg) mvp = { name: cfg.name, color: cfg.color, rr };
+            }
+        });
+        if (mvp && mvp.rr <= 0) mvp = null;
+
+        // Joueur "en feu" : plus longue série de victoires en cours dans la session
+        let hottest = null;
+        playersConfig.forEach(p => {
+            const pm = scoped.filter(m => m.playerId === p.id).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+            let streak = 0;
+            for (const m of pm) { if (m.result === 'WIN') streak++; else break; }
+            if (streak >= 2 && (!hottest || streak > hottest.streak)) hottest = { name: p.name, color: p.color, streak };
+        });
+
+        return {
+            sessionRR: sumRR(session), wins, losses, games: session.length,
+            lastKey, ladder, mvp, hottest,
+            isToday: lastKey === dateKey(new Date()),
+        };
+    }, [matches, selectedPlayerId, playersConfig]);
+
+    // --- BADGES DÉBLOQUÉS PAR L'ESCOUADE (vitrine sous le hero) ---
+    const squadBadges = useMemo(() => {
+        const tierRank = { diamond: 4, gold: 3, silver: 2, bronze: 1, shame: 0 };
+        const scoped = selectedPlayerId === 'all' ? playersConfig : playersConfig.filter(p => p.id === selectedPlayerId);
+        const collected = [];
+        scoped.forEach(p => {
+            const mine = matches.filter(m => m.playerId === p.id);
+            if (mine.length === 0) return;
+            const { badges } = computeBadges(mine);
+            badges.filter(b => b.unlocked).forEach(b => {
+                collected.push({ ...b, player: p.name, color: p.color });
+            });
+        });
+        // Les plus prestigieux d'abord (diamant > or > ...), vannes en dernier
+        collected.sort((a, b) => (tierRank[b.tier] ?? 0) - (tierRank[a.tier] ?? 0));
+        return collected.slice(0, 8);
+    }, [matches, selectedPlayerId, playersConfig]);
+
     const playersToShow = selectedPlayerId === 'all' ? playersConfig : playersConfig.filter(p => p.id === selectedPlayerId);
     const matchesForWidgets = useMemo(() => {
         let data = matches.filter(m => m.type === 'ranked');
@@ -647,9 +725,121 @@ export const RushDashboard = ({ matches, selectedPlayerId, playersConfig, challe
         return null;
     };
 
+    const HeroBanner = () => {
+        if (!heroStats) return null;
+        const { sessionRR, wins, losses, games, ladder, mvp, hottest, isToday } = heroStats;
+        const positive = sessionRR >= 0;
+        const sessionLabel = isToday ? "SESSION DU JOUR" : "DERNIÈRE SESSION";
+
+        return (
+            <div className="relative overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-br from-[#1c252e] via-[#0f1923] to-[#0f1923] shadow-2xl">
+                {/* halo coloré selon perf */}
+                <div className={`absolute -top-24 -right-16 w-80 h-80 rounded-full blur-[120px] opacity-25 ${positive ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                <div className="absolute inset-0 bg-gradient-to-r from-[#ff4655]/5 to-transparent pointer-events-none" />
+
+                <div className="relative p-5 sm:p-7">
+                    <div className="flex flex-col lg:flex-row lg:items-center gap-5 lg:gap-8">
+                        {/* Bloc RR de session */}
+                        <div className="shrink-0">
+                            <div className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 mb-1 flex items-center gap-1.5">
+                                <Activity size={12} className={positive ? 'text-emerald-400' : 'text-red-400'} /> {sessionLabel}
+                            </div>
+                            <div className="flex items-end gap-3">
+                                <div className={`text-5xl sm:text-6xl font-black italic tracking-tighter leading-none ${positive ? 'text-emerald-400 drop-shadow-[0_0_18px_rgba(16,185,129,0.4)]' : 'text-red-400 drop-shadow-[0_0_18px_rgba(239,68,68,0.4)]'}`}>
+                                    {positive ? '+' : ''}{sessionRR}
+                                </div>
+                                <div className="text-sm font-black text-gray-500 uppercase mb-1.5">RR</div>
+                            </div>
+                            <div className="flex items-center gap-3 mt-2 text-xs font-bold">
+                                <span className="text-gray-300">{games} game{games > 1 ? 's' : ''}</span>
+                                <span className="text-gray-600">·</span>
+                                <span className="text-emerald-400">{wins}V</span>
+                                <span className="text-red-400">{losses}D</span>
+                            </div>
+                        </div>
+
+                        {/* Séparateur */}
+                        <div className="hidden lg:block w-px self-stretch bg-white/10" />
+
+                        {/* Échelle de rangs de l'escouade */}
+                        <div className="flex-grow min-w-0">
+                            <div className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 mb-2 flex items-center gap-1.5">
+                                <Trophy size={12} className="text-yellow-400" /> Hiérarchie de l'escouade
+                            </div>
+                            <div className="flex items-center gap-2 sm:gap-3 overflow-x-auto custom-scrollbar pb-1">
+                                {ladder.slice(0, 8).map((p, i) => (
+                                    <div key={p.id} className="flex flex-col items-center shrink-0 group" title={`${p.name} — ${p.rankName} ${p.rr}RR`}>
+                                        <div className="relative">
+                                            <img src={getRankIcon(p.rankName)} alt={p.rankName} className="w-9 h-9 sm:w-11 sm:h-11 object-contain drop-shadow-lg group-hover:scale-110 transition-transform" />
+                                            {i === 0 && <Crown size={13} className="absolute -top-2 left-1/2 -translate-x-1/2 text-yellow-400 drop-shadow" />}
+                                        </div>
+                                        <span className="text-[9px] font-black text-white uppercase mt-0.5 max-w-[52px] truncate" style={{ color: p.color }}>{p.name}</span>
+                                        <span className="text-[8px] font-bold text-gray-500">{p.rr}RR</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        {/* Highlights : MVP + en feu */}
+                        {(mvp || hottest) && (
+                            <>
+                                <div className="hidden lg:block w-px self-stretch bg-white/10" />
+                                <div className="shrink-0 space-y-2">
+                                    {mvp && (
+                                        <div className="flex items-center gap-2.5 bg-yellow-500/10 border border-yellow-500/20 rounded-xl px-3 py-2">
+                                            <Crown size={18} className="text-yellow-400 shrink-0" />
+                                            <div className="leading-none">
+                                                <div className="text-[8px] font-black uppercase tracking-widest text-yellow-500/80">MVP Session</div>
+                                                <div className="text-sm font-black text-white">{mvp.name} <span className="text-emerald-400 text-xs">+{mvp.rr}</span></div>
+                                            </div>
+                                        </div>
+                                    )}
+                                    {hottest && (
+                                        <div className="flex items-center gap-2.5 bg-orange-500/10 border border-orange-500/20 rounded-xl px-3 py-2">
+                                            <Flame size={18} className="text-orange-400 shrink-0" />
+                                            <div className="leading-none">
+                                                <div className="text-[8px] font-black uppercase tracking-widest text-orange-500/80">En feu</div>
+                                                <div className="text-sm font-black text-white">{hottest.name} <span className="text-orange-400 text-xs">{hottest.streak}🔥</span></div>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </>
+                        )}
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
     return (
         <div className="space-y-6 sm:space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 w-full min-w-0">
             {selectedMatch && <MatchDetailModal match={selectedMatch} playersConfig={playersConfig} onClose={() => setSelectedMatch(null)} />}
+
+            <HeroBanner />
+
+            {squadBadges.length > 0 && (
+                <div className="flex items-center gap-2 sm:gap-3 overflow-x-auto custom-scrollbar pb-1 -mt-2">
+                    <span className="text-[10px] font-black uppercase tracking-widest text-gray-500 shrink-0 flex items-center gap-1.5">
+                        <Trophy size={12} className="text-yellow-400" /> Hauts faits
+                    </span>
+                    {squadBadges.map((b, i) => {
+                        const tier = TIERS[b.tier] || TIERS.bronze;
+                        return (
+                            <div key={b.id + b.player + i}
+                                className="flex items-center gap-2 rounded-full pl-2 pr-3 py-1 border shrink-0 bg-white/5"
+                                style={{ borderColor: tier.ring + '66' }}
+                                title={`${b.title} — ${b.player} · ${b.desc}`}>
+                                <span className="text-base leading-none">{b.icon}</span>
+                                <div className="leading-none">
+                                    <div className="text-[10px] font-black text-white">{b.title}</div>
+                                    <div className="text-[8px] font-bold" style={{ color: b.color }}>{b.player}</div>
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            )}
 
             <MVPBanner />
 
