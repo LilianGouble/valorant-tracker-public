@@ -151,7 +151,7 @@ export const LiveNight = () => {
         );
     }
 
-    const { collective, activeCount, sessions } = data;
+    const { collective, activeCount, sessions, recentGames = [] } = data;
     const positive = collective.rr >= 0;
     const inGameCount = sessions.filter(s => s.likelyInGame).length;
     const anyoneOnline = activeCount > 0;
@@ -212,6 +212,51 @@ export const LiveNight = () => {
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                 {sessions.map(s => <PlayerLiveCard key={s.id} s={s} />)}
             </div>
+
+            {/* FEED D'ACTIVITÉ (dernières 24h) */}
+            {recentGames.length > 0 && (
+                <Card className="p-4 sm:p-5">
+                    <h3 className="text-xs font-black uppercase tracking-widest text-gray-400 mb-4 flex items-center gap-2">
+                        <Radio size={14} className="text-red-400" /> Fil d'activité
+                        <span className="text-gray-600 normal-case tracking-normal font-bold">— dernières 24h</span>
+                    </h3>
+                    <div className="relative pl-4 space-y-3">
+                        {/* ligne verticale de timeline */}
+                        <div className="absolute left-[5px] top-1 bottom-1 w-px bg-white/10" />
+                        {recentGames.map(g => {
+                            const win = g.result === 'WIN';
+                            const timeStr = new Date(g.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                            return (
+                                <div key={g.matchId} className="relative">
+                                    <span className={`absolute -left-[15px] top-1.5 w-2.5 h-2.5 rounded-full border-2 border-[#1c252e] ${win ? 'bg-emerald-400' : 'bg-red-400'}`} />
+                                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                                        <span className="text-[10px] font-mono font-bold text-gray-500 w-10 shrink-0">{timeStr}</span>
+                                        <span className={`text-xs font-black uppercase ${win ? 'text-emerald-400' : 'text-red-400'}`}>
+                                            {win ? 'Victoire' : 'Défaite'}
+                                        </span>
+                                        <span className="text-xs font-bold text-white uppercase">{g.map}</span>
+                                        {g.score && <span className="text-[10px] font-mono text-gray-400">{g.score}</span>}
+                                        <div className="flex items-center gap-1.5 flex-wrap">
+                                            {g.players.map((p, i) => (
+                                                <span key={i} className="flex items-center gap-1 bg-white/5 border border-white/5 rounded-full pl-1 pr-2 py-0.5"
+                                                    title={`${p.name} (${p.agent}) ${p.kills}/${p.deaths}`}>
+                                                    {p.agentImg
+                                                        ? <img src={p.agentImg} alt={p.agent} className="w-4 h-4 rounded-full bg-black object-cover" />
+                                                        : <span className="w-4 h-4 rounded-full bg-white/10" />}
+                                                    <span className="text-[10px] font-bold" style={{ color: p.color }}>{p.name}</span>
+                                                    <span className={`text-[9px] font-black ${p.rr >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                                                        {p.rr > 0 ? '+' : ''}{p.rr}
+                                                    </span>
+                                                </span>
+                                            ))}
+                                        </div>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </Card>
+            )}
 
             <p className="text-center text-[10px] text-gray-600 font-bold">
                 Mise à jour automatique toutes les 30s · Le statut "en game" est une estimation basée sur l'heure de la dernière partie.

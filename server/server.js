@@ -284,6 +284,31 @@ const markDataChanged = () => {
     broadcastEvent('matches_updated');
 };
 
+// Cache des splash arts de maps (valorant-api.com), TTL 24h.
+// Utilisé pour illustrer les embeds Discord de fin de match.
+let mapSplashCache = { byName: {}, expiry: 0 };
+const getMapSplash = async (mapName) => {
+    if (!mapName) return null;
+    const now = Date.now();
+    if (now > mapSplashCache.expiry) {
+        try {
+            const res = await fetch('https://valorant-api.com/v1/maps');
+            const json = await res.json();
+            const byName = {};
+            (json.data || []).forEach(m => {
+                if (m.displayName && m.splash) byName[m.displayName.toLowerCase()] = m.splash;
+            });
+            if (Object.keys(byName).length > 0) {
+                mapSplashCache = { byName, expiry: now + 24 * 60 * 60 * 1000 };
+            }
+        } catch (e) {
+            console.warn("⚠️ Impossible de charger les splash de maps:", e.message);
+            mapSplashCache.expiry = now + 10 * 60 * 1000; // réessaie dans 10 min
+        }
+    }
+    return mapSplashCache.byName[mapName.toLowerCase()] || null;
+};
+
 // Cache pour le bot Discord : joueurs + app_url lus à chaque interaction.
 // TTL 60s — invalide aussi lors des changements admin.
 const DISCORD_CACHE_TTL_MS = 60 * 1000;
@@ -489,10 +514,15 @@ const buildMatchMessage = async (matchId, view, allConfigPlayers, appUrl) => {
         .setFooter({ text: 'KSL Tracker  •  gras = tracké KSL  •  italique = avec l\'escouade  •  👑 = MVP' })
         .setTimestamp(baseMatch.timestamp ? baseMatch.timestamp * 1000 : new Date(baseMatch.date).getTime());
         
+    // Grande image de la map (splash art façon écran de chargement).
+    // Cache dynamique valorant-api (couvre les futures maps), fallback statique.
     const mapName = (baseMatch.map || '').toLowerCase();
-    if (MAP_SPLASHES[mapName]) {
-        embed.setThumbnail(MAP_SPLASHES[mapName]);
-    }
+    const splash = (await getMapSplash(baseMatch.map)) || MAP_SPLASHES[mapName] || null;
+    if (splash) embed.setImage(splash);
+
+    // Thumbnail : l'agent du meilleur joueur tracké du match.
+    const topTracked = [...playersInMatch].sort((a, b) => (b.score || 0) - (a.score || 0))[0];
+    if (topTracked?.agentImg) embed.setThumbnail(topTracked.agentImg);
 
     const blueWin   = blueScore > redScore;
     const globalLabel = `__🌐 **SCOREBOARD GLOBAL** — ${blueScore} à ${redScore}__`;
@@ -2771,6 +2801,57 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
 };
 
 // --- ALERTE FIN DE MATCH IMMÉDIATE ---
+// --- ALERTE DÉBUT DE SESSION ---
+// Cooldown mémoire : max une annonce par joueur toutes les 3h (survit au sein
+// du process ; un restart serveur peut au pire re-annoncer une fois, acceptable).
+const sessionAnnounceCooldown = new Map();
+
+const announceSessionStarts = async (sessionStarters, allConfigPlayers, appUrl) => {
+    if (!sessionStarters || sessionStarters.size === 0) return;
+    const channelId = await getConfig('discord_channel_id');
+    if (!channelId || !discordClient.isReady()) return;
+
+    const now = Date.now();
+    const starters = [];
+    for (const [playerId, match] of sessionStarters) {
+        const lastAnnounce = sessionAnnounceCooldown.get(playerId) || 0;
+        if (now - lastAnnounce < 3 * 60 * 60 * 1000) continue;
+        const cfg = allConfigPlayers.find(p => p.id === playerId);
+        if (!cfg) continue;
+        sessionAnnounceCooldown.set(playerId, now);
+        starters.push({ cfg, match });
+    }
+    if (starters.length === 0) return;
+
+    try {
+        const channel = await discordClient.channels.fetch(channelId);
+        if (!channel) return;
+
+        // Message groupé si plusieurs lancent en même temps (soirée d'équipe !)
+        const names = starters.map(s => `**${s.cfg.name}**`).join(', ');
+        const isSquad = starters.length > 1;
+        const first = starters[0];
+
+        const embed = new EmbedBuilder()
+            .setColor(isSquad ? 0xff4655 : parseInt((first.cfg.color || '#5865F2').replace('#', ''), 16))
+            .setTitle(isSquad ? `🎮 L'escouade se connecte !` : `🎮 ${first.cfg.name} lance sa session !`)
+            .setDescription(
+                isSquad
+                    ? `${names} viennent de lancer leurs premières games de la session. Ça va farmer du RR ce soir ! 🔥`
+                    : `${names} vient de terminer sa première game de la session${first.match.currentRank ? ` — actuellement **${first.match.currentRank} ${first.match.currentRR ?? ''}RR**` : ''}.`
+            )
+            .setURL(appUrl || null)
+            .setFooter({ text: 'KSL Tracker • Session détectée' })
+            .setTimestamp();
+        if (!isSquad && first.match.agentImg) embed.setThumbnail(first.match.agentImg);
+
+        await channel.send({ embeds: [embed] });
+        console.log(`🎮 [Discord] Alerte début de session envoyée : ${starters.map(s => s.cfg.name).join(', ')}`);
+    } catch (e) {
+        console.error("❌ Alerte session:", e.message);
+    }
+};
+
 const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appUrl, ignoreTimeLimit = false) => {
     if (newlyDiscoveredMatches.length === 0) return;
 
@@ -2880,6 +2961,8 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
         let totalAdded = 0;
         let newlyAddedRankedMatches = []; 
 
+        const sessionStarters = new Map(); // playerId -> match (première game d'une session)
+
         if (allNewMatches.length > 0) {
             await db.exec('BEGIN TRANSACTION');
             for (const match of allNewMatches) {
@@ -2888,6 +2971,21 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
 
                 const existing = await db.get(`SELECT id FROM matches WHERE id = ?`, [uniqueId]);
                 const isNew = !existing;
+
+                // Détection "début de session" : match frais (< 2h) ET plus de 3h
+                // depuis la game précédente du joueur → il vient de (re)lancer.
+                if (isNew && match.type === 'ranked' && !sessionStarters.has(match.playerId)) {
+                    const ageMs = Date.now() - timestamp;
+                    if (ageMs < 2 * 60 * 60 * 1000) {
+                        const prev = await db.get(
+                            "SELECT MAX(date) AS d FROM matches WHERE player_id = ? AND type = 'ranked'",
+                            [match.playerId]
+                        );
+                        if (!prev?.d || (timestamp - prev.d) > 3 * 60 * 60 * 1000) {
+                            sessionStarters.set(match.playerId, match);
+                        }
+                    }
+                }
 
                 // ⚡ FIX: Ne pas écraser les noms Backfillés si le match existe déjà !
                 if (!isNew) {
@@ -2981,6 +3079,9 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
                 }
             }
         }
+
+        // Alerte "début de session" AVANT les embeds de match (ordre chronologique naturel)
+        await announceSessionStarts(sessionStarters, allConfigPlayers, appUrl);
 
         if (newlyAddedRankedMatches.length > 0) {
             console.log(`📢 ${newlyAddedRankedMatches.length} nouveau(x) match(s) classé(s) à annoncer.`);
@@ -3125,12 +3226,42 @@ app.get('/api/live/session', async (req, res) => {
             return acc;
         }, { rr: 0, wins: 0, losses: 0, games: 0 });
 
+        // Feed d'activité : les dernières games (24h), groupées par match
+        // (une seule entrée même si plusieurs joueurs trackés étaient dans la game).
+        const recentRows = await db.all(
+            "SELECT player_id, data FROM matches WHERE type = 'ranked' AND date >= ? ORDER BY date DESC LIMIT 40",
+            [now - 24 * 60 * 60 * 1000]
+        );
+        const feedByMatch = new Map();
+        for (const r of recentRows) {
+            let m; try { m = JSON.parse(r.data); } catch { continue; }
+            const cfg = players.find(p => p.id === r.player_id);
+            if (!cfg) continue;
+            const ts = m.timestamp ? m.timestamp * 1000 : new Date(m.date).getTime();
+            if (!feedByMatch.has(m.id)) {
+                feedByMatch.set(m.id, {
+                    matchId: m.id, map: m.map, ts,
+                    result: m.result, score: m.matchScore || null,
+                    players: [],
+                });
+            }
+            feedByMatch.get(m.id).players.push({
+                name: cfg.name, color: cfg.color,
+                agent: m.agent, agentImg: m.agentImg || null,
+                rr: m.rrChange ?? 0, kills: m.kills, deaths: m.deaths,
+            });
+        }
+        const recentGames = [...feedByMatch.values()]
+            .sort((a, b) => b.ts - a.ts)
+            .slice(0, 10);
+
         res.json({
             windowStart,
             now,
             collective,
             activeCount: sessions.filter(s => s.active).length,
             sessions,
+            recentGames,
         });
     } catch (e) {
         console.error("❌ /api/live/session:", e.message);
