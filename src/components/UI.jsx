@@ -5,23 +5,7 @@ import { calculateKD } from '../utils/calculations';
 import { getRankIcon } from '../config/constants';
 import { User } from 'lucide-react';
 
-const getPlayerColor = (puuid, playersConfig) => {
-    if (!puuid) return '#ff0000';
-    const player = playersConfig.find(p =>
-        (p.puuid && p.puuid.toLowerCase() === puuid.toLowerCase())
-        || p.id.toLowerCase() === puuid.toLowerCase()
-    );
-    return player ? player.color : '#ff0000';
-};
-
-const findCfgByPuuid = (cfgs, puuid) => {
-    if (!puuid || !cfgs) return null;
-    const lp = puuid.toLowerCase();
-    return cfgs.find(c =>
-        (c.puuid && c.puuid.toLowerCase() === lp)
-        || c.id.toLowerCase() === lp
-    ) || null;
-};
+import { findCfgByPuuid, getPlayerColor } from '../utils/players';
 
 export const Card = ({ children, className = "", style = {}, ...props }) => (
     <div

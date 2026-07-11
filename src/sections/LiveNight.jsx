@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
     Radio, Swords, Trophy, Flame, Snowflake, Moon, Wifi, WifiOff,
-    Gamepad2, TrendingUp, TrendingDown, Clock, RefreshCw
+    Gamepad2, TrendingUp, TrendingDown, Clock, RefreshCw, AlertTriangle, ServerCrash,
+    Tv, Crown, ShoppingBag
 } from 'lucide-react';
 import { Card, SectionHeader } from '../components/UI';
 import { getRankIcon } from '../config/constants';
@@ -68,6 +69,11 @@ const PlayerLiveCard = ({ s }) => {
                     <div className="min-w-0">
                         <div className="font-black text-white truncate leading-none">{s.name}</div>
                         <div className="text-[10px] text-gray-500 font-bold mt-0.5">{s.rank || 'Non classé'} · {s.rr ?? '—'}RR</div>
+                        {s.peak?.tier && (
+                            <div className="text-[9px] text-gray-600 font-bold mt-0.5 flex items-center gap-1" title={`Peak : ${s.peak.tier} (${s.peak.season || '?'})`}>
+                                <Trophy size={9} className="text-yellow-500/70" /> Peak {s.peak.tier}
+                            </div>
+                        )}
                     </div>
                 </div>
                 <StatusDot session={s} />
@@ -112,6 +118,7 @@ export const LiveNight = () => {
     const [data, setData] = useState(null);
     const [status, setStatus] = useState('loading'); // loading | ok | error
     const [lastUpdate, setLastUpdate] = useState(null);
+    const [context, setContext] = useState(null); // esports + ladder (cache serveur)
     const timerRef = useRef(null);
 
     const fetchSession = useCallback(async () => {
@@ -133,6 +140,14 @@ export const LiveNight = () => {
         return () => clearInterval(timerRef.current);
     }, [fetchSession]);
 
+    // Contexte esport/ladder : une seule fois (le serveur le cache 15 min).
+    useEffect(() => {
+        fetch(`${LOCAL_SERVER_URL}/api/live/context`)
+            .then(r => r.ok ? r.json() : null)
+            .then(j => j && setContext(j))
+            .catch(() => {});
+    }, []);
+
     if (status === 'loading' && !data) {
         return (
             <div className="flex items-center gap-3 text-gray-400 p-8">
@@ -151,7 +166,8 @@ export const LiveNight = () => {
         );
     }
 
-    const { collective, activeCount, sessions, recentGames = [] } = data;
+    const { collective, activeCount, sessions, recentGames = [], riotStatus } = data;
+    const riotIssues = riotStatus ? [...(riotStatus.incidents || []), ...(riotStatus.maintenances || [])] : [];
     const positive = collective.rr >= 0;
     const inGameCount = sessions.filter(s => s.likelyInGame).length;
     const anyoneOnline = activeCount > 0;
@@ -170,6 +186,23 @@ export const LiveNight = () => {
                     </div>
                 }
             />
+
+            {/* ALERTE SERVEURS RIOT */}
+            {riotIssues.length > 0 && (
+                <div className="flex items-start gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5">
+                    <ServerCrash size={20} className="text-amber-400 shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                        <div className="text-xs font-black uppercase tracking-wider text-amber-300 flex items-center gap-1.5">
+                            <AlertTriangle size={12} /> Serveurs Riot perturbés
+                        </div>
+                        <ul className="mt-1 space-y-0.5">
+                            {riotIssues.slice(0, 3).map((iss, i) => (
+                                <li key={i} className="text-[11px] text-amber-200/80 font-medium truncate">• {iss.title}</li>
+                            ))}
+                        </ul>
+                    </div>
+                </div>
+            )}
 
             {/* BANNIÈRE COLLECTIVE */}
             <div className="relative overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-br from-[#1c252e] to-[#0f1923] p-5 sm:p-6">
@@ -254,6 +287,87 @@ export const LiveNight = () => {
                                 </div>
                             );
                         })}
+                    </div>
+                </Card>
+            )}
+
+            {/* CONTEXTE ESPORT + LADDER */}
+            {context && (context.esports?.length > 0 || context.ladder?.top?.length > 0) && (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    {context.esports?.length > 0 && (
+                        <Card className="p-4 sm:p-5">
+                            <h3 className="text-xs font-black uppercase tracking-widest text-gray-400 mb-3 flex items-center gap-2">
+                                <Tv size={14} className="text-red-400" /> Matchs pro à venir
+                            </h3>
+                            <div className="space-y-2">
+                                {context.esports.map((m, i) => (
+                                    <div key={i} className="flex items-center justify-between gap-2 bg-black/20 border border-white/5 rounded-lg p-2">
+                                        <div className="flex items-center gap-2 min-w-0">
+                                            <div className="flex items-center gap-1.5 font-black text-white text-sm">
+                                                {m.teams[0].icon && <img src={m.teams[0].icon} alt="" className="w-5 h-5 object-contain" />}
+                                                {m.teams[0].code || m.teams[0].name}
+                                            </div>
+                                            <span className="text-gray-600 text-[10px] font-bold">vs</span>
+                                            <div className="flex items-center gap-1.5 font-black text-white text-sm">
+                                                {m.teams[1].icon && <img src={m.teams[1].icon} alt="" className="w-5 h-5 object-contain" />}
+                                                {m.teams[1].code || m.teams[1].name}
+                                            </div>
+                                        </div>
+                                        <span className="text-[9px] text-gray-500 font-bold uppercase shrink-0 truncate max-w-[120px]">{m.league}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </Card>
+                    )}
+                    {context.ladder?.top?.length > 0 && (
+                        <Card className="p-4 sm:p-5">
+                            <h3 className="text-xs font-black uppercase tracking-widest text-gray-400 mb-3 flex items-center gap-2">
+                                <Crown size={14} className="text-yellow-400" /> Sommet du ladder {context.ladder.region}
+                            </h3>
+                            <div className="space-y-2">
+                                {context.ladder.top.map((p, i) => (
+                                    <div key={i} className="flex items-center justify-between bg-black/20 border border-white/5 rounded-lg p-2">
+                                        <div className="flex items-center gap-2 min-w-0">
+                                            <span className={`text-sm font-black w-5 ${i === 0 ? 'text-yellow-400' : 'text-gray-500'}`}>#{p.rank ?? i + 1}</span>
+                                            <span className="font-bold text-white truncate">{p.name}<span className="text-gray-600 text-xs">#{p.tag}</span></span>
+                                        </div>
+                                        <span className="text-xs font-black text-cyan-400 shrink-0">{p.rr} RR</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </Card>
+                    )}
+                </div>
+            )}
+
+            {/* BOUTIQUE DU JOUR */}
+            {context?.store?.length > 0 && (
+                <Card className="p-4 sm:p-5">
+                    <h3 className="text-xs font-black uppercase tracking-widest text-gray-400 mb-3 flex items-center gap-2">
+                        <ShoppingBag size={14} className="text-pink-400" /> Boutique du jour
+                    </h3>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        {context.store.map((bundle, bi) => (
+                            <div key={bi} className="bg-black/20 border border-white/5 rounded-xl p-3">
+                                <div className="flex items-center justify-between mb-2">
+                                    <span className="text-[10px] font-black uppercase tracking-widest text-gray-500">Bundle {bi + 1}</span>
+                                    {bundle.price != null && (
+                                        <span className="text-xs font-black text-pink-300 flex items-center gap-1">
+                                            {bundle.price} <span className="text-[9px] text-gray-500">VP</span>
+                                        </span>
+                                    )}
+                                </div>
+                                <div className="grid grid-cols-4 gap-2">
+                                    {bundle.items.map((it, ii) => (
+                                        <div key={ii} className="aspect-square bg-white/5 rounded-lg flex items-center justify-center p-1" title={`${it.name} (${it.type})`}>
+                                            {it.image
+                                                ? <img src={it.image} alt={it.name} className="max-w-full max-h-full object-contain" />
+                                                : <span className="text-[8px] text-gray-600 text-center">{it.name}</span>}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        ))}
                     </div>
                 </Card>
             )}

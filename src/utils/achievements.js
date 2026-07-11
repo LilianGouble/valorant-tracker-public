@@ -70,6 +70,16 @@ export const computeBadges = (matches = []) => {
     const firstKills = ranked.reduce((s, m) => s + (m.firstKills || 0), 0);
     const netRR = ranked.reduce((s, m) => s + (m.rrChange || 0), 0);
     const rrLost = ranked.reduce((s, m) => s + Math.min(0, m.rrChange || 0), 0);
+    // ADR moyen (dégâts infligés vs subis) — dispo après le fix damage.dealt
+    const withAdr = ranked.filter(m => m.adr != null);
+    const avgAdr = withAdr.length ? withAdr.reduce((s, m) => s + m.adr, 0) / withAdr.length : 0;
+    const withAdrRec = ranked.filter(m => m.adrReceived != null);
+    const avgAdrRec = withAdrRec.length ? withAdrRec.reduce((s, m) => s + m.adrReceived, 0) / withAdrRec.length : 0;
+    // Cérémonies & comportement (v4) — tolérant : 0 si absent sur les vieux matchs.
+    const flawless = ranked.reduce((s, m) => s + (m.ceremonies?.flawless || 0), 0);
+    const closers = ranked.reduce((s, m) => s + (m.ceremonies?.closer || 0), 0);
+    const afkRounds = ranked.reduce((s, m) => s + (m.behavior?.afkRounds || 0), 0);
+    const ffOutgoing = ranked.reduce((s, m) => s + (m.behavior?.ffOutgoing || 0), 0);
 
     const kd = safeDiv(kills, Math.max(1, deaths));
     const hsPct = allShots > 0 ? (hs / allShots) * 100 : 0;
@@ -131,6 +141,24 @@ export const computeBadges = (matches = []) => {
 
         mk('veteran', 'Vétéran', 'Jouer 100 parties classées.', '🎖️', 'silver',
             games, 100, { valueLabel: `${games} games` }),
+
+        mk('wall', 'Le Mur', 'Infliger plus de 150 dégâts par round en moyenne (20+ games).', '🧱', 'diamond',
+            games >= 20 ? avgAdr : 0, 150, { valueLabel: `${Math.round(avgAdr)} ADR`, unlocked: games >= 20 && avgAdr >= 150 }),
+
+        mk('tank', 'Éponge à Balles', 'Subir plus de 160 dégâts par round en moyenne (20+ games).', '🩹', 'shame',
+            games >= 20 && avgAdrRec >= 160 ? 1 : 0, 1, { valueLabel: `${Math.round(avgAdrRec)} subis/rnd`, unlocked: games >= 20 && avgAdrRec >= 160 }),
+
+        mk('flawless', 'Sans Accroc', 'Remporter 15 rounds "Flawless" (aucun coéquipier mort).', '✨', 'gold',
+            flawless, 15, { valueLabel: `${flawless} flawless` }),
+
+        mk('closer', 'Le Dernier Mot', 'Réaliser 25 derniers kills de round (Closer).', '🎯', 'silver',
+            closers, 25, { valueLabel: `${closers} closers` }),
+
+        mk('teamkiller', 'Ami des Balles', 'Blesser ses coéquipiers 5 fois (tir ami).', '🔫', 'shame',
+            ffOutgoing, 5, { valueLabel: `${ffOutgoing} tirs amis` }),
+
+        mk('deserter', 'Déserteur', 'Cumuler 3 rounds en AFK.', '💤', 'shame',
+            afkRounds, 3, { valueLabel: `${afkRounds} rounds AFK` }),
 
         // ----- VANNES / HONTE -----
         mk('stormtrooper', 'Stormtrooper', 'Moins de 12% de précision à la tête sur 20+ games.', '🤖', 'shame',

@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { Skull, Ghost, UserX, Swords, Crown, ShieldAlert, X, Calendar, Map as MapIcon, Users } from 'lucide-react';
 import { Card } from '../components/UI';
-import { motion, AnimatePresence } from 'framer-motion';
+import { findCfgByPuuid } from '../utils/players';
 
 // Seuil de rencontres min pour apparaître
 const MIN_ENCOUNTERS = 2;
@@ -104,14 +104,6 @@ const NemesisDetailModal = ({ nemesis, onClose }) => {
             </div>
         </div>
     );
-};
-
-const findCfgByPuuid = (cfgs, puuid) => {
-    if (!puuid || !cfgs) return null;
-    const lp = puuid.toLowerCase();
-    return cfgs.find(c =>
-        (c.puuid && c.puuid.toLowerCase() === lp) || c.id.toLowerCase() === lp
-    ) || null;
 };
 
 export const Nemesis = ({ matches, playersConfig }) => {

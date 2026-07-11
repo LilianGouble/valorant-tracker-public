@@ -154,6 +154,24 @@ const discordClient = new Client({
         console.warn("⚠️  Migration discord_id:", e.message);
     }
 
+    // Migration : colonnes MMR temps réel (v3/mmr) — rang courant fiable + peak + crosshair
+    try {
+        const cols = await db.all("PRAGMA table_info(players)");
+        const add = async (name, type) => {
+            if (!cols.some(c => c.name === name)) {
+                await db.exec(`ALTER TABLE players ADD COLUMN ${name} ${type}`);
+                console.log(`🛠️  Colonne '${name}' ajoutée à la table players.`);
+            }
+        };
+        await add('live_mmr', 'TEXT');       // snapshot JSON du v3/mmr (current, peak, seasonal)
+        await add('mmr_updated_at', 'INTEGER');
+        await add('crosshair_code', 'TEXT'); // code de viseur Valorant du joueur
+        await add('account_card', 'TEXT');   // id de la bannière Valorant (v2/account)
+        await add('account_level', 'INTEGER');
+    } catch (e) {
+        console.warn("⚠️  Migration MMR:", e.message);
+    }
+
     // Migration : Architecture Hybride SQL (Extraction des colonnes clés)
     try {
         const cols = await db.all("PRAGMA table_info(matches)");
@@ -227,7 +245,7 @@ const getConfig = async (key, defaultVal = '') => {
     const row = await db.get("SELECT value FROM config WHERE key = ?", [key]);
     return row ? row.value : defaultVal;
 };
-const getPlayers = async () => await db.all("SELECT id, name, tag, region, color, puuid, discord_id FROM players");
+const getPlayers = async () => await db.all("SELECT id, name, tag, region, color, puuid, discord_id, live_mmr, mmr_updated_at, crosshair_code, account_card, account_level FROM players");
 const getApiKeys = async () => (await db.all("SELECT key FROM api_keys")).map(r => r.key);
 
 // Rate-limit en mémoire pour /api/auth/login : 5 tentatives par 15 min par IP.
@@ -307,6 +325,31 @@ const getMapSplash = async (mapName) => {
         }
     }
     return mapSplashCache.byName[mapName.toLowerCase()] || null;
+};
+
+// Cache du statut serveurs Riot (v1/status), TTL 5 min. Incidents/maintenances.
+let riotStatusCache = { data: null, expiry: 0 };
+const getRiotStatus = async (region, apiKeys) => {
+    const now = Date.now();
+    if (riotStatusCache.data && now < riotStatusCache.expiry) return riotStatusCache.data;
+    try {
+        const res = await fetchWithRetry(`${API_BASE}/v1/status/${(region || 'eu').toLowerCase()}`, apiKeys, {}, 2);
+        if (!res.ok) { riotStatusCache.expiry = now + 60 * 1000; return riotStatusCache.data; }
+        const j = await res.json();
+        const extract = (arr) => (arr || []).map(x => {
+            const t = (x.titles || []).find(t => t.locale === 'fr_FR') || (x.titles || [])[0];
+            return { title: t?.content || 'Incident', severity: x.incident_severity || x.maintenance_status || 'info' };
+        });
+        const data = {
+            incidents: extract(j.data?.incidents),
+            maintenances: extract(j.data?.maintenances),
+        };
+        riotStatusCache = { data, expiry: now + 5 * 60 * 1000 };
+        return data;
+    } catch {
+        riotStatusCache.expiry = now + 60 * 1000;
+        return riotStatusCache.data;
+    }
 };
 
 // Cache pour le bot Discord : joueurs + app_url lus à chaque interaction.
@@ -1629,7 +1672,15 @@ app.get('/api/public/config', async (req, res) => {
         if (publicConfigCache.data && publicConfigCache.expiry > now) {
             return res.json(publicConfigCache.data);
         }
-        const players = await getPlayers();
+        const rawPlayers = await getPlayers();
+        // On parse le snapshot MMR en objet propre et on retire le blob brut.
+        const players = rawPlayers.map(p => {
+            let mmr = null;
+            try { mmr = p.live_mmr ? JSON.parse(p.live_mmr) : null; } catch { mmr = null; }
+            const rest = { ...p };
+            delete rest.live_mmr; // on ne renvoie pas le blob brut, seulement l'objet parsé
+            return { ...rest, mmr };
+        });
         const appUrl = await getConfig('app_url', 'http://localhost:5173');
         const challengeStartDate = await getConfig('challenge_start_date', '2024-01-01T00:00');
         const payload = { players, appUrl, challengeStartDate };
@@ -1706,13 +1757,16 @@ app.post('/api/admin/players', authenticateToken, async (req, res) => {
 });
 
 app.put('/api/admin/players/:id', authenticateToken, async (req, res) => {
-    const { name, tag, color, discord_id } = req.body;
+    const { name, tag, color, discord_id, crosshair_code } = req.body;
     const err = validatePlayerInput({ name, tag, color, discord_id });
     if (err) return res.status(400).json({ error: err });
+    if (crosshair_code !== undefined && typeof crosshair_code === 'string' && crosshair_code.length > 500) {
+        return res.status(400).json({ error: "Code de viseur trop long" });
+    }
     try {
         await db.run(
-            "UPDATE players SET name = ?, tag = ?, color = ?, discord_id = ? WHERE id = ?",
-            [name.trim(), tag.trim(), color, discord_id || '', req.params.id]
+            "UPDATE players SET name = ?, tag = ?, color = ?, discord_id = ?, crosshair_code = ? WHERE id = ?",
+            [name.trim(), tag.trim(), color, discord_id || '', (crosshair_code || '').trim(), req.params.id]
         );
         invalidatePublicConfigCache();
         invalidateDiscordCache();
@@ -2109,6 +2163,46 @@ const backfillNamesForMatches = async (matchIds, apiKeys) => {
     return result;
 };
 
+// Backfill ADR : recalcule l'ADR (et damage received) depuis les données déjà
+// stockées dans allPlayers — AUCUN appel API requis (le bug affectait la valeur
+// dérivée, pas la donnée brute). Corrige tout l'historique instantanément.
+app.post('/api/admin/backfill-adr', authenticateToken, async (req, res) => {
+    try {
+        const players = await getPlayers();
+        const puuidById = {};
+        players.forEach(p => { if (p.puuid) puuidById[p.id] = p.puuid.toLowerCase(); });
+
+        const rows = await db.all("SELECT id, player_id, data FROM matches WHERE type = 'ranked'");
+        let updated = 0, skipped = 0;
+        await db.exec('BEGIN TRANSACTION');
+        for (const row of rows) {
+            let m; try { m = JSON.parse(row.data); } catch { continue; }
+            const rp = m.roundsPlayed || 0;
+            const myPuuid = puuidById[row.player_id];
+            const me = myPuuid && (m.allPlayers || []).find(p => p.puuid?.toLowerCase() === myPuuid);
+            const dmg = me?.stats?.damage;
+            if (!rp || !dmg || typeof dmg !== 'object') { skipped++; continue; }
+
+            const newAdr = Math.round((dmg.dealt || 0) / rp);
+            const newDmgReceived = Math.round((dmg.received || 0) / rp);
+            if (m.adr === newAdr && m.adrReceived === newDmgReceived) { skipped++; continue; }
+
+            m.adr = newAdr;
+            m.adrReceived = newDmgReceived; // nouveau : ADR subi (mesure de survie)
+            await db.run("UPDATE matches SET data = ? WHERE id = ?", [JSON.stringify(m), row.id]);
+            updated++;
+        }
+        await db.exec('COMMIT');
+        invalidatePublicConfigCache();
+        console.log(`✅ Backfill ADR : ${updated} matchs corrigés, ${skipped} ignorés.`);
+        res.json({ updated, skipped, total: rows.length });
+    } catch (e) {
+        try { await db.exec('ROLLBACK'); } catch { /* noop */ }
+        console.error("❌ backfill-adr:", e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.post('/api/admin/backfill-names', authenticateToken, async (req, res) => {
     try {
         const apiKeys = await getApiKeys();
@@ -2181,8 +2275,10 @@ const normalizeV4Player = (p) => {
         player_card: p.customization?.card || '',
         player_title: p.customization?.title || '',
         session_playtime: { milliseconds: p.session_playtime_in_ms || 0 },
-        damage_made: p.stats?.damage || 0,
-        damage_received: 0,
+        // v4 : stats.damage est un objet {dealt, received}. On extrait les nombres
+        // (bug historique : l'objet entier était affecté → ADR = NaN partout).
+        damage_made: (typeof p.stats?.damage === 'object' ? p.stats?.damage?.dealt : p.stats?.damage) || 0,
+        damage_received: (typeof p.stats?.damage === 'object' ? p.stats?.damage?.received : 0) || 0,
         assets: { agent: { small: constructAgentImg(p.agent?.id) }, card: {} }
     };
 };
@@ -2620,6 +2716,15 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
         const plantSites = { A: 0, B: 0, C: 0 };
         const roundDetails = [];
         const timeline = [];
+        // Cérémonies de fin de round où le joueur a réalisé le fait marquant (v4 : round.ceremony
+        // s'applique au dernier kill du round). On attribue au joueur du dernier kill du round.
+        const ceremonies = { flawless: 0, clutch: 0, ace: 0, closer: 0, thrifty: 0 };
+        // Comportement (v4) : AFK, tirs alliés, temps passé au spawn.
+        const behavior = {
+            afkRounds: playerStats.behavior?.afk_rounds || 0,
+            ffOutgoing: playerStats.behavior?.friendly_fire?.outgoing || 0,
+            ffIncoming: playerStats.behavior?.friendly_fire?.incoming || 0,
+        };
 
         if (m.rounds && m.rounds.length > 0) {
           m.rounds.forEach((round, index) => {
@@ -2630,6 +2735,15 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
           if (!startSide) startSide = 'Unknown';
 
           m.rounds.forEach((round, index) => {
+            // Cérémonie : on l'attribue si le dernier kill du round est celui du joueur.
+            const cer = (round.ceremony || '').replace('Ceremony', '').toLowerCase();
+            if (cer && cer !== 'default') {
+                const roundKillEvents = (allKills || []).filter(k => (k.round ?? k.round_number) === index);
+                const lastKill = roundKillEvents.sort((a, b) => (b.kill_time_in_round || 0) - (a.kill_time_in_round || 0))[0];
+                if (lastKill && lastKill.killer_puuid === playerStats.puuid && ceremonies[cer] !== undefined) {
+                    ceremonies[cer]++;
+                }
+            }
             if (round.plant_events?.planted_by?.puuid === playerStats.puuid) plants++;
             if (round.defuse_events?.defused_by?.puuid === playerStats.puuid) defuses++;
             if (round.plant_events?.plant_site) plantSites[round.plant_events.plant_site] = (plantSites[round.plant_events.plant_site] || 0) + 1;
@@ -2767,8 +2881,10 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
           legshots: playerStats.stats?.legshots || 0,
           totalShots: (playerStats.stats?.bodyshots || 0) + (playerStats.stats?.legshots || 0) + (playerStats.stats?.headshots || 0),
           firstKills: matchFkFd[playerStats.puuid]?.fk || 0, 
-          firstDeaths: matchFkFd[playerStats.puuid]?.fd || 0, 
+          firstDeaths: matchFkFd[playerStats.puuid]?.fd || 0,
           clutches,
+          ceremonies,
+          behavior,
           sides: { atkWins, atkRounds, defWins, defRounds },
           plants,
           defuses,
@@ -2778,8 +2894,9 @@ const fetchPlayerData = async (player, apiKeys, allConfigPlayers) => {
           roundDetails,
           timeline: timeline, 
           adr: Math.round((playerStats.damage_made || 0) / rp),
+          adrReceived: Math.round((playerStats.damage_received || 0) / rp), // dégâts subis/round (survie)
           acs: Math.round(score / rp),
-          roundsPlayed: rp, 
+          roundsPlayed: rp,
           economy: { avgSpent: Math.round((playerStats.economy?.spent?.overall || 0) / rp), avgLoadoutValue: Math.round((playerStats.economy?.loadout_value?.overall || 0) / rp) },
           abilities: { ...abilities, total: (abilities.c_cast || 0) + (abilities.q_cast || 0) + (abilities.e_cast || 0) + (abilities.x_cast || 0) },
           partyId: playerStats.party_id,
@@ -2919,6 +3036,75 @@ const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appU
     }
 };
 
+// --- MMR TEMPS RÉEL (v3/mmr) ---
+// Récupère le rang courant fiable (indépendant du dernier match stocké), le peak,
+// et l'historique par saison. Persiste un snapshot JSON dans players.live_mmr.
+// Corrige le bug d'affichage de rang périmé après un reset d'acte.
+const refreshMmrForPlayer = async (player, apiKeys) => {
+    if (!player.puuid) return null;
+    const region = (player.region || 'eu').toLowerCase();
+    const name = encodeURIComponent(player.name.trim());
+    const tag = encodeURIComponent(player.tag.trim());
+    try {
+        const res = await fetchWithRetry(`${API_BASE}/v3/mmr/${region}/pc/${name}/${tag}`, apiKeys, {}, 3);
+        if (!res.ok) return null;
+        const j = await res.json();
+        const d = j.data;
+        if (!d) return null;
+
+        const snapshot = {
+            current: {
+                tier: d.current?.tier?.name || null,
+                tierId: d.current?.tier?.id ?? null,
+                rr: d.current?.rr ?? null,
+                elo: d.current?.elo ?? null,
+                rankValue: (d.current?.tier?.id ?? 0) * 100 + (d.current?.rr ?? 0),
+                leaderboard: d.current?.leaderboard_placement?.rank ?? null,
+            },
+            peak: d.peak ? {
+                tier: d.peak.tier?.name || null,
+                tierId: d.peak.tier?.id ?? null,
+                rr: d.peak.rr ?? null,
+                season: d.peak.season?.short || null,
+            } : null,
+            // Historique par saison (short → tier/wins/games), utile pour la frise carrière
+            seasonal: (d.seasonal || []).map(s => ({
+                season: s.season?.short || null,
+                tier: s.end_tier?.name || s.final_tier?.name || null,
+                wins: s.wins ?? s.wins_by_tier ? undefined : undefined,
+                games: s.games ?? null,
+            })).filter(s => s.season),
+            fetchedAt: Date.now(),
+        };
+
+        await db.run(
+            "UPDATE players SET live_mmr = ?, mmr_updated_at = ? WHERE id = ?",
+            [JSON.stringify(snapshot), Date.now(), player.id]
+        );
+
+        // Bannière + level (v2/account) : ne les récupère qu'une fois par 24h.
+        if (!player.account_card || !player.mmr_updated_at || (Date.now() - player.mmr_updated_at) > 24 * 60 * 60 * 1000) {
+            try {
+                const accRes = await fetchWithRetry(`${API_BASE}/v2/account/${name}/${tag}`, apiKeys, {}, 2);
+                if (accRes.ok) {
+                    const accJson = await accRes.json();
+                    const card = accJson.data?.card || null;   // UUID de la player card
+                    const level = accJson.data?.account_level ?? null;
+                    if (card || level) {
+                        await db.run("UPDATE players SET account_card = ?, account_level = ? WHERE id = ?",
+                            [card, level, player.id]);
+                    }
+                }
+            } catch { /* non bloquant */ }
+        }
+
+        return snapshot;
+    } catch (e) {
+        console.warn(`⚠️ MMR ${player.name}:`, e.message);
+        return null;
+    }
+};
+
 let isSyncing = false;
 
 const syncAllPlayers = async (requestedPlayerId = 'all') => {
@@ -2955,7 +3141,9 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
             const matches = await fetchPlayerData(player, apiKeys, allConfigPlayers);
             console.log(`   -> ${matches.length} matchs récupérés et filtrés.`);
             allNewMatches.push(...matches);
-            await delay(1000); 
+            // Rafraîchit le rang temps réel (peak, reset d'acte, etc.) via v3/mmr
+            await refreshMmrForPlayer(player, apiKeys);
+            await delay(1000);
         }
 
         let totalAdded = 0;
@@ -3202,11 +3390,17 @@ app.get('/api/live/session', async (req, res) => {
             // "Actif" : a joué il y a moins de 90 min.
             const active = minSinceLast !== null && minSinceLast <= 90 && playedTonight;
 
+            // Rang FIABLE : v3/mmr (temps réel) en priorité, fallback dernier match.
+            let mmr = null;
+            try { mmr = p.live_mmr ? JSON.parse(p.live_mmr) : null; } catch { mmr = null; }
+            const rank = mmr?.current?.tier || lastMatch?.currentRank || null;
+            const rr = mmr?.current?.rr ?? lastMatch?.currentRR ?? null;
+            const rankValue = mmr?.current?.rankValue ?? lastMatch?.rankValue ?? 0;
+
             sessions.push({
                 id: p.id, name: p.name, tag: p.tag, color: p.color,
-                rank: lastMatch?.currentRank || null,
-                rr: lastMatch?.currentRR ?? null,
-                rankValue: lastMatch?.rankValue ?? 0,
+                rank, rr, rankValue,
+                peak: mmr?.peak || null,
                 sessionRR, wins, losses, gamesTonight: games.length,
                 minSinceLast, lastTs,
                 streak, streakType,
@@ -3255,6 +3449,14 @@ app.get('/api/live/session', async (req, res) => {
             .sort((a, b) => b.ts - a.ts)
             .slice(0, 10);
 
+        // Statut serveurs Riot (région du 1er joueur, cache 5 min) — best effort.
+        let riotStatus = null;
+        try {
+            const apiKeys = await getApiKeys();
+            const region = players[0]?.region || 'eu';
+            if (apiKeys.length > 0) riotStatus = await getRiotStatus(region, apiKeys);
+        } catch { /* non bloquant */ }
+
         res.json({
             windowStart,
             now,
@@ -3262,10 +3464,101 @@ app.get('/api/live/session', async (req, res) => {
             activeCount: sessions.filter(s => s.active).length,
             sessions,
             recentGames,
+            riotStatus,
         });
     } catch (e) {
         console.error("❌ /api/live/session:", e.message);
         res.status(500).json({ error: e.message });
+    }
+});
+
+// Contexte esport + ladder (v1/esports/schedule + v3/leaderboard), cache 15 min.
+let esportsCache = { data: null, expiry: 0 };
+app.get('/api/live/context', async (req, res) => {
+    try {
+        const now = Date.now();
+        if (esportsCache.data && now < esportsCache.expiry) return res.json(esportsCache.data);
+
+        const apiKeys = await getApiKeys();
+        if (apiKeys.length === 0) return res.json({ esports: [], ladder: null });
+
+        const players = await getPlayers();
+        const region = players[0]?.region || 'eu';
+
+        // Matchs pro à venir (EMEA par défaut)
+        let esports = [];
+        try {
+            const r = await fetchWithRetry(`${API_BASE}/v1/esports/schedule?region=emea`, apiKeys, {}, 2);
+            if (r.ok) {
+                const j = await r.json();
+                esports = (j.data || [])
+                    .filter(m => m.state === 'unstarted' && m.match?.teams?.length === 2)
+                    .slice(0, 5)
+                    .map(m => ({
+                        league: m.league?.name || '',
+                        icon: m.league?.icon || null,
+                        date: m.date || null,
+                        teams: m.match.teams.map(t => ({ name: t.name, code: t.code, icon: t.icon })),
+                    }));
+            }
+        } catch { /* non bloquant */ }
+
+        // Top ladder de la région (borne Radiant #1)
+        let ladder = null;
+        try {
+            const r = await fetchWithRetry(`${API_BASE}/v3/leaderboard/${region}/pc?size=3`, apiKeys, {}, 2);
+            if (r.ok) {
+                const j = await r.json();
+                const top = (j.data?.players || []).slice(0, 3).map(p => ({
+                    name: p.name, tag: p.tag, rr: p.rr, rank: p.leaderboard_rank ?? null,
+                }));
+                ladder = { region: region.toUpperCase(), top, total: j.data?.total_players ?? null };
+            }
+        } catch { /* non bloquant */ }
+
+        // Boutique du jour (bundles en vedette). La rotation change à minuit UTC-ish.
+        let store = null;
+        try {
+            const r = await fetchWithRetry(`${API_BASE}/v2/store-featured`, apiKeys, {}, 2);
+            if (r.ok) {
+                const j = await r.json();
+                const bundles = Array.isArray(j.data) ? j.data : [];
+                store = bundles.slice(0, 2).map(b => ({
+                    price: b.bundle_price ?? null,
+                    // Aperçu : jusqu'à 4 items avec leur image
+                    items: (b.items || []).slice(0, 4).map(it => ({
+                        name: it.name, type: it.type, image: it.image || null,
+                    })),
+                }));
+            }
+        } catch { /* non bloquant */ }
+
+        const data = { esports, ladder, store };
+        esportsCache = { data, expiry: now + 15 * 60 * 1000 };
+        res.json(data);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Proxy image du viseur : la génération HenrikDev exige la clé API, donc on
+// relaie le PNG côté serveur. Cache navigateur 1h (un code de viseur est stable).
+app.get('/api/crosshair', async (req, res) => {
+    try {
+        const code = req.query.code;
+        if (!code || typeof code !== 'string' || code.length > 500) {
+            return res.status(400).send('Code invalide');
+        }
+        const apiKeys = await getApiKeys();
+        if (apiKeys.length === 0) return res.status(503).send('Pas de clé API');
+        const r = await fetchWithRetry(`${API_BASE}/v1/crosshair/generate?id=${encodeURIComponent(code)}`, apiKeys, {}, 2);
+        if (!r.ok) return res.status(r.status).send('Génération impossible');
+        const buf = Buffer.from(await r.arrayBuffer());
+        res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.send(buf);
+    } catch (e) {
+        res.status(500).send(e.message);
     }
 });
 

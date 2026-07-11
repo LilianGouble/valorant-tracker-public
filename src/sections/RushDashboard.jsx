@@ -11,6 +11,7 @@ import { RANK_TIERS, getRankIcon } from '../config/constants';
 import { MatchHistoryTable } from '../components/MatchHistoryTable';
 import { calculateKD, calculateWinrate } from '../utils/calculations';
 import { computeBadges, TIERS } from '../utils/achievements';
+import { findCfgByPuuid } from '../utils/players';
 
 const SQUAD_COLORS = {
     solo: '#3b82f6', duo: '#10b981', trio: '#f59e0b', quad: '#f97316', five: '#ef4444'
@@ -145,10 +146,7 @@ const DailyGamesList = ({ dailyMatches, onSelectMatch, playersConfig }) => {
                         displaySquad = meta.allPlayers.filter(p => p.party_id && myPartyIds.has(p.party_id));
                         displaySquad = displaySquad.map(rawPlayer => {
                             // Match d'un tracké via son puuid de configuration (peuplé au sync)
-                            const cfg = playersConfig.find(c =>
-                                (c.puuid && c.puuid.toLowerCase() === (rawPlayer.puuid || '').toLowerCase())
-                                || c.id.toLowerCase() === (rawPlayer.puuid || '').toLowerCase()
-                            );
+                            const cfg = findCfgByPuuid(playersConfig, rawPlayer.puuid);
                             const trackedData = cfg ? players.find(p => p.playerId === cfg.id) : null;
                             if (trackedData) return { ...trackedData, isGuest: false };
                             else return {

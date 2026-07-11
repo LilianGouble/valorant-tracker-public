@@ -8,7 +8,7 @@ import {
 } from 'recharts';
 import { Card, StatPill } from '../components/UI';
 import { computeBadges, TIERS } from '../utils/achievements';
-import { getRankIcon } from '../config/constants';
+import { getRankIcon, LOCAL_SERVER_URL } from '../config/constants';
 
 const BadgeChip = ({ badge }) => {
     const tier = TIERS[badge.tier] || TIERS.bronze;
@@ -77,9 +77,13 @@ export const PlayerProfile = ({ matches, selectedPlayerId, playersConfig, onSele
                 return { game: i + 1, rr: cumRR };
             });
 
-        // Rang actuel : dernier match ranked avec une info de rang
+        // Rang actuel : v3/mmr (fiable, temps réel) en priorité, sinon dernier match.
         const lastRanked = [...ranked].reverse().find(m => m.currentRank);
-        const rank = lastRanked ? { name: lastRanked.currentRank, rr: lastRanked.currentRR } : null;
+        const rank = cfg.mmr?.current?.tier
+            ? { name: cfg.mmr.current.tier, rr: cfg.mmr.current.rr }
+            : (lastRanked ? { name: lastRanked.currentRank, rr: lastRanked.currentRR } : null);
+        const peak = cfg.mmr?.peak?.tier ? cfg.mmr.peak : null;
+        const seasonal = (cfg.mmr?.seasonal || []).filter(s => s.tier);
 
         // Agents fétiches
         const agentMap = {};
@@ -108,7 +112,7 @@ export const PlayerProfile = ({ matches, selectedPlayerId, playersConfig, onSele
 
         const unlockedCount = badges.filter(b => b.unlocked).length;
 
-        return { badges, stats, rrCurve, rank, topAgents, bestMap, worstMap, unlockedCount, gamesCount: ranked.length };
+        return { badges, stats, rrCurve, rank, peak, seasonal, topAgents, bestMap, worstMap, unlockedCount, gamesCount: ranked.length };
     }, [cfg, matches]);
 
     if (!cfg) {
@@ -159,17 +163,29 @@ export const PlayerProfile = ({ matches, selectedPlayerId, playersConfig, onSele
         );
     }
 
-    const { stats, rank, rrCurve, topAgents, bestMap, worstMap, badges, unlockedCount } = profile;
+    const { stats, rank, peak, seasonal, rrCurve, topAgents, bestMap, worstMap, badges, unlockedCount } = profile;
     const accent = cfg.color || '#ff4655';
     const unlockedBadges = badges.filter(b => b.unlocked);
     const lockedBadges = badges.filter(b => !b.unlocked);
+    // Bannière Valorant du joueur (v2/account) en fond de la carte d'identité.
+    const bannerUrl = cfg.account_card ? `https://media.valorant-api.com/playercards/${cfg.account_card}/wideart.png` : null;
+    const crosshairUrl = cfg.crosshair_code ? `${LOCAL_SERVER_URL}/api/crosshair?code=${encodeURIComponent(cfg.crosshair_code)}` : null;
 
     return (
         <div className="space-y-6">
             {/* CARTE D'IDENTITÉ */}
             <Card className="p-0 overflow-hidden border-white/10">
-                <div className="relative p-6 md:p-8" style={{ background: `linear-gradient(135deg, ${accent}22, transparent 60%)` }}>
-                    <div className="absolute top-0 right-0 w-64 h-64 rounded-full blur-[100px] opacity-20" style={{ backgroundColor: accent }} />
+                <div className="relative p-6 md:p-8">
+                    {/* Fond : bannière Valorant si dispo, sinon dégradé couleur joueur */}
+                    {bannerUrl ? (
+                        <>
+                            <img src={bannerUrl} alt="" className="absolute inset-0 w-full h-full object-cover opacity-40" />
+                            <div className="absolute inset-0 bg-gradient-to-r from-[#1c252e] via-[#1c252e]/85 to-[#1c252e]/40" />
+                        </>
+                    ) : (
+                        <div className="absolute inset-0" style={{ background: `linear-gradient(135deg, ${accent}22, transparent 60%)` }} />
+                    )}
+                    <div className="absolute top-0 right-0 w-64 h-64 rounded-full blur-[100px] opacity-20 pointer-events-none" style={{ backgroundColor: accent }} />
                     <div className="relative flex flex-col md:flex-row md:items-center gap-6">
                         {/* Avatar initiale + rang */}
                         <div className="flex items-center gap-4">
@@ -183,6 +199,20 @@ export const PlayerProfile = ({ matches, selectedPlayerId, playersConfig, onSele
                                     <span className="text-[10px] font-black text-gray-300 uppercase mt-0.5">{rank.rr} RR</span>
                                 </div>
                             )}
+                            {peak && (
+                                <div className="flex flex-col items-center opacity-80" title={`Peak : ${peak.tier}${peak.season ? ` (${peak.season})` : ''}`}>
+                                    <img src={getRankIcon(peak.tier)} alt={peak.tier} className="w-11 h-11 object-contain drop-shadow grayscale-[30%]" />
+                                    <span className="text-[9px] font-black text-yellow-500/80 uppercase mt-0.5 flex items-center gap-0.5"><Trophy size={9} /> Peak</span>
+                                </div>
+                            )}
+                            {crosshairUrl && (
+                                <div className="flex flex-col items-center" title={`Viseur : ${cfg.crosshair_code}`}>
+                                    <div className="w-11 h-11 rounded-lg bg-black/40 border border-white/10 flex items-center justify-center">
+                                        <img src={crosshairUrl} alt="viseur" className="w-8 h-8 object-contain" />
+                                    </div>
+                                    <span className="text-[9px] font-black text-gray-500 uppercase mt-0.5">Viseur</span>
+                                </div>
+                            )}
                         </div>
                         <div className="flex-grow">
                             <h1 className="text-3xl md:text-4xl font-black text-white italic uppercase tracking-tighter leading-none">
@@ -190,6 +220,7 @@ export const PlayerProfile = ({ matches, selectedPlayerId, playersConfig, onSele
                             </h1>
                             <div className="flex items-center gap-3 mt-2 flex-wrap">
                                 {rank && <span className="text-sm font-bold uppercase tracking-wide" style={{ color: accent }}>{rank.name}</span>}
+                                {cfg.account_level != null && <span className="text-xs text-gray-400 font-bold">Niveau {cfg.account_level}</span>}
                                 <span className="text-xs text-gray-500 font-bold flex items-center gap-1">
                                     <Award size={13} /> {unlockedCount}/{badges.length} badges
                                 </span>
@@ -208,6 +239,23 @@ export const PlayerProfile = ({ matches, selectedPlayerId, playersConfig, onSele
                     </div>
                 </div>
             </Card>
+
+            {/* FRISE CARRIÈRE PAR SAISON (v3/mmr seasonal) */}
+            {seasonal && seasonal.length > 0 && (
+                <Card className="p-5">
+                    <h3 className="text-xs font-black uppercase tracking-widest text-gray-400 mb-4 flex items-center gap-2">
+                        <Trophy size={14} className="text-yellow-500/70" /> Carrière par saison
+                    </h3>
+                    <div className="flex items-end gap-2 overflow-x-auto custom-scrollbar pb-2">
+                        {seasonal.map((s, i) => (
+                            <div key={i} className="flex flex-col items-center shrink-0 group" title={`${s.season} — ${s.tier}`}>
+                                <img src={getRankIcon(s.tier)} alt={s.tier} className="w-10 h-10 object-contain group-hover:scale-110 transition-transform" />
+                                <span className="text-[9px] font-black text-gray-500 uppercase mt-1">{s.season}</span>
+                            </div>
+                        ))}
+                    </div>
+                </Card>
+            )}
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                 {/* COURBE DE RR */}
