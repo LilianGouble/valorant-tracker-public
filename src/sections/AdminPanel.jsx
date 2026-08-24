@@ -896,13 +896,13 @@ export const AdminPanel = () => {
 
                                 <div className="mt-4 flex flex-wrap gap-2">
                                     <button type="button" onClick={async () => {
-                                        try { await fetch(`${LOCAL_SERVER_URL}/test-send`); showMsg("Ping envoyé au bot ! Vérifiez Discord."); } catch (e) { showMsg("Erreur ping", "error"); }
+                                        try { const r = await fetch(`${LOCAL_SERVER_URL}/test-send`, { headers: authHeaders }); if (!r.ok) throw new Error(); showMsg("Ping envoyé au bot ! Vérifiez Discord."); } catch { showMsg("Erreur ping", "error"); }
                                     }} className="flex-1 bg-[#5865F2]/20 hover:bg-[#5865F2]/40 text-[#5865F2] font-bold py-2 rounded text-xs transition-colors text-center">Test Connexion Bot</button>
                                     <button type="button" onClick={async () => {
-                                        try { await fetch(`${LOCAL_SERVER_URL}/test-match`); showMsg("Faux match envoyé !"); } catch (e) { showMsg("Erreur", "error"); }
+                                        try { const r = await fetch(`${LOCAL_SERVER_URL}/test-match`, { headers: authHeaders }); if (!r.ok) throw new Error(); showMsg("Faux match envoyé !"); } catch { showMsg("Erreur", "error"); }
                                     }} className="flex-1 bg-emerald-500/20 hover:bg-emerald-500/40 text-emerald-400 font-bold py-2 rounded text-xs transition-colors text-center">Test Faux Match</button>
                                     <button type="button" onClick={async () => {
-                                        try { await fetch(`${LOCAL_SERVER_URL}/test-report`); showMsg("Faux rapport envoyé !"); } catch (e) { showMsg("Erreur", "error"); }
+                                        try { const r = await fetch(`${LOCAL_SERVER_URL}/test-report`, { headers: authHeaders }); if (!r.ok) throw new Error(); showMsg("Faux rapport envoyé !"); } catch { showMsg("Erreur", "error"); }
                                     }} className="flex-1 bg-purple-500/20 hover:bg-purple-500/40 text-purple-400 font-bold py-2 rounded text-xs transition-colors text-center">Test Rapport Quotidien</button>
                                 </div>
                             </div>

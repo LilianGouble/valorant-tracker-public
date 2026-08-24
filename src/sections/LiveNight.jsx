@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
     Radio, Swords, Trophy, Flame, Snowflake, Moon, Wifi, WifiOff,
     Gamepad2, TrendingUp, TrendingDown, Clock, RefreshCw, AlertTriangle, ServerCrash,
-    Tv, Crown, ShoppingBag
+    Tv, Crown, ShoppingBag, Share2, Send
 } from 'lucide-react';
 import { Card, SectionHeader } from '../components/UI';
 import { getRankIcon } from '../config/constants';
@@ -114,6 +114,48 @@ const PlayerLiveCard = ({ s }) => {
     );
 };
 
+// Partage de la carte de soirée (aperçu + téléchargement + Discord si admin).
+const SessionShare = ({ hasGames }) => {
+    const [preview, setPreview] = useState(false);
+    const [sharing, setSharing] = useState('');
+    const url = `${LOCAL_SERVER_URL}/api/recap/session.png`;
+    const adminToken = typeof localStorage !== 'undefined' ? localStorage.getItem('adminToken') : null;
+    if (!hasGames) return null;
+
+    const shareDiscord = async () => {
+        setSharing('loading');
+        try {
+            const res = await fetch(`${LOCAL_SERVER_URL}/api/recap/share`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminToken}` },
+                body: JSON.stringify({ type: 'session' }),
+            });
+            setSharing(res.ok ? 'done' : 'error');
+        } catch { setSharing('error'); }
+        setTimeout(() => setSharing(''), 2500);
+    };
+
+    return (
+        <div className="relative flex items-center gap-2">
+            <button onClick={() => setPreview(v => !v)}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-white/5 hover:bg-white/10 rounded-lg text-xs font-bold text-gray-300 transition-colors">
+                <Share2 size={13} /> Carte de soirée
+            </button>
+            {adminToken && (
+                <button onClick={shareDiscord} disabled={sharing === 'loading'}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-[#5865F2]/20 hover:bg-[#5865F2]/40 rounded-lg text-xs font-bold text-[#8b95f5] transition-colors disabled:opacity-50">
+                    <Send size={13} /> {sharing === 'done' ? 'Envoyé !' : sharing === 'error' ? 'Erreur' : 'Discord'}
+                </button>
+            )}
+            {preview && (
+                <div className="absolute top-full right-0 mt-2 z-30 p-2 bg-[#0f1923] border border-white/10 rounded-xl shadow-2xl">
+                    <img src={url} alt="Carte de soirée" className="w-[440px] max-w-[85vw] rounded-lg" />
+                </div>
+            )}
+        </div>
+    );
+};
+
 export const LiveNight = () => {
     const [data, setData] = useState(null);
     const [status, setStatus] = useState('loading'); // loading | ok | error
@@ -180,9 +222,12 @@ export const LiveNight = () => {
                 subtitle={anyoneOnline ? `${activeCount} joueur(s) en ligne · ${inGameCount} potentiellement en partie` : "Personne en ligne pour le moment"}
                 accent="#ef4444"
                 action={
-                    <div className="flex items-center gap-2 text-[10px] font-bold text-gray-500">
-                        {status === 'ok' ? <Wifi size={13} className="text-emerald-400" /> : <WifiOff size={13} className="text-red-400" />}
-                        {lastUpdate && <span>maj {new Date(lastUpdate).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>}
+                    <div className="flex items-center gap-3">
+                        <SessionShare hasGames={collective.games > 0} />
+                        <div className="flex items-center gap-2 text-[10px] font-bold text-gray-500">
+                            {status === 'ok' ? <Wifi size={13} className="text-emerald-400" /> : <WifiOff size={13} className="text-red-400" />}
+                            {lastUpdate && <span>maj {new Date(lastUpdate).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>}
+                        </div>
                     </div>
                 }
             />

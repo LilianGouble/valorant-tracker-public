@@ -1,21 +1,120 @@
-import React, { useMemo } from 'react';
-import { BrainCircuit, Crosshair, Shield, Zap, Activity, Trophy, Swords } from 'lucide-react';
-import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, Cell, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, Legend } from 'recharts';
+import React, { useMemo, useState } from 'react';
+import { BrainCircuit, Activity, Trophy, Swords, Wand2, AlertTriangle, Map as MapIcon, Users as UsersIcon } from 'lucide-react';
+import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, Legend } from 'recharts';
 import { Card, Badge } from '../components/UI';
 import { calculateKD, calculateWinrate, safeDiv } from '../utils/calculations';
+import { AGENT_ROLES, ROLE_COLORS, AVAILABLE_MAPS, computeAgentPools, recommendComposition } from '../utils/compositions';
 
-const ROLE_COLORS = {
-    Duelist: '#ef4444',
-    Initiator: '#eab308',
-    Controller: '#3b82f6',
-    Sentinel: '#10b981'
-};
+// --- RECOMMANDEUR DE COMPOSITIONS ---
+const CompositionRecommender = ({ matches, playersConfig }) => {
+    const [map, setMap] = useState(AVAILABLE_MAPS[0]);
+    const [selectedIds, setSelectedIds] = useState(() => playersConfig.slice(0, 5).map(p => p.id));
 
-const AGENT_ROLES = {
-    "Jett": "Duelist", "Phoenix": "Duelist", "Reyna": "Duelist", "Raze": "Duelist", "Yoru": "Duelist", "Neon": "Duelist", "Iso": "Duelist",
-    "Brimstone": "Controller", "Viper": "Controller", "Omen": "Controller", "Astra": "Controller", "Harbor": "Controller", "Clove": "Controller",
-    "Sova": "Initiator", "Breach": "Initiator", "Skye": "Initiator", "KAY/O": "Initiator", "Fade": "Initiator", "Gekko": "Initiator", "Tejo": "Initiator",
-    "Killjoy": "Sentinel", "Cypher": "Sentinel", "Sage": "Sentinel", "Chamber": "Sentinel", "Deadlock": "Sentinel", "Vyse": "Sentinel"
+    const pools = useMemo(() => computeAgentPools(matches, playersConfig), [matches, playersConfig]);
+
+    const togglePlayer = (id) => {
+        setSelectedIds(prev => {
+            if (prev.includes(id)) return prev.filter(x => x !== id);
+            if (prev.length >= 5) return prev; // max 5
+            return [...prev, id];
+        });
+    };
+
+    const present = playersConfig.filter(p => selectedIds.includes(p.id));
+    const reco = useMemo(() => recommendComposition(map, present, pools), [map, present, pools]);
+
+    // Récupère l'image d'agent depuis un match (le pool ne stocke pas l'image)
+    const agentImgFromMatches = useMemo(() => {
+        const m = {};
+        matches.forEach(x => { if (x.agent && x.agentImg && !m[x.agent]) m[x.agent] = x.agentImg; });
+        return m;
+    }, [matches]);
+
+    return (
+        <Card className="p-5 border-l-4 border-l-indigo-500 bg-gradient-to-br from-indigo-500/10 to-transparent">
+            <h3 className="text-sm font-black text-white uppercase mb-1 flex items-center gap-2">
+                <Wand2 size={18} className="text-indigo-400" /> Compositions recommandées
+            </h3>
+            <p className="text-xs text-gray-400 mb-4">Choisis une map et les joueurs présents — on assigne le meilleur agent à chacun selon sa maîtrise, sans doublon.</p>
+
+            {/* Sélecteurs */}
+            <div className="flex flex-col sm:flex-row gap-3 mb-4">
+                <div className="flex-1">
+                    <label className="text-[10px] font-black uppercase tracking-widest text-gray-500 mb-1 flex items-center gap-1"><MapIcon size={11} /> Map</label>
+                    <select value={map} onChange={e => setMap(e.target.value)}
+                        className="w-full bg-[#0f1923] text-white p-2.5 rounded-lg border border-white/10 outline-none focus:border-indigo-500 font-bold text-sm">
+                        {AVAILABLE_MAPS.map(m => <option key={m} value={m}>{m}</option>)}
+                    </select>
+                </div>
+                <div className="flex-[2]">
+                    <label className="text-[10px] font-black uppercase tracking-widest text-gray-500 mb-1 flex items-center gap-1"><UsersIcon size={11} /> Joueurs présents ({present.length}/5)</label>
+                    <div className="flex flex-wrap gap-1.5">
+                        {playersConfig.map(p => {
+                            const on = selectedIds.includes(p.id);
+                            return (
+                                <button key={p.id} onClick={() => togglePlayer(p.id)}
+                                    className={`px-2.5 py-1.5 rounded-lg text-xs font-bold transition-all border ${on ? 'text-white' : 'text-gray-500 border-white/10 hover:text-gray-300'}`}
+                                    style={on ? { backgroundColor: (p.color || '#6366f1') + '33', borderColor: p.color || '#6366f1' } : {}}>
+                                    {p.name}
+                                </button>
+                            );
+                        })}
+                    </div>
+                </div>
+            </div>
+
+            {/* Résultat */}
+            {reco ? (
+                <>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                        {reco.assignments.map((a, i) => (
+                            <div key={i} className="flex items-center gap-3 bg-black/25 border rounded-xl p-2.5"
+                                style={{ borderColor: ROLE_COLORS[a.role] + '55' }}>
+                                {agentImgFromMatches[a.agent]
+                                    ? <img src={agentImgFromMatches[a.agent]} alt={a.agent} className="w-10 h-10 rounded-lg bg-black object-cover" />
+                                    : <div className="w-10 h-10 rounded-lg flex items-center justify-center text-lg font-black" style={{ backgroundColor: ROLE_COLORS[a.role] + '33', color: ROLE_COLORS[a.role] }}>{a.agent.charAt(0)}</div>}
+                                <div className="min-w-0 flex-grow">
+                                    <div className="font-black text-white text-sm truncate">{a.player.name}</div>
+                                    <div className="text-xs font-bold" style={{ color: ROLE_COLORS[a.role] }}>{a.agent} · {a.role}</div>
+                                </div>
+                                <div className="text-right shrink-0">
+                                    {a.fromPool
+                                        ? <><div className={`text-xs font-black ${a.winrate >= 50 ? 'text-emerald-400' : 'text-gray-400'}`}>{a.winrate}%</div><div className="text-[9px] text-gray-600">{a.games}g</div></>
+                                        : <div className="text-[9px] font-bold text-amber-400" title="Agent hors de son pool habituel">à apprendre</div>}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+
+                    {/* Bilan rôles */}
+                    <div className="flex items-center gap-2 mt-3 flex-wrap">
+                        {Object.entries(reco.roleCount).map(([role, n]) => n > 0 && (
+                            <span key={role} className="text-[10px] font-black uppercase px-2 py-1 rounded" style={{ backgroundColor: ROLE_COLORS[role] + '22', color: ROLE_COLORS[role] }}>
+                                {n}× {role}
+                            </span>
+                        ))}
+                    </div>
+
+                    {(reco.warnings.length > 0 || reco.stretched.length > 0) && (
+                        <div className="mt-3 space-y-1.5">
+                            {reco.warnings.map((w, i) => (
+                                <div key={i} className="flex items-center gap-2 text-xs text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg p-2">
+                                    <AlertTriangle size={14} className="shrink-0" /> {w}
+                                </div>
+                            ))}
+                            {reco.stretched.length > 0 && (
+                                <div className="flex items-center gap-2 text-xs text-blue-300 bg-blue-500/10 border border-blue-500/20 rounded-lg p-2">
+                                    <BrainCircuit size={14} className="shrink-0" /> {reco.stretched.join(', ')} {reco.stretched.length > 1 ? 'jouent' : 'joue'} un agent hors de leur pool habituel — à travailler.
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </>
+            ) : (
+                <div className="text-center py-6 text-gray-500 text-sm italic">Sélectionne au moins un joueur pour générer une compo.</div>
+            )}
+        </Card>
+    );
 };
 
 export const RoleAnalysis = ({ matches, selectedPlayerId, playersConfig, challengeStartDate }) => {
@@ -105,9 +204,12 @@ export const RoleAnalysis = ({ matches, selectedPlayerId, playersConfig, challen
                 </div>
                 <div>
                     <h2 className="text-4xl font-black text-white italic tracking-tighter uppercase">TACTIQUE & RÔLES</h2>
-                    <p className="text-gray-400 font-medium uppercase tracking-widest text-xs">Analyse de polyvalence et performance par classe</p>
+                    <p className="text-gray-400 font-medium uppercase tracking-widest text-xs">Compositions recommandées & performance par classe</p>
                 </div>
             </div>
+
+            {/* RECOMMANDEUR DE COMPOSITIONS (nouveau — assigne les rôles intelligemment) */}
+            <CompositionRecommender matches={matches} playersConfig={playersConfig} />
 
             {roleStats.chartData.length > 0 ? (
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">

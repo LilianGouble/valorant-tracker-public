@@ -1,7 +1,7 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
     Trophy, Skull, Target, TrendingUp, TrendingDown, Award, Flame,
-    Crosshair, Swords, Lock, MapPin, User, IdCard
+    Crosshair, Swords, Lock, MapPin, User, IdCard, Share2, Download, Send
 } from 'lucide-react';
 import {
     LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer
@@ -35,6 +35,51 @@ const BadgeChip = ({ badge }) => {
             {locked && badge.progress > 0 && (
                 <div className="mt-2 h-1 bg-white/5 rounded-full overflow-hidden">
                     <div className="h-full bg-gray-500" style={{ width: `${Math.round(badge.progress * 100)}%` }} />
+                </div>
+            )}
+        </div>
+    );
+};
+
+// Boutons de partage de la carte de récap (télécharger + Discord si admin connecté).
+const ShareCard = ({ playerId }) => {
+    const [showPreview, setShowPreview] = useState(false);
+    const [sharing, setSharing] = useState('');
+    const cardUrl = `${LOCAL_SERVER_URL}/api/recap/player/${playerId}.png`;
+    const adminToken = typeof localStorage !== 'undefined' ? localStorage.getItem('adminToken') : null;
+
+    const shareDiscord = async () => {
+        setSharing('loading');
+        try {
+            const res = await fetch(`${LOCAL_SERVER_URL}/api/recap/share`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${adminToken}` },
+                body: JSON.stringify({ type: 'player', playerId }),
+            });
+            setSharing(res.ok ? 'done' : 'error');
+        } catch { setSharing('error'); }
+        setTimeout(() => setSharing(''), 2500);
+    };
+
+    return (
+        <div className="relative flex items-center gap-2">
+            <button onClick={() => setShowPreview(v => !v)}
+                className="flex items-center gap-1.5 px-3 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-xs font-bold text-gray-300 transition-colors">
+                <Share2 size={14} /> Ma carte
+            </button>
+            <a href={cardUrl} download={`ksl-${playerId}.png`} target="_blank" rel="noreferrer"
+                className="flex items-center gap-1.5 px-3 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-xs font-bold text-gray-300 transition-colors">
+                <Download size={14} /> Télécharger
+            </a>
+            {adminToken && (
+                <button onClick={shareDiscord} disabled={sharing === 'loading'}
+                    className="flex items-center gap-1.5 px-3 py-2 bg-[#5865F2]/20 hover:bg-[#5865F2]/40 rounded-lg text-xs font-bold text-[#8b95f5] transition-colors disabled:opacity-50">
+                    <Send size={14} /> {sharing === 'done' ? 'Envoyé !' : sharing === 'error' ? 'Erreur' : 'Discord'}
+                </button>
+            )}
+            {showPreview && (
+                <div className="absolute top-full right-0 mt-2 z-30 p-2 bg-[#0f1923] border border-white/10 rounded-xl shadow-2xl">
+                    <img src={cardUrl} alt="Carte de récap" className="w-[400px] max-w-[80vw] rounded-lg" />
                 </div>
             )}
         </div>
@@ -215,9 +260,12 @@ export const PlayerProfile = ({ matches, selectedPlayerId, playersConfig, onSele
                             )}
                         </div>
                         <div className="flex-grow">
-                            <h1 className="text-3xl md:text-4xl font-black text-white italic uppercase tracking-tighter leading-none">
-                                {cfg.name} <span className="text-gray-500 text-xl not-italic">#{cfg.tag}</span>
-                            </h1>
+                            <div className="flex items-start justify-between gap-3 flex-wrap">
+                                <h1 className="text-3xl md:text-4xl font-black text-white italic uppercase tracking-tighter leading-none">
+                                    {cfg.name} <span className="text-gray-500 text-xl not-italic">#{cfg.tag}</span>
+                                </h1>
+                                <ShareCard playerId={cfg.id} />
+                            </div>
                             <div className="flex items-center gap-3 mt-2 flex-wrap">
                                 {rank && <span className="text-sm font-bold uppercase tracking-wide" style={{ color: accent }}>{rank.name}</span>}
                                 {cfg.account_level != null && <span className="text-xs text-gray-400 font-bold">Niveau {cfg.account_level}</span>}

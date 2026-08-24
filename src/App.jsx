@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react';
 import {
-  Crosshair, Swords, Trophy, Award, Cloud, BrainCircuit, Server,
+  Crosshair, Swords, Trophy, Award, BrainCircuit,
   RefreshCw, AlertTriangle, Users, BarChart2, Handshake, Menu, User,
-  X as CloseIcon, Target, Map as MapIcon, Skull, Send, Banknote, Zap, Settings, Calendar, IdCard, Radio
+  X as CloseIcon, Target, Map as MapIcon, Skull, Send, Banknote, Settings, Calendar, IdCard, Radio, Search, ChevronDown, Wrench
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Routes, Route, Navigate, useNavigate, useParams } from 'react-router-dom';
@@ -16,11 +16,10 @@ const namedLazy = (importFn, name) => lazy(() => importFn().then(m => ({ default
 
 const HallOfFameAndShame = namedLazy(() => import('./sections/HallOfFame.jsx'), 'HallOfFameAndShame');
 const VersusMode = namedLazy(() => import('./sections/VersusMode.jsx'), 'VersusMode');
-const ServerWeather = namedLazy(() => import('./sections/ServerWeather.jsx'), 'ServerWeather');
 const RoleAnalysis = namedLazy(() => import('./sections/RoleAnalysis.jsx'), 'RoleAnalysis');
 const RushDashboard = namedLazy(() => import('./sections/RushDashboard.jsx'), 'RushDashboard');
 const Leaderboard = namedLazy(() => import('./sections/Leaderboard.jsx'), 'Leaderboard');
-const DeathmatchAnalysis = namedLazy(() => import('./sections/DeathmatchAnalysis.jsx'), 'DeathmatchAnalysis');
+const Training = namedLazy(() => import('./sections/Training.jsx'), 'Training');
 const SynergyAnalysis = namedLazy(() => import('./sections/SynergyAnalysis.jsx'), 'SynergyAnalysis');
 const Arsenal = namedLazy(() => import('./sections/Arsenal.jsx'), 'Arsenal');
 const AgentAnalysis = namedLazy(() => import('./sections/AgentAnalysis.jsx'), 'AgentAnalysis');
@@ -28,14 +27,14 @@ const MapAnalysis = namedLazy(() => import('./sections/MapAnalysis.jsx'), 'MapAn
 const Nemesis = namedLazy(() => import('./sections/Nemesis.jsx'), 'Nemesis');
 const PlaystyleMatrix = namedLazy(() => import('./sections/PlaystyleMatrix.jsx'), 'PlaystyleMatrix');
 const EcoRating = namedLazy(() => import('./sections/EcoRating.jsx'), 'EcoRating');
-const TDMChallenge = namedLazy(() => import('./sections/TDMChallenge.jsx'), 'TDMChallenge');
-const Spellcaster = namedLazy(() => import('./sections/Spellcaster.jsx'), 'Spellcaster');
 const AdminPanel = namedLazy(() => import('./sections/AdminPanel.jsx'), 'AdminPanel');
 const SkirmishAnalysis = namedLazy(() => import('./sections/SkirmishAnalysis.jsx'), 'SkirmishAnalysis');
 const Tournaments = namedLazy(() => import('./sections/Tournaments.jsx'), 'Tournaments');
 const SeasonWrapUp = namedLazy(() => import('./sections/SeasonWrapUp.jsx'), 'SeasonWrapUp');
 const PlayerProfile = namedLazy(() => import('./sections/PlayerProfile.jsx'), 'PlayerProfile');
 const LiveNight = namedLazy(() => import('./sections/LiveNight.jsx'), 'LiveNight');
+const Scout = namedLazy(() => import('./sections/Scout.jsx'), 'Scout');
+const Utilities = namedLazy(() => import('./sections/Utilities.jsx'), 'Utilities');
 
 // Modale lourde, chargée seulement au clic sur un match
 const MatchDetailModal = namedLazy(() => import('./components/UI'), 'MatchDetailModal');
@@ -45,12 +44,78 @@ const SidebarItem = ({ id, label, icon: Icon, activeTab, onNavigate, isMobile, s
   return (
     <button
       onClick={() => { onNavigate(id); if (isMobile) setIsSidebarOpen(false); }}
-      className={`w-full flex items-center justify-start px-4 py-3 rounded-xl transition-all duration-200 group relative overflow-hidden ${isActive ? 'bg-gradient-to-r from-[#ff4655] to-[#d93442] text-white shadow-lg shadow-[#ff4655]/20' : 'text-gray-400 hover:bg-white/5 hover:text-white'}`}
+      className={`w-full flex items-center justify-start px-4 py-2.5 rounded-xl transition-all duration-200 group relative overflow-hidden ${isActive ? 'bg-gradient-to-r from-[#ff4655] to-[#d93442] text-white shadow-lg shadow-[#ff4655]/20' : 'text-gray-400 hover:bg-white/5 hover:text-white'}`}
     >
-      <Icon size={20} className={`flex-shrink-0 ${isActive ? 'text-white' : 'text-gray-400 group-hover:text-white'}`} />
+      <Icon size={19} className={`flex-shrink-0 ${isActive ? 'text-white' : 'text-gray-400 group-hover:text-white'}`} />
       <span className={`font-bold text-sm tracking-wide whitespace-nowrap ml-3 ${isActive ? 'text-white' : ''}`}>{label}</span>
       {isActive && <motion.div layoutId="activeTabIndicator" className="absolute left-0 top-0 bottom-0 w-1 bg-white rounded-r" />}
     </button>
+  );
+};
+
+// Navigation organisée en groupes thématiques repliables (fix de la surcharge
+// des 22 onglets). Chaque groupe a un titre scannable ; l'utilisateur peut plier
+// les sections qu'il utilise peu. L'état d'ouverture est persisté en localStorage.
+const NAV_GROUPS = [
+  { title: 'Essentiel', items: [
+    { id: 'live', label: 'Soirée en direct', icon: Radio },
+    { id: 'rush', label: 'Rush Immortal', icon: Trophy },
+    { id: 'profil', label: 'Profil joueur', icon: IdCard },
+    { id: 'scout', label: 'Scout / Recherche', icon: Search },
+    { id: 'wrapup', label: 'Bilan de saison', icon: Calendar },
+  ]},
+  { title: 'Classements & Duels', items: [
+    { id: 'leaderboard', label: 'Classements', icon: BarChart2 },
+    { id: 'tournaments', label: 'Tournois KSL', icon: Trophy },
+    { id: 'versus', label: 'Versus', icon: Swords },
+    { id: 'nemesis', label: 'Némésis', icon: Skull },
+    { id: 'shame', label: 'Hall of Fame', icon: Award },
+  ]},
+  { title: 'Analyse de jeu', items: [
+    { id: 'agents', label: 'Agents', icon: User },
+    { id: 'roles', label: 'Tactique & Rôles', icon: BrainCircuit },
+    { id: 'arsenal', label: 'Arsenal', icon: Target },
+    { id: 'maps', label: 'Cartographie', icon: MapIcon },
+    { id: 'synergy', label: 'Synergies', icon: Handshake },
+    { id: 'matrix', label: 'Matrice du style', icon: Crosshair },
+    { id: 'eco', label: "L'Économie", icon: Banknote },
+  ]},
+  { title: 'Modes annexes', items: [
+    { id: 'skirmish', label: 'Skirmish 2v2', icon: Users },
+    { id: 'training', label: 'Entraînement', icon: Target },
+  ]},
+  { title: 'Outils', items: [
+    { id: 'utils', label: 'Utilitaires', icon: Wrench },
+  ]},
+];
+
+const NavGroup = ({ title, items, defaultOpen, activeTab, ...itemProps }) => {
+  const storageKey = `nav_open_${title}`;
+  const [open, setOpen] = useState(() => {
+    const saved = localStorage.getItem(storageKey);
+    return saved === null ? defaultOpen : saved === '1';
+  });
+  const hasActive = items.some(it => it.id === activeTab);
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    localStorage.setItem(storageKey, next ? '1' : '0');
+  };
+  return (
+    <div className="mb-1">
+      <button onClick={toggle}
+        className="w-full flex items-center justify-between px-4 py-1.5 text-[10px] font-black uppercase tracking-widest text-gray-600 hover:text-gray-400 transition-colors">
+        <span className={hasActive ? 'text-[#ff4655]' : ''}>{title}</span>
+        <ChevronDown size={13} className={`transition-transform ${open ? '' : '-rotate-90'}`} />
+      </button>
+      {open && (
+        <div className="space-y-0.5 mt-1">
+          {items.map(it => (
+            <SidebarItem key={it.id} id={it.id} label={it.label} icon={it.icon} activeTab={activeTab} {...itemProps} />
+          ))}
+        </div>
+      )}
+    </div>
   );
 };
 
@@ -66,7 +131,9 @@ function MainApp() {
   const { scope, tab } = useParams();
   const navigate = useNavigate();
 
-  const activeTab = tab || 'rush';
+  // Redirige les anciens onglets retirés/renommés (bookmarks) vers leur remplaçant.
+  const TAB_REDIRECTS = { deathmatch: 'training', tdm: 'training', weather: 'rush', spells: 'agents' };
+  const activeTab = TAB_REDIRECTS[tab] || tab || 'rush';
   const selectedPlayerId = scope === 'global' ? 'all' : scope;
 
   const [selectedMatch, setSelectedMatch] = useState(null);
@@ -284,32 +351,11 @@ function MainApp() {
           {isMobile && <button onClick={() => setIsSidebarOpen(false)} className="text-gray-400 hover:text-white shrink-0 ml-2 p-1 bg-white/5 rounded-lg"><CloseIcon size={20} /></button>}
         </div>
 
-        <div className="flex-grow py-6 px-3 space-y-1.5 overflow-y-auto custom-scrollbar">
-          <SidebarItem id="live" label="SOIRÉE EN DIRECT" icon={Radio} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="rush" label="RUSH IMMORTAL" icon={Trophy} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="profil" label="PROFIL JOUEUR" icon={IdCard} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="wrapup" label="BILAN DE SAISON" icon={Calendar} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <div className="my-4 border-t border-white/5 mx-2"></div>
-          <SidebarItem id="skirmish" label="SKIRMISH 2V2" icon={Users} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="deathmatch" label="DEATHMATCH 100" icon={Swords} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="tdm" label="DÉFI 100 TDM" icon={Target} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <div className="my-4 border-t border-white/5 mx-2"></div>
-          <SidebarItem id="tournaments" label="TOURNOIS KSL" icon={Trophy} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="leaderboard" label="CLASSEMENTS" icon={BarChart2} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="agents" label="AGENTS" icon={User} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="arsenal" label="ARSENAL" icon={Target} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="maps" label="CARTOGRAPHIE" icon={MapIcon} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="nemesis" label="NÉMÉSIS" icon={Skull} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="synergy" label="SYNERGIES" icon={Handshake} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <div className="my-4 border-t border-white/5 mx-2"></div>
-          <SidebarItem id="shame" label="HALL OF FAME" icon={Award} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="versus" label="VERSUS" icon={Swords} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <div className="my-4 border-t border-white/5 mx-2"></div>
-          <SidebarItem id="weather" label="MÉTÉO" icon={Cloud} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="roles" label="TACTIQUE" icon={BrainCircuit} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="matrix" label="MATRICE DU STYLE" icon={Crosshair} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="eco" label="L'ÉCONOMIE" icon={Banknote} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
-          <SidebarItem id="spells" label="SPELLCASTER" icon={Zap} activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
+        <div className="flex-grow py-5 px-3 overflow-y-auto custom-scrollbar">
+          {NAV_GROUPS.map((g, i) => (
+            <NavGroup key={g.title} title={g.title} items={g.items} defaultOpen={i < 2}
+              activeTab={activeTab} onNavigate={handleTabChange} isMobile={isMobile} setIsSidebarOpen={setIsSidebarOpen} />
+          ))}
         </div>
 
         <div className="p-4 border-t border-white/5 bg-black/20 space-y-4">
@@ -376,12 +422,13 @@ function MainApp() {
                 {
                   {
                     'live': <LiveNight />,
+                    'scout': <Scout />,
+                    'utils': <Utilities />,
                     'rush': <RushDashboard matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={challengeStartDate} onSelectMatch={setSelectedMatch} />,
                     'profil': <PlayerProfile matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} onSelectPlayer={(pid) => navigate(`/${pid}/profil`)} />,
                     'wrapup': <SeasonWrapUp matches={globalFilteredMatches} playersConfig={playersConfig} />,
                     'skirmish': <SkirmishAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={challengeStartDate} />,
-                    'deathmatch': <DeathmatchAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />,
-                    'tdm': <TDMChallenge matches={globalFilteredMatches} playersConfig={playersConfig} />,
+                    'training': <Training matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />,
                     'tournaments': <Tournaments />,
                     'leaderboard': <Leaderboard matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={challengeStartDate} />,
                     'agents': <AgentAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} />,
@@ -391,11 +438,9 @@ function MainApp() {
                     'synergy': <SynergyAnalysis matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={challengeStartDate} />,
                     'shame': <HallOfFameAndShame matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={challengeStartDate} />,
                     'versus': <VersusMode matches={globalFilteredMatches} players={playersConfig} challengeStartDate={challengeStartDate} />,
-                    'weather': <ServerWeather matches={globalFilteredMatches} playersConfig={playersConfig} />,
                     'roles': <RoleAnalysis matches={globalFilteredMatches} selectedPlayerId={selectedPlayerId} playersConfig={playersConfig} challengeStartDate={challengeStartDate} />,
                     'matrix': <PlaystyleMatrix matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={challengeStartDate} />,
-                    'eco': <EcoRating matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={challengeStartDate} />,
-                    'spells': <Spellcaster matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={challengeStartDate} />
+                    'eco': <EcoRating matches={globalFilteredMatches} playersConfig={playersConfig} challengeStartDate={challengeStartDate} />
                   }[activeTab]
                 }
               </motion.div>

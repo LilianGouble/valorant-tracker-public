@@ -12,7 +12,8 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 
 // --- IMPORT DU BOT DISCORD ---
-import { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, REST, Routes } from 'discord.js';
+import { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, REST, Routes, AttachmentBuilder } from 'discord.js';
+import { buildSessionCard, buildPlayerCard, toDataUri } from './recap-generator.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,6 +22,11 @@ const app = express();
 const PORT = 3001;
 const DB_FILE = path.join(__dirname, 'database.sqlite');
 const API_BASE = "https://api.henrikdev.xyz/valorant";
+
+// Derrière Nginx/proxy : fait confiance au 1er proxy pour lire la vraie IP client
+// (X-Forwarded-For). Indispensable pour que le rate-limiting soit par-client et
+// non par-proxy (sinon tout le trafic partage une seule IP).
+app.set('trust proxy', 1);
 
 // CORS : liste blanche dynamique (localhost dev + app_url configuré).
 // Rechargée au démarrage et après chaque édition admin (refreshAllowedOrigins).
@@ -45,6 +51,16 @@ app.use(compression({
         return compression.filter(req, res);
     }
 }));
+// En-têtes de sécurité de base (équivalent minimal de Helmet, sans dépendance).
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');       // pas de MIME sniffing
+    res.setHeader('X-Frame-Options', 'DENY');                 // anti-clickjacking
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('X-XSS-Protection', '0');                   // désactive le filtre XSS legacy (déprécié)
+    res.removeHeader('X-Powered-By');                         // masque "Express"
+    next();
+});
+
 // 2mb suffit largement (payload Riot ~50KB, ajouts admin ~quelques KB).
 app.use(bodyParser.json({ limit: '2mb' }));
 
@@ -266,6 +282,38 @@ const checkLoginRateLimit = (ip) => {
     return { allowed: true };
 };
 const resetLoginAttempts = (ip) => loginAttempts.delete(ip);
+
+// Rate-limiter générique par IP (middleware). Protège les routes publiques
+// coûteuses (sync, scout, génération d'images) contre l'abus / le flood.
+const makeRateLimiter = ({ windowMs, max, name }) => {
+    const hits = new Map();
+    // Purge périodique pour éviter la fuite mémoire.
+    setInterval(() => {
+        const now = Date.now();
+        for (const [ip, e] of hits) if (now - e.first > windowMs) hits.delete(ip);
+    }, windowMs).unref?.();
+    return (req, res, next) => {
+        const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+        const now = Date.now();
+        const e = hits.get(ip);
+        if (!e || now - e.first > windowMs) {
+            hits.set(ip, { count: 1, first: now });
+            return next();
+        }
+        e.count++;
+        if (e.count > max) {
+            const retryAfter = Math.ceil((windowMs - (now - e.first)) / 1000);
+            res.set('Retry-After', String(retryAfter));
+            return res.status(429).json({ error: `Trop de requêtes (${name}). Réessaie dans ${retryAfter}s.` });
+        }
+        next();
+    };
+};
+
+// Limiteurs dédiés : sync coûteux (quota API), scout (appels externes), images.
+const syncLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 10, name: 'sync' });
+const scoutLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 20, name: 'scout' });
+const imageLimiter = makeRateLimiter({ windowMs: 60 * 1000, max: 30, name: 'image' });
 
 // Validations communes
 const HEX_COLOR_RE = /^#[0-9A-Fa-f]{6}$/;
@@ -1621,6 +1669,387 @@ const sendDiscordMessage = async (channelId, payload) => {
 };
 
 // ==========================================
+// RÉCAPS PARTAGEABLES (Wrapped KSL)
+// ==========================================
+
+// UUID stable des paliers compétitifs (icônes de rang valorant-api).
+const TIER_UUID_SRV = "03621f52-342b-cf4e-4f86-9350a49c6d04";
+const TIER_NAME_TO_ID = {
+    'unrated': 0, 'iron 1': 3, 'iron 2': 4, 'iron 3': 5, 'bronze 1': 6, 'bronze 2': 7, 'bronze 3': 8,
+    'silver 1': 9, 'silver 2': 10, 'silver 3': 11, 'gold 1': 12, 'gold 2': 13, 'gold 3': 14,
+    'platinum 1': 15, 'platinum 2': 16, 'platinum 3': 17, 'diamond 1': 18, 'diamond 2': 19, 'diamond 3': 20,
+    'ascendant 1': 21, 'ascendant 2': 22, 'ascendant 3': 23, 'immortal 1': 24, 'immortal 2': 25, 'immortal 3': 26, 'radiant': 27,
+};
+const rankIconUrl = (tierName) => {
+    const id = TIER_NAME_TO_ID[(tierName || '').toLowerCase().trim()] ?? 0;
+    return `https://media.valorant-api.com/competitivetiers/${TIER_UUID_SRV}/${id}/largeicon.png`;
+};
+
+// Agrège la session (dernier jour joué) de toute l'escouade pour la carte de soirée.
+const gatherSessionData = async () => {
+    const players = await getPlayers();
+    const now = Date.now();
+    const start = new Date(now);
+    start.setHours(16, 0, 0, 0);
+    if (new Date(now).getHours() < 6) start.setDate(start.getDate() - 1);
+    const windowStart = start.getTime();
+
+    const perPlayer = [];
+    let anyGames = false;
+    for (const p of players) {
+        const rows = await db.all(
+            "SELECT data FROM matches WHERE player_id = ? AND type = 'ranked' AND date >= ? ORDER BY date DESC",
+            [p.id, windowStart]
+        );
+        const games = rows.map(r => { try { return JSON.parse(r.data); } catch { return null; } }).filter(Boolean);
+        if (games.length === 0) continue;
+        anyGames = true;
+        perPlayer.push({
+            name: p.name, color: p.color,
+            rr: games.reduce((s, m) => s + (m.rrChange || 0), 0),
+            wins: games.filter(m => m.result === 'WIN').length,
+            losses: games.filter(m => m.result === 'LOSS').length,
+        });
+    }
+    if (!anyGames) return null;
+
+    perPlayer.sort((a, b) => b.rr - a.rr);
+    const collective = perPlayer.reduce((acc, s) => {
+        acc.rr += s.rr; acc.wins += s.wins; acc.losses += s.losses; acc.games += s.wins + s.losses;
+        return acc;
+    }, { rr: 0, wins: 0, losses: 0, games: 0 });
+    const mvp = perPlayer[0] && perPlayer[0].rr > 0 ? perPlayer[0] : null;
+    const dateLabel = new Date(windowStart).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/Paris' });
+
+    return { dateLabel, collective, mvp, topPlayers: perPlayer };
+};
+
+// Agrège les stats carrière d'un joueur pour sa carte de profil.
+const gatherPlayerCardData = async (playerId) => {
+    const players = await getPlayers();
+    const cfg = players.find(p => p.id === playerId);
+    if (!cfg) return null;
+
+    const rows = await db.all("SELECT data FROM matches WHERE player_id = ? AND type = 'ranked'", [playerId]);
+    const games = rows.map(r => { try { return JSON.parse(r.data); } catch { return null; } }).filter(Boolean);
+    if (games.length === 0) return null;
+
+    const wins = games.filter(m => m.result === 'WIN').length;
+    const kills = games.reduce((s, m) => s + (m.kills || 0), 0);
+    const deaths = games.reduce((s, m) => s + (m.deaths || 0), 0);
+    const hs = games.reduce((s, m) => s + (m.headshots || 0), 0);
+    const shots = games.reduce((s, m) => s + (m.headshots || 0) + (m.bodyshots || 0) + (m.legshots || 0), 0);
+    const adrGames = games.filter(m => m.adr != null);
+    const avgAdr = adrGames.length ? Math.round(adrGames.reduce((s, m) => s + m.adr, 0) / adrGames.length) : 0;
+
+    let mmr = null; try { mmr = cfg.live_mmr ? JSON.parse(cfg.live_mmr) : null; } catch { mmr = null; }
+    const rankName = mmr?.current?.tier || null;
+    const peak = mmr?.peak?.tier || null;
+
+    return {
+        name: cfg.name, tag: cfg.tag, color: cfg.color,
+        rankName, peak,
+        rankIconUri: rankName ? await toDataUri(rankIconUrl(rankName)) : null,
+        bannerUri: cfg.account_card ? await toDataUri(`https://media.valorant-api.com/playercards/${cfg.account_card}/wideart.png`) : null,
+        stats: {
+            games: games.length,
+            winrate: Math.round((wins / games.length) * 100),
+            kd: (deaths > 0 ? kills / deaths : kills).toFixed(2),
+            hsPct: shots > 0 ? ((hs / shots) * 100).toFixed(1) : '0',
+            adr: avgAdr,
+        },
+    };
+};
+
+// ==========================================
+// SCOUT : analyse publique d'un joueur (anti-cheat)
+// ==========================================
+// Résout le joueur, récupère rang/peak + les 10 dernières ranked ultra-détaillées.
+// Gère proprement : 404 (introuvable), profil masqué Riot, IGN changé.
+app.get('/api/scout/:name/:tag', scoutLimiter, async (req, res) => {
+    try {
+        const apiKeys = await getApiKeys();
+        if (apiKeys.length === 0) return res.status(503).json({ error: 'Aucune clé API configurée.' });
+
+        const name = req.params.name;
+        const tag = req.params.tag;
+        // Région : uniquement une valeur de la liste blanche (sinon on force 'eu')
+        // pour empêcher toute manipulation du chemin de l'URL API.
+        let region = ((req.query.region || 'eu') + '').toLowerCase();
+        if (!REGION_VALUES.has(region)) region = 'eu';
+        // Garde-fous sur les entrées (un pseudo Riot fait ≤16 char, un tag ≤5).
+        if (!name || !tag || name.length > 32 || tag.length > 16) {
+            return res.status(400).json({ error: 'invalid', message: 'Pseudo ou tag invalide.' });
+        }
+        const enc = (s) => encodeURIComponent((s || '').trim());
+
+        // 1) Résolution du compte (puuid, level, card)
+        const accRes = await fetchWithRetry(`${API_BASE}/v2/account/${enc(name)}/${enc(tag)}`, apiKeys, {}, 3);
+        if (accRes.status === 404) return res.status(404).json({ error: 'notfound', message: `${name}#${tag} introuvable. Pseudo ou tag incorrect (ou IGN changé).` });
+        if (!accRes.ok) return res.status(502).json({ error: 'api', message: `Erreur API (${accRes.status}).` });
+        const accJson = await accRes.json();
+        const account = accJson.data || {};
+        const puuid = account.puuid;
+
+        // 2) MMR : rang courant + peak
+        let mmr = null;
+        try {
+            const mmrRes = await fetchWithRetry(`${API_BASE}/v3/mmr/${region}/pc/${enc(name)}/${enc(tag)}`, apiKeys, {}, 2);
+            if (mmrRes.ok) {
+                const d = (await mmrRes.json()).data;
+                mmr = {
+                    current: d?.current?.tier?.name || null,
+                    rr: d?.current?.rr ?? null,
+                    peak: d?.peak?.tier?.name || null,
+                    peakSeason: d?.peak?.season?.short || null,
+                    leaderboard: d?.current?.leaderboard_placement?.rank ?? null,
+                };
+            }
+        } catch { /* rang optionnel */ }
+
+        // 3) Les 10 dernières compétitives, ultra-détaillées
+        const matchRes = await fetchWithRetry(`${API_BASE}/v4/matches/${region}/pc/${enc(name)}/${enc(tag)}?mode=competitive&size=10`, apiKeys, {}, 3);
+        if (matchRes.status === 404 || matchRes.status === 403) {
+            return res.json({
+                account: { name: account.name || name, tag: account.tag || tag, level: account.account_level ?? null, card: account.card || null, region },
+                mmr, matches: [], hidden: true,
+                message: "L'historique de ce joueur est masqué (paramètre Riot 'Career Profile').",
+            });
+        }
+        if (!matchRes.ok) return res.status(502).json({ error: 'api', message: `Erreur historique (${matchRes.status}).` });
+        const matchesRaw = (await matchRes.json()).data || [];
+
+        // Analyse détaillée de chaque match du point de vue du joueur cherché
+        const matches = matchesRaw.map(m => {
+            const me = (m.players || []).find(p => p.puuid === puuid);
+            if (!me) return null;
+            const rp = (m.rounds || []).length || 1;
+            const st = me.stats || {};
+            const dealt = typeof st.damage === 'object' ? (st.damage.dealt || 0) : (st.damage || 0);
+            const received = typeof st.damage === 'object' ? (st.damage.received || 0) : 0;
+            const shots = (st.headshots || 0) + (st.bodyshots || 0) + (st.legshots || 0);
+
+            // Kills du joueur : HS% et arme par kill
+            const myKills = (m.kills || []).filter(k => (k.killer?.puuid || k.killer_puuid) === puuid);
+            const weaponCount = {};
+            let fastestKillMs = null;
+            myKills.forEach(k => {
+                const w = k.weapon?.name || k.damage_weapon_name || 'Inconnu';
+                weaponCount[w] = (weaponCount[w] || 0) + 1;
+                const t = k.time_in_round_in_ms ?? k.kill_time_in_round;
+                if (t != null && (fastestKillMs == null || t < fastestKillMs)) fastestKillMs = t;
+            });
+            const topWeapon = Object.entries(weaponCount).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+
+            // First bloods : 1er kill de chaque round attribué au joueur
+            let firstBloods = 0, firstDeaths = 0;
+            const roundFirst = {};
+            (m.kills || []).forEach(k => {
+                const r = k.round ?? k.round_number;
+                const t = k.time_in_round_in_ms ?? k.kill_time_in_round ?? 9e9;
+                if (roundFirst[r] == null || t < roundFirst[r].t) {
+                    roundFirst[r] = { t, killer: k.killer?.puuid || k.killer_puuid, victim: k.victim?.puuid || k.victim_puuid };
+                }
+            });
+            Object.values(roundFirst).forEach(fb => {
+                if (fb.killer === puuid) firstBloods++;
+                if (fb.victim === puuid) firstDeaths++;
+            });
+
+            const won = (() => {
+                const myTeamId = me.team_id;
+                const t = (m.teams || []).find(x => x.team_id === myTeamId);
+                return t ? !!t.won : null;
+            })();
+            const teamScore = (m.teams || []).map(t => t.rounds?.won ?? 0).sort((a, b) => b - a);
+
+            return {
+                matchId: m.metadata?.match_id,
+                map: m.metadata?.map?.name || '?',
+                date: m.metadata?.started_at || null,
+                agent: me.agent?.name || '?',
+                agentId: me.agent?.id || null,
+                won,
+                score: teamScore.length === 2 ? `${teamScore[0]}-${teamScore[1]}` : null,
+                rounds: rp,
+                kills: st.kills || 0, deaths: st.deaths || 0, assists: st.assists || 0,
+                kd: st.deaths ? +(st.kills / st.deaths).toFixed(2) : (st.kills || 0),
+                kda: `${st.kills || 0}/${st.deaths || 0}/${st.assists || 0}`,
+                acs: Math.round((st.score || 0) / rp),
+                adr: Math.round(dealt / rp),
+                adrReceived: Math.round(received / rp),
+                hs: st.headshots || 0, body: st.bodyshots || 0, leg: st.legshots || 0,
+                hsPct: shots ? +((st.headshots / shots) * 100).toFixed(1) : 0,
+                firstBloods, firstDeaths,
+                topWeapon, fastestKillMs,
+                kastLike: null, // KAST vrai non dispo simplement ; on s'appuie sur FB/FD
+                tier: me.tier?.name || null,
+            };
+        }).filter(Boolean);
+
+        // Agrégats sur les 10 games (pour la détection de patterns anormaux)
+        const agg = (() => {
+            if (matches.length === 0) return null;
+            const n = matches.length;
+            const sum = (f) => matches.reduce((s, m) => s + f(m), 0);
+            const avg = (f) => sum(f) / n;
+            const hsVals = matches.map(m => m.hsPct);
+            const avgHs = avg(m => m.hsPct);
+            // Écart-type du HS% : très faible = suspicieusement régulier
+            const variance = hsVals.reduce((s, v) => s + (v - avgHs) ** 2, 0) / n;
+            return {
+                games: n,
+                wins: matches.filter(m => m.won).length,
+                avgKd: +avg(m => m.kd).toFixed(2),
+                avgAcs: Math.round(avg(m => m.acs)),
+                avgAdr: Math.round(avg(m => m.adr)),
+                avgHs: +avgHs.toFixed(1),
+                hsStdev: +Math.sqrt(variance).toFixed(1),
+                totalFirstBloods: sum(m => m.firstBloods),
+                totalKills: sum(m => m.kills),
+            };
+        })();
+
+        // 4) ANALYSE PROFONDE : jusqu'à 90 games résumées (stored-matches).
+        // Échantillon bien plus grand → détection anti-cheat statistiquement fiable.
+        let deep = null;
+        try {
+            const deepRes = await fetchWithRetry(`${API_BASE}/v1/stored-matches/${region}/${enc(name)}/${enc(tag)}?mode=competitive&size=90`, apiKeys, {}, 2);
+            if (deepRes.ok) {
+                const dm = (await deepRes.json()).data || [];
+                const rows = dm.map(g => {
+                    const st = g.stats || {};
+                    const sh = st.shots || {};
+                    const head = sh.head || 0, body = sh.body || 0, leg = sh.leg || 0;
+                    const shots = head + body + leg;
+                    const rounds = ((g.teams?.red || 0) + (g.teams?.blue || 0)) || 1;
+                    const made = st.damage?.made || 0, received = st.damage?.received || 0;
+                    const won = st.team && g.teams
+                        ? (st.team.toLowerCase() === 'blue' ? g.teams.blue > g.teams.red : g.teams.red > g.teams.blue)
+                        : null;
+                    return {
+                        date: g.meta?.started_at || null,
+                        map: g.meta?.map?.name || '?',
+                        agent: st.character?.name || '?',
+                        kills: st.kills || 0, deaths: st.deaths || 0, assists: st.assists || 0,
+                        kd: st.deaths ? +(st.kills / st.deaths).toFixed(2) : (st.kills || 0),
+                        acs: Math.round((st.score || 0) / rounds),
+                        adr: Math.round(made / rounds),
+                        adrReceived: Math.round(received / rounds),
+                        hsPct: shots ? +((head / shots) * 100).toFixed(1) : 0,
+                        head, body, leg, won,
+                    };
+                });
+
+                if (rows.length > 0) {
+                    const n = rows.length;
+                    const sum = (f) => rows.reduce((s, r) => s + f(r), 0);
+                    const avg = (f) => sum(f) / n;
+                    const avgHs = avg(r => r.hsPct);
+                    const hsStdev = Math.sqrt(rows.reduce((s, r) => s + (r.hsPct - avgHs) ** 2, 0) / n);
+                    // Distribution du HS% par paliers (pour un histogramme côté front)
+                    const buckets = [0, 0, 0, 0, 0, 0]; // <15, 15-25, 25-35, 35-45, 45-55, 55+
+                    rows.forEach(r => {
+                        const h = r.hsPct;
+                        const idx = h < 15 ? 0 : h < 25 ? 1 : h < 35 ? 2 : h < 45 ? 3 : h < 55 ? 4 : 5;
+                        buckets[idx]++;
+                    });
+                    // Agent le plus joué
+                    const agCount = {};
+                    rows.forEach(r => { agCount[r.agent] = (agCount[r.agent] || 0) + 1; });
+                    const topAgent = Object.entries(agCount).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+
+                    deep = {
+                        games: n,
+                        wins: rows.filter(r => r.won === true).length,
+                        avgKd: +avg(r => r.kd).toFixed(2),
+                        avgAcs: Math.round(avg(r => r.acs)),
+                        avgAdr: Math.round(avg(r => r.adr)),
+                        avgAdrReceived: Math.round(avg(r => r.adrReceived)),
+                        avgHs: +avgHs.toFixed(1),
+                        maxHs: Math.max(...rows.map(r => r.hsPct)),
+                        hsStdev: +hsStdev.toFixed(1),
+                        hsBuckets: buckets,
+                        topAgent,
+                        // Courbe HS% chronologique (ancien → récent) pour repérer une bascule nette
+                        hsTrend: [...rows].reverse().map(r => r.hsPct),
+                    };
+                }
+            }
+        } catch { /* analyse profonde optionnelle */ }
+
+        res.json({
+            account: { name: account.name || name, tag: account.tag || tag, level: account.account_level ?? null, card: account.card || null, region },
+            mmr, matches, agg, deep, hidden: false,
+        });
+    } catch (e) {
+        console.error('❌ /api/scout:', e.message);
+        res.status(500).json({ error: 'server', message: e.message });
+    }
+});
+
+// GET carte de soirée (PNG direct — pratique pour <img> côté front).
+app.get('/api/recap/session.png', imageLimiter, async (req, res) => {
+    try {
+        const data = await gatherSessionData();
+        if (!data) return res.status(404).send('Aucune session à afficher');
+        const png = await buildSessionCard(data);
+        res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Cache-Control', 'public, max-age=120');
+        res.send(png);
+    } catch (e) {
+        console.error('❌ recap/session:', e.message);
+        res.status(500).send(e.message);
+    }
+});
+
+// GET carte de profil joueur (PNG direct).
+app.get('/api/recap/player/:id.png', imageLimiter, async (req, res) => {
+    try {
+        const data = await gatherPlayerCardData(req.params.id);
+        if (!data) return res.status(404).send('Joueur introuvable ou sans games');
+        const png = await buildPlayerCard(data);
+        res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Cache-Control', 'public, max-age=300');
+        res.send(png);
+    } catch (e) {
+        console.error('❌ recap/player:', e.message);
+        res.status(500).send(e.message);
+    }
+});
+
+// POST partage sur Discord (carte de soirée ou de joueur).
+app.post('/api/recap/share', authenticateToken, async (req, res) => {
+    try {
+        const { type, playerId } = req.body || {};
+        const channelId = await getConfig('discord_channel_id');
+        if (!channelId || !discordClient.isReady()) return res.status(503).json({ error: 'Bot Discord indisponible' });
+
+        let png, title;
+        if (type === 'session') {
+            const data = await gatherSessionData();
+            if (!data) return res.status(404).json({ error: 'Aucune session à partager' });
+            png = await buildSessionCard(data);
+            title = `📅 Récap de la soirée — ${data.collective.rr >= 0 ? '+' : ''}${data.collective.rr} RR`;
+        } else if (type === 'player' && playerId) {
+            const data = await gatherPlayerCardData(playerId);
+            if (!data) return res.status(404).json({ error: 'Joueur introuvable' });
+            png = await buildPlayerCard(data);
+            title = `🎯 Carte de ${data.name}`;
+        } else {
+            return res.status(400).json({ error: 'Type invalide' });
+        }
+
+        const attachment = new AttachmentBuilder(png, { name: 'ksl-recap.png' });
+        await sendDiscordMessage(channelId, { content: title, files: [attachment] });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('❌ recap/share:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ==========================================
 // ROUTES : AUTHENTIFICATION & CONFIG (ADMIN)
 // ==========================================
 
@@ -2949,13 +3378,34 @@ const announceSessionStarts = async (sessionStarters, allConfigPlayers, appUrl) 
         const isSquad = starters.length > 1;
         const first = starters[0];
 
+        // Rang fiable : on privilégie le snapshot live_mmr (v3/mmr) stocké en base.
+        // On le relit FRAIS depuis la DB car refreshMmrForPlayer l'a mis à jour
+        // pendant ce sync (l'objet cfg en mémoire peut être périmé). Le rang du
+        // match peut être "Unknown"/0 si Riot n'a pas encore indexé le MMR.
+        const resolveRank = async (s) => {
+            let mmr = null;
+            try {
+                const row = await db.get("SELECT live_mmr FROM players WHERE id = ?", [s.cfg.id]);
+                mmr = row?.live_mmr ? JSON.parse(row.live_mmr) : null;
+            } catch { mmr = null; }
+            if (mmr?.current?.tier && mmr.current.tier !== 'Unrated') {
+                return `${mmr.current.tier} ${mmr.current.rr ?? 0}RR`;
+            }
+            const mr = s.match?.currentRank;
+            if (mr && mr !== 'Unknown' && mr !== 'Unrated') {
+                return `${mr} ${s.match.currentRR ?? 0}RR`;
+            }
+            return null; // on n'affiche rien plutôt qu'un "Unknown 0RR"
+        };
+        const firstRank = await resolveRank(first);
+
         const embed = new EmbedBuilder()
             .setColor(isSquad ? 0xff4655 : parseInt((first.cfg.color || '#5865F2').replace('#', ''), 16))
             .setTitle(isSquad ? `🎮 L'escouade se connecte !` : `🎮 ${first.cfg.name} lance sa session !`)
             .setDescription(
                 isSquad
                     ? `${names} viennent de lancer leurs premières games de la session. Ça va farmer du RR ce soir ! 🔥`
-                    : `${names} vient de terminer sa première game de la session${first.match.currentRank ? ` — actuellement **${first.match.currentRank} ${first.match.currentRR ?? ''}RR**` : ''}.`
+                    : `${names} vient de terminer sa première game de la session${firstRank ? ` — actuellement **${firstRank}**` : ''}.`
             )
             .setURL(appUrl || null)
             .setFooter({ text: 'KSL Tracker • Session détectée' })
@@ -3318,6 +3768,18 @@ const generateDailyReport = async (isManual = false, forceDate = null) => {
     if (payload) {
         await sendDiscordMessage(channelId, payload);
         console.log(`✅ [RAPPORT] Envoyé pour le ${dateStr}.`);
+        // Carte-image de la soirée en complément visuel du rapport texte.
+        try {
+            const sessionData = await gatherSessionData();
+            if (sessionData) {
+                const png = await buildSessionCard(sessionData);
+                const attachment = new AttachmentBuilder(png, { name: 'ksl-soiree.png' });
+                await sendDiscordMessage(channelId, { files: [attachment] });
+                console.log(`🖼️ [RAPPORT] Carte de soirée envoyée.`);
+            }
+        } catch (e) {
+            console.warn(`⚠️ [RAPPORT] Carte de soirée non envoyée: ${e.message}`);
+        }
     } else {
         console.log(`ℹ️ [RAPPORT] Aucune partie classée le ${dateStr} — rapport non envoyé.`);
         if (isManual) {
@@ -3543,7 +4005,7 @@ app.get('/api/live/context', async (req, res) => {
 
 // Proxy image du viseur : la génération HenrikDev exige la clé API, donc on
 // relaie le PNG côté serveur. Cache navigateur 1h (un code de viseur est stable).
-app.get('/api/crosshair', async (req, res) => {
+app.get('/api/crosshair', imageLimiter, async (req, res) => {
     try {
         const code = req.query.code;
         if (!code || typeof code !== 'string' || code.length > 500) {
@@ -3639,7 +4101,7 @@ app.get('/api/events', (req, res) => {
     });
 });
 
-app.post('/sync', async (req, res) => {
+app.post('/sync', syncLimiter, async (req, res) => {
     const { playerId } = req.body;
     if (isSyncing) return res.status(429).json({ error: "Une synchro est déjà en cours" });
     
@@ -3649,7 +4111,7 @@ app.post('/sync', async (req, res) => {
     res.status(202).json({ message: "Synchronisation lancée en arrière-plan. Les matchs apparaîtront d'ici peu." });
 });
 
-app.get('/test-send', async (req, res) => {
+app.get('/test-send', authenticateToken, async (req, res) => {
     try {
         const channelId = await getConfig('discord_channel_id');
         if (!channelId) return res.status(400).send("Aucun ID de Salon Discord configuré dans le panel d'administration.");
@@ -3668,7 +4130,7 @@ app.get('/test-send', async (req, res) => {
     }
 });
 
-app.get('/test-match', async (req, res) => {
+app.get('/test-match', authenticateToken, async (req, res) => {
     try {
         const allConfigPlayers = await getPlayers();
         const appUrl = await getConfig('app_url', 'http://localhost:5173');
@@ -3692,7 +4154,7 @@ app.get('/test-match', async (req, res) => {
     }
 });
 
-app.get('/test-report', async (req, res) => {
+app.get('/test-report', authenticateToken, async (req, res) => {
     try {
         const row = await db.get("SELECT date FROM matches WHERE type = 'ranked' ORDER BY date DESC LIMIT 1");
         if (!row) return res.status(404).send("Aucun match classé en base de données pour faire le rapport.");
@@ -3705,7 +4167,7 @@ app.get('/test-report', async (req, res) => {
     }
 });
 
-app.get('/trigger-report', async (req, res) => {
+app.get('/trigger-report', authenticateToken, async (req, res) => {
     try {
         await generateDailyReport(true);
         res.sendStatus(200);
