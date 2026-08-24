@@ -2601,30 +2601,39 @@ app.post('/api/admin/backfill-adr', authenticateToken, async (req, res) => {
         const puuidById = {};
         players.forEach(p => { if (p.puuid) puuidById[p.id] = p.puuid.toLowerCase(); });
 
-        const rows = await db.all("SELECT id, player_id, data FROM matches WHERE type = 'ranked'");
-        let updated = 0, skipped = 0;
-        await db.exec('BEGIN TRANSACTION');
-        for (const row of rows) {
-            let m; try { m = JSON.parse(row.data); } catch { continue; }
-            const rp = m.roundsPlayed || 0;
-            const myPuuid = puuidById[row.player_id];
-            const me = myPuuid && (m.allPlayers || []).find(p => p.puuid?.toLowerCase() === myPuuid);
-            const dmg = me?.stats?.damage;
-            if (!rp || !dmg || typeof dmg !== 'object') { skipped++; continue; }
-
-            const newAdr = Math.round((dmg.dealt || 0) / rp);
-            const newDmgReceived = Math.round((dmg.received || 0) / rp);
-            if (m.adr === newAdr && m.adrReceived === newDmgReceived) { skipped++; continue; }
-
-            m.adr = newAdr;
-            m.adrReceived = newDmgReceived; // nouveau : ADR subi (mesure de survie)
-            await db.run("UPDATE matches SET data = ? WHERE id = ?", [JSON.stringify(m), row.id]);
-            updated++;
+        // Traitement PAGINÉ (lots de 500) pour ne jamais charger toute la table
+        // en mémoire — évite l'OOM sur les grosses bases.
+        const BATCH = 500;
+        let offset = 0, updated = 0, skipped = 0, total = 0;
+        for (;;) {
+            const rows = await db.all(
+                "SELECT id, player_id, data FROM matches WHERE type = 'ranked' ORDER BY id LIMIT ? OFFSET ?",
+                [BATCH, offset]
+            );
+            if (rows.length === 0) break;
+            total += rows.length;
+            await db.exec('BEGIN TRANSACTION');
+            for (const row of rows) {
+                let m; try { m = JSON.parse(row.data); } catch { continue; }
+                const rp = m.roundsPlayed || 0;
+                const myPuuid = puuidById[row.player_id];
+                const me = myPuuid && (m.allPlayers || []).find(p => p.puuid?.toLowerCase() === myPuuid);
+                const dmg = me?.stats?.damage;
+                if (!rp || !dmg || typeof dmg !== 'object') { skipped++; continue; }
+                const newAdr = Math.round((dmg.dealt || 0) / rp);
+                const newDmgReceived = Math.round((dmg.received || 0) / rp);
+                if (m.adr === newAdr && m.adrReceived === newDmgReceived) { skipped++; continue; }
+                m.adr = newAdr;
+                m.adrReceived = newDmgReceived;
+                await db.run("UPDATE matches SET data = ? WHERE id = ?", [JSON.stringify(m), row.id]);
+                updated++;
+            }
+            await db.exec('COMMIT');
+            offset += BATCH;
         }
-        await db.exec('COMMIT');
         invalidatePublicConfigCache();
         console.log(`✅ Backfill ADR : ${updated} matchs corrigés, ${skipped} ignorés.`);
-        res.json({ updated, skipped, total: rows.length });
+        res.json({ updated, skipped, total });
     } catch (e) {
         try { await db.exec('ROLLBACK'); } catch { /* noop */ }
         console.error("❌ backfill-adr:", e.message);
@@ -2637,16 +2646,23 @@ app.post('/api/admin/backfill-names', authenticateToken, async (req, res) => {
         const apiKeys = await getApiKeys();
         if (apiKeys.length === 0) return res.status(500).json({ error: 'Aucune clé API configurée.' });
 
-        const allRows = await db.all("SELECT id, data FROM matches");
+        // Parcours ligne par ligne (db.each) pour ne pas charger toute la table
+        // en mémoire d'un coup — évite les pics OOM sur les grosses bases.
         const matchIds = new Set();
-        for (const row of allRows) {
-            try {
-                const data = JSON.parse(row.data);
-                if (data.id && (data.allPlayers || []).some(isMissingPseudo)) {
-                    matchIds.add(data.id);
-                }
-            } catch (e) { void e; }
-        }
+        await new Promise((resolve, reject) => {
+            db.db.each(
+                "SELECT data FROM matches",
+                [],
+                (err, row) => {
+                    if (err || !row?.data) return;
+                    try {
+                        const data = JSON.parse(row.data);
+                        if (data.id && (data.allPlayers || []).some(isMissingPseudo)) matchIds.add(data.id);
+                    } catch { /* ligne corrompue ignorée */ }
+                },
+                (err) => (err ? reject(err) : resolve())
+            );
+        });
 
         const ids = [...matchIds];
         const result = await backfillNamesForMatches(ids, apiKeys);
@@ -4057,22 +4073,41 @@ app.get('/history', async (req, res) => {
             query += ' WHERE ' + conditions.join(' AND ');
         }
 
+        // Borne dure : jamais plus de 5000 matchs par requête (évite l'OOM).
+        const safeLimit = Math.min(parseInt(limit) || 5000, 5000);
+        const safeOffset = parseInt(offset) || 0;
         query += ' ORDER BY date DESC';
-        query += ` LIMIT ${parseInt(limit)} OFFSET ${parseInt(offset)}`;
+        query += ` LIMIT ${safeLimit} OFFSET ${safeOffset}`;
 
-        const rows = await db.all(query, params);
-
-        // Optim: row.data est déjà une string JSON valide. On évite le
-        // round-trip parse+stringify qui allouait ~10-20 MB pour 5000 matchs.
-        const jsonParts = [];
-        for (const r of rows) {
-            if (r.data) jsonParts.push(r.data);
-        }
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.send('{"matches":[' + jsonParts.join(',') + ']}');
+
+        // STREAMING : on écrit la réponse au fil de l'eau (res.write) au lieu de
+        // construire une seule String géante en mémoire (cause de l'OOM V8 :
+        // String::SlowFlatten / Utf8Length sur ~40 Mo concaténés). db.each traite
+        // ligne par ligne sans jamais charger tout le résultat d'un coup.
+        res.write('{"matches":[');
+        let first = true;
+        await new Promise((resolve, reject) => {
+            db.db.each(
+                query,
+                params,
+                (err, row) => {
+                    if (err) return; // ligne ignorée
+                    if (row && row.data) {
+                        res.write(first ? row.data : ',' + row.data);
+                        first = false;
+                    }
+                },
+                (err) => (err ? reject(err) : resolve())
+            );
+        });
+        res.write(']}');
+        res.end();
     } catch (e) {
         console.error("❌ ERREUR CRITIQUE SUR LA ROUTE /history :", e);
-        res.status(500).json({ matches: [], error: e.message });
+        // Si on a déjà commencé à streamer, on ne peut plus renvoyer du JSON propre.
+        if (res.headersSent) { try { res.end(']}'); } catch { /* noop */ } }
+        else res.status(500).json({ matches: [], error: e.message });
     }
 });
 
