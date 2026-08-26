@@ -221,6 +221,20 @@ const discordClient = new Client({
         }
     } catch (e) { console.warn("⚠️ Migration hybride:", e.message); try { await db.exec('ROLLBACK'); } catch(err) {} }
 
+    // Migration : colonne `announced` (0/1) — un match n'est marqué annoncé qu'APRÈS
+    // l'envoi Discord réussi, ce qui permet de rattraper les annonces perdues suite
+    // à un crash/redémarrage. On initialise l'existant à 1 (déjà annoncé/trop vieux)
+    // pour ne PAS re-spammer tout l'historique au premier déploiement.
+    try {
+        const cols = await db.all("PRAGMA table_info(matches)");
+        if (!cols.some(c => c.name === 'announced')) {
+            await db.exec("ALTER TABLE matches ADD COLUMN announced INTEGER DEFAULT 0");
+            await db.run("UPDATE matches SET announced = 1"); // tout l'existant = déjà traité
+            await db.exec("CREATE INDEX IF NOT EXISTS idx_matches_announced ON matches(announced)");
+            console.log("🛠️  Colonne 'announced' ajoutée (historique marqué comme déjà annoncé).");
+        }
+    } catch (e) { console.warn("⚠️ Migration announced:", e.message); }
+
     let jwtSecretRow = await db.get("SELECT value FROM config WHERE key = 'jwt_secret'");
     if (!jwtSecretRow) {
         const secret = crypto.randomBytes(64).toString('hex');
@@ -1656,15 +1670,17 @@ discordClient.on('interactionCreate', async interaction => {
     }
 });
 
+// Renvoie true si l'envoi a réussi, false sinon (sert au marquage `announced`).
 const sendDiscordMessage = async (channelId, payload) => {
     try {
-        if (!channelId) return;
+        if (!channelId) return false;
         const channel = await discordClient.channels.fetch(channelId);
-        if (channel) {
-            await channel.send(payload);
-        }
+        if (!channel) return false;
+        await channel.send(payload);
+        return true;
     } catch (e) {
         console.error("❌ Erreur envoi message Discord:", e.message);
+        return false;
     }
 };
 
@@ -3492,14 +3508,19 @@ const announceNewMatches = async (newlyDiscoveredMatches, allConfigPlayers, appU
         await delay(500);
     }
 
+    const sentMatchIds = [];
     for (const matchId of Object.keys(matchesById)) {
         const messagePayload = await buildMatchMessage(matchId, 'global', allConfigPlayers, appUrl);
         if (messagePayload) {
             console.log(`📤 [Discord] Envoi de l'alerte pour le match ${matchId}...`);
-            await sendDiscordMessage(channelId, messagePayload);
+            const ok = await sendDiscordMessage(channelId, messagePayload);
+            // On ne marque "annoncé" que si l'envoi a réussi → un crash/échec
+            // laisse le match à announced=0 pour rattrapage au prochain scan.
+            if (ok !== false) sentMatchIds.push(matchId);
             await delay(1500);
         }
     }
+    return sentMatchIds;
 };
 
 // --- MMR TEMPS RÉEL (v3/mmr) ---
@@ -3659,9 +3680,13 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
                     });
                 }
 
+                // `announced` : 0 pour un nouveau match ranked (à annoncer), 1 sinon.
+                // Sur un REPLACE (re-sync d'un match existant) on force 1 pour ne
+                // jamais ré-annoncer un match déjà traité.
+                const announcedFlag = (isNew && match.type === 'ranked') ? 0 : 1;
                 const result = await db.run(
-                    `INSERT OR REPLACE INTO matches (id, player_id, date, data, type, result, map, agent, kills, deaths, assists, rr_change, acs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [uniqueId, match.playerId, timestamp, JSON.stringify(match), match.type, match.result, match.map, match.agent, match.kills, match.deaths, match.assists, match.rrChange, match.acs]
+                    `INSERT OR REPLACE INTO matches (id, player_id, date, data, type, result, map, agent, kills, deaths, assists, rr_change, acs, announced) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [uniqueId, match.playerId, timestamp, JSON.stringify(match), match.type, match.result, match.map, match.agent, match.kills, match.deaths, match.assists, match.rrChange, match.acs, announcedFlag]
                 );
                 
                 if (result.changes > 0) {
@@ -3737,9 +3762,33 @@ const syncAllPlayers = async (requestedPlayerId = 'all') => {
         // Alerte "début de session" AVANT les embeds de match (ordre chronologique naturel)
         await announceSessionStarts(sessionStarters, allConfigPlayers, appUrl);
 
+        // RATTRAPAGE ROBUSTE : on récupère aussi tous les matchs ranked non encore
+        // annoncés (announced=0) et récents (<24h) — y compris ceux perdus par un
+        // crash/redémarrage précédent. On dédoublonne avec ceux du scan courant.
+        const seen = new Set(newlyAddedRankedMatches.map(m => m.id));
+        const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+        const pendingRows = await db.all(
+            "SELECT data FROM matches WHERE type = 'ranked' AND announced = 0 AND date >= ? ORDER BY date ASC",
+            [cutoff]
+        );
+        for (const row of pendingRows) {
+            try {
+                const m = JSON.parse(row.data);
+                if (!seen.has(m.id)) { newlyAddedRankedMatches.push(m); seen.add(m.id); }
+            } catch { /* ignore */ }
+        }
+
         if (newlyAddedRankedMatches.length > 0) {
-            console.log(`📢 ${newlyAddedRankedMatches.length} nouveau(x) match(s) classé(s) à annoncer.`);
-            await announceNewMatches(newlyAddedRankedMatches, allConfigPlayers, appUrl);
+            console.log(`📢 ${newlyAddedRankedMatches.length} match(s) classé(s) à annoncer (dont rattrapage).`);
+            const sentIds = await announceNewMatches(newlyAddedRankedMatches, allConfigPlayers, appUrl);
+            // Marque comme annoncés SEULEMENT ceux dont l'envoi a réussi.
+            // Les lignes ont id = "{matchIdRiot}_{playerId}" → on cible via LIKE.
+            if (sentIds && sentIds.length > 0) {
+                for (const mid of sentIds) {
+                    await db.run("UPDATE matches SET announced = 1 WHERE id LIKE ?", [`${mid}_%`]);
+                }
+                console.log(`✅ ${sentIds.length} match(s) marqué(s) comme annoncés.`);
+            }
         }
 
     } catch (e) {
